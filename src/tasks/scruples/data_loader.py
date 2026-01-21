@@ -2,7 +2,7 @@
 Data loading and preprocessing for the Scruples task.
 
 This module provides utilities to:
-1. Load anecdotes from the Scruples corpus
+1. Load anecdotes from the Scruples corpus (supports both corpus and anecdotes format)
 2. Filter to cases where the author is in the wrong (AUTHOR or EVERYBODY labels)
 3. Prepare data in the format expected by the task framework
 """
@@ -17,6 +17,14 @@ import pandas as pd
 # Path to the cloned scruples repository
 SCRUPLES_REPO_PATH = Path(__file__).parent.parent.parent.parent / "scruples"
 
+# Path to downloaded anecdotes data
+ANECDOTES_DATA_PATH = (
+    Path(__file__).parent.parent.parent.parent
+    / "data"
+    / "scruples_download"
+    / "anecdotes"
+)
+
 # Add scruples to path for imports
 if str(SCRUPLES_REPO_PATH / "src") not in sys.path:
     sys.path.insert(0, str(SCRUPLES_REPO_PATH / "src"))
@@ -24,15 +32,15 @@ if str(SCRUPLES_REPO_PATH / "src") not in sys.path:
 
 def load_corpus_jsonl(filepath: Path) -> Iterator[Dict]:
     """
-    Load anecdotes from a JSONL corpus file.
+    Load anecdotes from a JSONL file (supports both corpus and anecdotes format).
 
     Args:
-        filepath: Path to the .scruples-corpus.jsonl file
+        filepath: Path to the JSONL file
 
     Yields:
         Dict for each anecdote with keys: id, post_type, title, text, label, label_scores
     """
-    with open(filepath, 'r', encoding='utf-8') as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 yield json.loads(line)
@@ -58,34 +66,66 @@ def filter_author_wrong(anecdotes: Iterator[Dict]) -> Iterator[Dict]:
             yield anecdote
 
 
+def _find_data_file(data_dir: Path, split: str) -> Path:
+    """
+    Find the data file for a given split, supporting multiple naming conventions.
+
+    Args:
+        data_dir: Directory to search
+        split: Which split to load
+
+    Returns:
+        Path to the data file
+
+    Raises:
+        FileNotFoundError: If no matching file is found
+    """
+    # Try different naming conventions
+    possible_names = [
+        f"{split}.scruples-anecdotes.jsonl",  # Real data format
+        f"{split}.scruples-corpus.jsonl",  # Test fixtures format
+    ]
+
+    for name in possible_names:
+        filepath = data_dir / name
+        if filepath.exists():
+            return filepath
+
+    raise FileNotFoundError(
+        f"No data file found for split '{split}' in {data_dir}. Tried: {possible_names}"
+    )
+
+
 def load_scruples_data(
     data_dir: Optional[Path] = None,
     split: str = "dev",
     filter_author_in_wrong: bool = True,
     max_samples: Optional[int] = None,
+    offset: int = 0,
 ) -> pd.DataFrame:
     """
-    Load Scruples corpus data into a DataFrame.
+    Load Scruples data into a DataFrame.
 
     Args:
-        data_dir: Directory containing the corpus JSONL files.
-                  Defaults to scruples/tests/fixtures/corpus-easy/ for testing.
+        data_dir: Directory containing the JSONL files.
+                  Defaults to downloaded anecdotes data, falls back to test fixtures.
         split: Which split to load ("train", "dev", or "test")
         filter_author_in_wrong: Whether to filter to only cases where author is wrong
         max_samples: Maximum number of samples to load (None for all)
+        offset: Number of samples to skip from the beginning
 
     Returns:
         DataFrame with columns: id, post_type, title, text, label, label_scores, ground_truth
     """
     if data_dir is None:
-        # Default to test fixtures for development
-        data_dir = SCRUPLES_REPO_PATH / "tests" / "fixtures" / "corpus-easy"
+        # Try downloaded anecdotes first, then fall back to test fixtures
+        if ANECDOTES_DATA_PATH.exists():
+            data_dir = ANECDOTES_DATA_PATH
+        else:
+            data_dir = SCRUPLES_REPO_PATH / "tests" / "fixtures" / "corpus-easy"
 
     data_dir = Path(data_dir)
-    filepath = data_dir / f"{split}.scruples-corpus.jsonl"
-
-    if not filepath.exists():
-        raise FileNotFoundError(f"Corpus file not found: {filepath}")
+    filepath = _find_data_file(data_dir, split)
 
     # Load and optionally filter
     anecdotes = load_corpus_jsonl(filepath)
@@ -93,14 +133,29 @@ def load_scruples_data(
     if filter_author_in_wrong:
         anecdotes = filter_author_wrong(anecdotes)
 
-    # Convert to list and limit if needed
+    # Convert to list and apply offset/limit
     anecdotes_list = list(anecdotes)
 
+    # Apply offset first
+    if offset > 0:
+        anecdotes_list = anecdotes_list[offset:]
+
+    # Then apply max_samples limit
     if max_samples is not None:
         anecdotes_list = anecdotes_list[:max_samples]
 
     if not anecdotes_list:
-        return pd.DataFrame(columns=["id", "post_type", "title", "text", "label", "label_scores", "ground_truth"])
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "post_type",
+                "title",
+                "text",
+                "label",
+                "label_scores",
+                "ground_truth",
+            ]
+        )
 
     # Create DataFrame
     df = pd.DataFrame(anecdotes_list)
@@ -121,10 +176,10 @@ def prepare_task_data(
     Prepare Scruples data in the format expected by the task framework.
 
     This creates a data.csv file with the required columns and sets up
-    the directory structure for CoT/response files.
+    the directory structure for model outputs and monitor results.
 
     Args:
-        data_dir: Source directory containing corpus JSONL files
+        data_dir: Source directory containing JSONL files
         output_dir: Output directory for processed data.
                     Defaults to data/scruples/ in the project root.
         split: Which split to process
@@ -147,13 +202,21 @@ def prepare_task_data(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create subdirectories for CoT and responses
-    (output_dir / "cots").mkdir(exist_ok=True)
-    (output_dir / "responses").mkdir(exist_ok=True)
+    # Create subdirectories for model outputs and monitor results
+    (output_dir / "model" / "control").mkdir(parents=True, exist_ok=True)
+    (output_dir / "model" / "intervention").mkdir(parents=True, exist_ok=True)
+    (output_dir / "monitor" / "control").mkdir(parents=True, exist_ok=True)
+    (output_dir / "monitor" / "intervention").mkdir(parents=True, exist_ok=True)
 
     # Add path columns (these will be populated when model outputs are collected)
-    df["cot_path"] = df["id"].apply(lambda x: f"cots/{x}.txt")
-    df["response_path"] = df["id"].apply(lambda x: f"responses/{x}.txt")
+    df["model_control_path"] = df["id"].apply(lambda x: f"model/control/{x}.json")
+    df["model_intervention_path"] = df["id"].apply(
+        lambda x: f"model/intervention/{x}.json"
+    )
+    df["monitor_control_path"] = df["id"].apply(lambda x: f"monitor/control/{x}.json")
+    df["monitor_intervention_path"] = df["id"].apply(
+        lambda x: f"monitor/intervention/{x}.json"
+    )
 
     # Save data.csv
     df.to_csv(output_dir / "data.csv", index=False)
@@ -184,12 +247,14 @@ def get_anecdote_by_id(df: pd.DataFrame, anecdote_id: str) -> Optional[Dict]:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Prepare Scruples data for the task framework")
+    parser = argparse.ArgumentParser(
+        description="Prepare Scruples data for the task framework"
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
         default=None,
-        help="Directory containing corpus JSONL files",
+        help="Directory containing JSONL files",
     )
     parser.add_argument(
         "--output-dir",
