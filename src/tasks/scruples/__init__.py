@@ -24,36 +24,38 @@ Usage:
 """
 
 from .data_loader import (
-    load_scruples_data,
-    prepare_task_data,
-    filter_author_wrong,
+    compute_consensus,
+    filter_high_consensus,
     get_anecdote_by_id,
+    load_scruples_data,
 )
 from .monitor import (
-    ScruplesMonitor,
+    DEFAULT_MONITOR_MODEL,
+    OPENROUTER_BASE_URL,
     ScruplesFirstPersonMonitor,
+    ScruplesMonitor,
     ScruplesSuggestRightMonitor,
     ScruplesSuggestWrongMonitor,
-    OPENROUTER_BASE_URL,
-    DEFAULT_MONITOR_MODEL,
 )
 from .prompts import (
     CONTROL_PROMPT,
     FIRST_PERSON_INTERVENTION_PROMPT,
+    INTERVENTION_DESCRIPTIONS,
+    INTERVENTION_SUGGESTED_ANSWER,
+    MONITOR_PROMPT_TEMPLATE,
     SUGGEST_RIGHT_INTERVENTION_PROMPT,
     SUGGEST_WRONG_INTERVENTION_PROMPT,
-    MONITOR_PROMPT_TEMPLATE,
-    HINT_DESCRIPTIONS,
-    SYCOPHANTIC_ANSWER,
     get_control_prompt,
     get_intervention_prompt,
     get_monitor_prompt,
+    get_sycophantic_answer,
+    is_sycophantic,
 )
 from .task import (
-    ScruplesTask,
     ScruplesFirstPersonTask,
     ScruplesSuggestRightTask,
     ScruplesSuggestWrongTask,
+    ScruplesTask,
 )
 
 __all__ = [
@@ -72,8 +74,8 @@ __all__ = [
     "DEFAULT_MONITOR_MODEL",
     # Data loading
     "load_scruples_data",
-    "prepare_task_data",
-    "filter_author_wrong",
+    "filter_high_consensus",
+    "compute_consensus",
     "get_anecdote_by_id",
     # Prompts
     "CONTROL_PROMPT",
@@ -81,9 +83,11 @@ __all__ = [
     "SUGGEST_RIGHT_INTERVENTION_PROMPT",
     "SUGGEST_WRONG_INTERVENTION_PROMPT",
     "MONITOR_PROMPT_TEMPLATE",
-    "HINT_DESCRIPTIONS",
-    "SYCOPHANTIC_ANSWER",
+    "INTERVENTION_DESCRIPTIONS",
+    "INTERVENTION_SUGGESTED_ANSWER",
     "get_control_prompt",
     "get_intervention_prompt",
     "get_monitor_prompt",
+    "get_sycophantic_answer",
+    "is_sycophantic",
 ]

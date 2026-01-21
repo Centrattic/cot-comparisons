@@ -3,14 +3,14 @@ Data loading and preprocessing for the Scruples task.
 
 This module provides utilities to:
 1. Load anecdotes from the Scruples corpus (supports both corpus and anecdotes format)
-2. Filter to cases where the author is in the wrong (AUTHOR or EVERYBODY labels)
+2. Filter to high-consensus cases (>80% agreement for AUTHOR or OTHER labels)
 3. Prepare data in the format expected by the task framework
 """
 
 import json
 import sys
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, Optional
 
 import pandas as pd
 
@@ -29,6 +29,12 @@ ANECDOTES_DATA_PATH = (
 if str(SCRUPLES_REPO_PATH / "src") not in sys.path:
     sys.path.insert(0, str(SCRUPLES_REPO_PATH / "src"))
 
+# Default consensus threshold (80%)
+DEFAULT_CONSENSUS_THRESHOLD = 0.80
+
+# Default minimum total votes required
+DEFAULT_MIN_TOTAL_VOTES = 50
+
 
 def load_corpus_jsonl(filepath: Path) -> Iterator[Dict]:
     """
@@ -46,23 +52,66 @@ def load_corpus_jsonl(filepath: Path) -> Iterator[Dict]:
                 yield json.loads(line)
 
 
-def filter_author_wrong(anecdotes: Iterator[Dict]) -> Iterator[Dict]:
+def compute_consensus(label_scores: Dict[str, int]) -> tuple[str, float]:
     """
-    Filter to anecdotes where the community voted the author is in the wrong.
+    Compute the consensus ratio for an anecdote's label scores.
 
-    The author is considered "in the wrong" if the label is:
-    - AUTHOR (YTA - You're the asshole)
-    - EVERYBODY (ESH - Everyone sucks here)
+    Args:
+        label_scores: Dict mapping labels to vote counts
+
+    Returns:
+        Tuple of (majority_label, consensus_ratio)
+    """
+    if not label_scores:
+        return "", 0.0
+
+    total_votes = sum(label_scores.values())
+    if total_votes == 0:
+        return "", 0.0
+
+    majority_label = max(label_scores, key=label_scores.get)
+    majority_votes = label_scores[majority_label]
+    consensus_ratio = majority_votes / total_votes
+
+    return majority_label, consensus_ratio
+
+
+def filter_high_consensus(
+    anecdotes: Iterator[Dict],
+    consensus_threshold: float = DEFAULT_CONSENSUS_THRESHOLD,
+    min_total_votes: int = DEFAULT_MIN_TOTAL_VOTES,
+) -> Iterator[Dict]:
+    """
+    Filter to anecdotes with high consensus for AUTHOR or OTHER labels only.
+
+    Skips anecdotes where:
+    - The majority label is EVERYBODY, NOBODY, or INFO
+    - The consensus is below the threshold
+    - The total number of votes is below min_total_votes
 
     Args:
         anecdotes: Iterator of anecdote dicts
+        consensus_threshold: Minimum consensus ratio required (default 0.80)
+        min_total_votes: Minimum total votes required (default 50)
 
     Yields:
-        Anecdotes where the author is in the wrong
+        Anecdotes with high consensus for AUTHOR or OTHER
     """
     for anecdote in anecdotes:
-        label = anecdote.get("label", "")
-        if label in ("AUTHOR", "EVERYBODY"):
+        label_scores = anecdote.get("label_scores", {})
+        majority_label, consensus_ratio = compute_consensus(label_scores)
+        total_votes = sum(label_scores.values())
+
+        # Only accept AUTHOR or OTHER with high consensus and enough votes
+        if (
+            majority_label in ("AUTHOR", "OTHER")
+            and consensus_ratio >= consensus_threshold
+            and total_votes >= min_total_votes
+        ):
+            # Add consensus info to the anecdote
+            anecdote["consensus_ratio"] = consensus_ratio
+            anecdote["majority_label"] = majority_label
+            anecdote["total_votes"] = total_votes
             yield anecdote
 
 
@@ -99,23 +148,28 @@ def _find_data_file(data_dir: Path, split: str) -> Path:
 def load_scruples_data(
     data_dir: Optional[Path] = None,
     split: str = "dev",
-    filter_author_in_wrong: bool = True,
+    consensus_threshold: float = DEFAULT_CONSENSUS_THRESHOLD,
     max_samples: Optional[int] = None,
     offset: int = 0,
 ) -> pd.DataFrame:
     """
-    Load Scruples data into a DataFrame.
+    Load Scruples data into a DataFrame, filtered by high consensus.
+
+    Only includes anecdotes where:
+    - The majority label is AUTHOR or OTHER (not EVERYBODY, NOBODY, or INFO)
+    - The consensus ratio is >= consensus_threshold
 
     Args:
         data_dir: Directory containing the JSONL files.
                   Defaults to downloaded anecdotes data, falls back to test fixtures.
         split: Which split to load ("train", "dev", or "test")
-        filter_author_in_wrong: Whether to filter to only cases where author is wrong
+        consensus_threshold: Minimum consensus ratio required (default 0.80)
         max_samples: Maximum number of samples to load (None for all)
         offset: Number of samples to skip from the beginning
 
     Returns:
-        DataFrame with columns: id, post_type, title, text, label, label_scores, ground_truth
+        DataFrame with columns: id, post_type, title, text, label, label_scores,
+                               consensus_ratio, majority_label, author_is_wrong
     """
     if data_dir is None:
         # Try downloaded anecdotes first, then fall back to test fixtures
@@ -127,11 +181,9 @@ def load_scruples_data(
     data_dir = Path(data_dir)
     filepath = _find_data_file(data_dir, split)
 
-    # Load and optionally filter
+    # Load and filter by consensus
     anecdotes = load_corpus_jsonl(filepath)
-
-    if filter_author_in_wrong:
-        anecdotes = filter_author_wrong(anecdotes)
+    anecdotes = filter_high_consensus(anecdotes, consensus_threshold)
 
     # Convert to list and apply offset/limit
     anecdotes_list = list(anecdotes)
@@ -153,76 +205,17 @@ def load_scruples_data(
                 "text",
                 "label",
                 "label_scores",
-                "ground_truth",
+                "consensus_ratio",
+                "majority_label",
+                "author_is_wrong",
             ]
         )
 
     # Create DataFrame
     df = pd.DataFrame(anecdotes_list)
 
-    # Add ground_truth column (1 = author is in the wrong, which is always true after filtering)
-    df["ground_truth"] = 1
-
-    return df
-
-
-def prepare_task_data(
-    data_dir: Optional[Path] = None,
-    output_dir: Optional[Path] = None,
-    split: str = "dev",
-    max_samples: Optional[int] = None,
-) -> pd.DataFrame:
-    """
-    Prepare Scruples data in the format expected by the task framework.
-
-    This creates a data.csv file with the required columns and sets up
-    the directory structure for model outputs and monitor results.
-
-    Args:
-        data_dir: Source directory containing JSONL files
-        output_dir: Output directory for processed data.
-                    Defaults to data/scruples/ in the project root.
-        split: Which split to process
-        max_samples: Maximum number of samples to include
-
-    Returns:
-        The prepared DataFrame
-    """
-    # Load filtered data
-    df = load_scruples_data(
-        data_dir=data_dir,
-        split=split,
-        filter_author_in_wrong=True,
-        max_samples=max_samples,
-    )
-
-    if output_dir is None:
-        output_dir = Path(__file__).parent.parent.parent.parent / "data" / "scruples"
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create subdirectories for model outputs and monitor results
-    (output_dir / "model" / "control").mkdir(parents=True, exist_ok=True)
-    (output_dir / "model" / "intervention").mkdir(parents=True, exist_ok=True)
-    (output_dir / "monitor" / "control").mkdir(parents=True, exist_ok=True)
-    (output_dir / "monitor" / "intervention").mkdir(parents=True, exist_ok=True)
-
-    # Add path columns (these will be populated when model outputs are collected)
-    df["model_control_path"] = df["id"].apply(lambda x: f"model/control/{x}.json")
-    df["model_intervention_path"] = df["id"].apply(
-        lambda x: f"model/intervention/{x}.json"
-    )
-    df["monitor_control_path"] = df["id"].apply(lambda x: f"monitor/control/{x}.json")
-    df["monitor_intervention_path"] = df["id"].apply(
-        lambda x: f"monitor/intervention/{x}.json"
-    )
-
-    # Save data.csv
-    df.to_csv(output_dir / "data.csv", index=False)
-
-    print(f"Prepared {len(df)} anecdotes in {output_dir}")
-    print(f"  - Label distribution: {df['label'].value_counts().to_dict()}")
+    # Add author_is_wrong column (True if majority_label is AUTHOR)
+    df["author_is_wrong"] = df["majority_label"] == "AUTHOR"
 
     return df
 
@@ -248,7 +241,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Prepare Scruples data for the task framework"
+        description="Load and filter Scruples data by consensus"
     )
     parser.add_argument(
         "--data-dir",
@@ -257,17 +250,17 @@ if __name__ == "__main__":
         help="Directory containing JSONL files",
     )
     parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Output directory for processed data",
-    )
-    parser.add_argument(
         "--split",
         type=str,
         default="dev",
         choices=["train", "dev", "test"],
         help="Which split to process",
+    )
+    parser.add_argument(
+        "--consensus-threshold",
+        type=float,
+        default=DEFAULT_CONSENSUS_THRESHOLD,
+        help="Minimum consensus ratio required (default 0.80)",
     )
     parser.add_argument(
         "--max-samples",
@@ -278,12 +271,17 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    df = prepare_task_data(
+    df = load_scruples_data(
         data_dir=args.data_dir,
-        output_dir=args.output_dir,
         split=args.split,
+        consensus_threshold=args.consensus_threshold,
         max_samples=args.max_samples,
     )
+
+    print(f"Loaded {len(df)} high-consensus anecdotes")
+    print(f"  - Consensus threshold: {args.consensus_threshold:.0%}")
+    print(f"  - Label distribution: {df['majority_label'].value_counts().to_dict()}")
+    print(f"  - Author is wrong: {df['author_is_wrong'].sum()} / {len(df)}")
 
     print("\nSample anecdote:")
     if len(df) > 0:
@@ -292,3 +290,5 @@ if __name__ == "__main__":
         print(f"  Title: {sample['title']}")
         print(f"  Text: {sample['text'][:200]}...")
         print(f"  Label: {sample['label']}")
+        print(f"  Consensus: {sample['consensus_ratio']:.1%}")
+        print(f"  Author is wrong: {sample['author_is_wrong']}")
