@@ -43,6 +43,12 @@ MODELS = {
         thought_tokens=16000,
         response_tokens=1000,
     ),
+    "kimi-k2-thinking": ModelConfig(
+        name="moonshotai/kimi-k2-thinking",
+        provider="moonshot",
+        thought_tokens=16000,
+        response_tokens=1000,
+    ),
 }
 
 

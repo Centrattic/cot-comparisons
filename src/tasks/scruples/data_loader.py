@@ -150,7 +150,6 @@ def load_scruples_data(
     split: str = "dev",
     consensus_threshold: float = DEFAULT_CONSENSUS_THRESHOLD,
     max_samples: Optional[int] = None,
-    offset: int = 0,
 ) -> pd.DataFrame:
     """
     Load Scruples data into a DataFrame, filtered by high consensus.
@@ -165,7 +164,6 @@ def load_scruples_data(
         split: Which split to load ("train", "dev", or "test")
         consensus_threshold: Minimum consensus ratio required (default 0.80)
         max_samples: Maximum number of samples to load (None for all)
-        offset: Number of samples to skip from the beginning
 
     Returns:
         DataFrame with columns: id, post_type, title, text, label, label_scores,
@@ -185,14 +183,9 @@ def load_scruples_data(
     anecdotes = load_corpus_jsonl(filepath)
     anecdotes = filter_high_consensus(anecdotes, consensus_threshold)
 
-    # Convert to list and apply offset/limit
+    # Convert to list and apply limit
     anecdotes_list = list(anecdotes)
 
-    # Apply offset first
-    if offset > 0:
-        anecdotes_list = anecdotes_list[offset:]
-
-    # Then apply max_samples limit
     if max_samples is not None:
         anecdotes_list = anecdotes_list[:max_samples]
 
