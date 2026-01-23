@@ -6,8 +6,11 @@ Usage:
     # Run verification to find a high-agreement question
     python run_forced_response.py verify --num-rollouts 50
 
-    # Run forcing on a verified question
-    python run_forced_response.py force --question-id gpqa_sample_001
+    # Run true forcing (Tinker prefill) on a verified question
+    python run_forced_response.py force --question-id gpqa_sample_001 -n 5
+
+    # Run monitor (CoT in user message) on a verified question
+    python run_forced_response.py monitor --question-id gpqa_sample_001 -n 5
 
     # Full pipeline: verify then force
     python run_forced_response.py full --num-rollouts 50 --num-forces 5
@@ -30,6 +33,7 @@ from src.tasks.forced_response.data_loader import (
     GPQAQuestion,
     load_gpqa_questions,
     load_gpqa_from_huggingface,
+    load_custom_questions,
 )
 from src.tasks.forced_response.verification import (
     run_verification,
@@ -40,6 +44,10 @@ from src.tasks.forced_response.forcing import (
     run_forcing,
     run_forcing_from_verification,
 )
+from src.tasks.forced_response.monitor import (
+    run_monitor,
+    run_monitor_from_verification,
+)
 from src.tasks.forced_response.resampling import (
     run_resampling,
     run_resampling_from_verification,
@@ -47,7 +55,7 @@ from src.tasks.forced_response.resampling import (
 from src.tasks.forced_response.task import ForcedResponseTask
 
 
-DEFAULT_MODEL = "moonshotai/kimi-k2-thinking"
+DEFAULT_MODEL = "moonshotai/Kimi-K2-Thinking"
 
 
 def cmd_verify(args):
@@ -62,14 +70,20 @@ def cmd_verify(args):
     print()
 
     # Load questions
-    if args.use_huggingface:
+    if args.use_custom:
+        print("Loading custom questions...")
+        questions = load_custom_questions()
+        if not questions:
+            print("No custom questions found in questions.json")
+            return 1
+    elif args.use_huggingface:
         print("Loading questions from HuggingFace...")
         questions = load_gpqa_from_huggingface(
             subset=args.gpqa_subset,
             max_questions=args.max_questions,
         )
     else:
-        print("Using sample questions...")
+        print("Using sample GPQA questions...")
         questions = load_gpqa_questions(use_samples=True)
 
     if args.question_id:
@@ -129,7 +143,7 @@ def cmd_verify(args):
 
 
 def cmd_force(args):
-    """Run forcing on a verified question."""
+    """Run true forcing (Tinker prefill) on a verified question."""
     if not args.question_id:
         # Find verified questions
         task = ForcedResponseTask(model=args.model)
@@ -142,11 +156,61 @@ def cmd_force(args):
         args.question_id = verified[0]
         print(f"Using verified question: {args.question_id}")
 
-    print(f"Running forcing with {args.num_forces} attempts per sentence")
+    print(f"Running true forcing (Tinker) with {args.num_forces} samples per sentence")
     print(f"Model: {args.model}")
     print()
 
     summary = run_forcing_from_verification(
+        question_id=args.question_id,
+        rollout_idx=args.rollout_idx,
+        num_forces=args.num_forces,
+        model=args.model,
+        verbose=True,
+    )
+
+    if summary:
+        print("\n" + "=" * 60)
+        print("FORCING COMPLETE (Tinker)")
+        print("=" * 60)
+        print(f"Question: {summary['question_id']}")
+        print(f"Correct answer: {summary['correct_answer']}")
+        print(f"Sentences processed: {summary['num_sentences']}")
+
+        # Show answer progression
+        print("\nAnswer progression by sentence:")
+        for result in summary["sentence_results"]:
+            idx = result["sentence_idx"]
+            counts = result["answer_counts"]
+            valid = result.get("valid_answers", result.get("valid_single_token", 0))
+            total = result["total_forces"]
+            most_common = result.get("most_common", "?")
+            print(f"  Sentence {idx + 1}: {counts} (valid: {valid}/{total}, most common: {most_common})")
+
+        return 0
+    else:
+        return 1
+
+
+def cmd_monitor(args):
+    """Run monitor (CoT-in-user-message) on a verified question."""
+    if not args.question_id:
+        # Find verified questions
+        task = ForcedResponseTask(model=args.model)
+        verified = task.get_verified_questions(threshold=args.threshold)
+
+        if not verified:
+            print("No verified questions found. Run 'verify' first.")
+            return 1
+
+        args.question_id = verified[0]
+        print(f"Using verified question: {args.question_id}")
+
+    print(f"Running monitor with {args.num_forces} attempts per sentence")
+    print(f"Model: {args.model}")
+    print(f"Max workers: {args.max_workers}")
+    print()
+
+    summary = run_monitor_from_verification(
         question_id=args.question_id,
         rollout_idx=args.rollout_idx,
         num_forces=args.num_forces,
@@ -158,7 +222,7 @@ def cmd_force(args):
 
     if summary:
         print("\n" + "=" * 60)
-        print("FORCING COMPLETE")
+        print("MONITOR COMPLETE")
         print("=" * 60)
         print(f"Question: {summary['question_id']}")
         print(f"Correct answer: {summary['correct_answer']}")
@@ -189,7 +253,12 @@ def cmd_full(args):
     print("\nStep 1: Finding high-agreement question...")
     print()
 
-    if args.use_huggingface:
+    if getattr(args, 'use_custom', False):
+        questions = load_custom_questions()
+        if not questions:
+            print("No custom questions found in questions.json")
+            return 1
+    elif args.use_huggingface:
         questions = load_gpqa_from_huggingface(
             subset=args.gpqa_subset,
             max_questions=args.max_questions,
@@ -218,10 +287,9 @@ def cmd_full(args):
 
     summary = run_forcing_from_verification(
         question_id=question.id,
-        rollout_idx=0,
+        rollout_idx=args.rollout_idx,
         num_forces=args.num_forces,
         model=args.model,
-        api_key=args.api_key,
         verbose=True,
     )
 
@@ -260,22 +328,37 @@ def cmd_list(args):
                 print(f"    Agreement: {agreement:.1%} (meets threshold: {meets})")
                 print(f"    Most common: {most_common} ({correct})")
 
-    print()
-    print("Forcing Results:")
-    print("-" * 60)
+    # Show forcing and monitor results
+    for label, data_dir in [("Forcing (Tinker)", task.forcing_dir), ("Monitor", task.monitor_dir)]:
+        print()
+        print(f"{label} Results:")
+        print("-" * 60)
 
-    if not task.forcing_dir.exists():
-        print("No forcing data found.")
-        return 0
+        if not data_dir.exists():
+            print(f"No {label.lower()} data found.")
+            continue
 
-    for question_dir in sorted(task.forcing_dir.iterdir()):
-        if question_dir.is_dir():
-            summary_path = question_dir / "summary.json"
-            if summary_path.exists():
-                with open(summary_path) as f:
-                    summary = json.load(f)
-                num_sentences = summary.get("num_sentences", 0)
-                print(f"  {question_dir.name}: {num_sentences} sentences processed")
+        for question_dir in sorted(data_dir.iterdir()):
+            if question_dir.is_dir():
+                rollout_dirs = sorted(
+                    [d for d in question_dir.iterdir() if d.is_dir() and d.name.startswith("rollout_")]
+                )
+                if rollout_dirs:
+                    print(f"  {question_dir.name}:")
+                    for rollout_dir in rollout_dirs:
+                        summary_path = rollout_dir / "summary.json"
+                        if summary_path.exists():
+                            with open(summary_path) as f:
+                                summary = json.load(f)
+                            num_sentences = summary.get("num_sentences", 0)
+                            print(f"    {rollout_dir.name}: {num_sentences} sentences processed")
+                else:
+                    summary_path = question_dir / "summary.json"
+                    if summary_path.exists():
+                        with open(summary_path) as f:
+                            summary = json.load(f)
+                        num_sentences = summary.get("num_sentences", 0)
+                        print(f"  {question_dir.name}: {num_sentences} sentences processed")
 
     return 0
 
@@ -319,6 +402,11 @@ def main():
         help="Verify a specific question ID",
     )
     verify_parser.add_argument(
+        "--use-custom",
+        action="store_true",
+        help="Load custom questions from questions.json",
+    )
+    verify_parser.add_argument(
         "--use-huggingface",
         action="store_true",
         help="Load questions from HuggingFace instead of samples",
@@ -346,10 +434,10 @@ def main():
     )
     verify_parser.set_defaults(func=cmd_verify)
 
-    # Force command
+    # Force command (Tinker-based true forcing)
     force_parser = subparsers.add_parser(
         "force",
-        help="Run forcing on a verified question",
+        help="Run true forcing (Tinker prefill) on a verified question",
     )
     force_parser.add_argument(
         "--question-id", "-q",
@@ -365,7 +453,7 @@ def main():
         "--num-forces", "-n",
         type=int,
         default=5,
-        help="Number of force attempts per sentence (default: 5)",
+        help="Number of force samples per sentence (default: 5)",
     )
     force_parser.add_argument(
         "--threshold", "-t",
@@ -373,13 +461,42 @@ def main():
         default=0.8,
         help="Agreement threshold for selecting questions (default: 0.8)",
     )
-    force_parser.add_argument(
+    force_parser.set_defaults(func=cmd_force)
+
+    # Monitor command (CoT-in-user-message approach)
+    monitor_parser = subparsers.add_parser(
+        "monitor",
+        help="Run monitor (CoT in user message) on a verified question",
+    )
+    monitor_parser.add_argument(
+        "--question-id", "-q",
+        help="Question ID to monitor (default: first verified question)",
+    )
+    monitor_parser.add_argument(
+        "--rollout-idx", "-r",
+        type=int,
+        default=0,
+        help="Which verification rollout to use as source (default: 0)",
+    )
+    monitor_parser.add_argument(
+        "--num-forces", "-n",
+        type=int,
+        default=5,
+        help="Number of monitor attempts per sentence (default: 5)",
+    )
+    monitor_parser.add_argument(
+        "--threshold", "-t",
+        type=float,
+        default=0.8,
+        help="Agreement threshold for selecting questions (default: 0.8)",
+    )
+    monitor_parser.add_argument(
         "--max-workers", "-w",
         type=int,
         default=300,
         help="Maximum concurrent API calls (default: 300)",
     )
-    force_parser.set_defaults(func=cmd_force)
+    monitor_parser.set_defaults(func=cmd_monitor)
 
     # Full command
     full_parser = subparsers.add_parser(
@@ -405,6 +522,11 @@ def main():
         help="Agreement threshold (default: 0.8)",
     )
     full_parser.add_argument(
+        "--use-custom",
+        action="store_true",
+        help="Load custom questions from questions.json",
+    )
+    full_parser.add_argument(
         "--use-huggingface",
         action="store_true",
         help="Load questions from HuggingFace instead of samples",
@@ -419,6 +541,12 @@ def main():
         type=int,
         help="Maximum questions to try",
     )
+    full_parser.add_argument(
+        "--rollout-idx", "-r",
+        type=int,
+        default=0,
+        help="Which verification rollout to use as source (default: 0)",
+    )
     full_parser.set_defaults(func=cmd_full)
 
     # List command
@@ -430,10 +558,11 @@ def main():
 
     args = parser.parse_args()
 
-    # Check for API key
-    if not args.api_key and not os.environ.get("OPENROUTER_API_KEY"):
-        print("Error: No API key provided. Set OPENROUTER_API_KEY or use --api-key")
-        return 1
+    # Check for API key (not needed for 'force' which uses Tinker, or 'list')
+    if args.command not in ("force", "list"):
+        if not args.api_key and not os.environ.get("OPENROUTER_API_KEY"):
+            print("Error: No API key provided. Set OPENROUTER_API_KEY or use --api-key")
+            return 1
 
     return args.func(args)
 

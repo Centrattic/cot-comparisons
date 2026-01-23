@@ -181,12 +181,22 @@ async def run_verification_async(
     Returns:
         Summary dictionary with agreement statistics
     """
+    task = ForcedResponseTask(model=model)
+
+    # Skip if already verified (unless called internally with shared client)
+    if _async_client is None:
+        existing = task.load_verification_summary(question.id)
+        if existing:
+            if verbose:
+                print(f"  {question.id}: already verified "
+                      f"(agreement: {existing['agreement_rate']:.0%}), skipping")
+            return existing
+
     async_client = _async_client or openai.AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key or os.environ.get("OPENROUTER_API_KEY"),
     )
     semaphore = _semaphore or asyncio.Semaphore(max_workers)
-    task = ForcedResponseTask(model=model)
 
     if verbose:
         print(f"  Launching {num_rollouts} rollouts for {question.id}...")
@@ -264,21 +274,43 @@ async def find_questions_async(
     """
     Run verification on all questions in parallel, return all summaries.
 
-    Launches all questions' rollouts concurrently, limited by max_workers.
+    Skips questions that already have verification data on disk.
+    Launches remaining questions' rollouts concurrently, limited by max_workers.
     """
+    task = ForcedResponseTask(model=model)
+
+    # Check which questions already have verification results
+    summaries: List[Optional[Dict[str, Any]]] = [None] * len(questions)
+    questions_to_run: List[tuple[int, GPQAQuestion]] = []
+
+    for i, q in enumerate(questions):
+        existing = task.load_verification_summary(q.id)
+        if existing:
+            summaries[i] = existing
+            if verbose:
+                print(f"  {q.id}: already verified "
+                      f"(agreement: {existing['agreement_rate']:.0%}), skipping")
+        else:
+            questions_to_run.append((i, q))
+
+    if not questions_to_run:
+        if verbose:
+            print("All questions already verified.")
+        return summaries
+
     async_client = openai.AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key or os.environ.get("OPENROUTER_API_KEY"),
     )
     semaphore = asyncio.Semaphore(max_workers)
 
-    total_jobs = len(questions) * num_rollouts
+    total_jobs = len(questions_to_run) * num_rollouts
     if verbose:
-        print(f"Launching {total_jobs} rollouts across {len(questions)} questions "
+        print(f"\nLaunching {total_jobs} rollouts across {len(questions_to_run)} questions "
               f"(max {max_workers} concurrent)")
         print()
 
-    # Launch all questions concurrently, sharing the semaphore
+    # Launch remaining questions concurrently, sharing the semaphore
     tasks = [
         run_verification_async(
             question=q,
@@ -290,11 +322,16 @@ async def find_questions_async(
             _async_client=async_client,
             _semaphore=semaphore,
         )
-        for q in questions
+        for _, q in questions_to_run
     ]
 
-    summaries = await asyncio.gather(*tasks)
-    return list(summaries)
+    new_summaries = await asyncio.gather(*tasks)
+
+    # Merge results back
+    for (idx, _), summary in zip(questions_to_run, new_summaries):
+        summaries[idx] = summary
+
+    return summaries
 
 
 def find_high_agreement_question(

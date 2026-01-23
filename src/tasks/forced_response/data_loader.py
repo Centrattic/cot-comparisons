@@ -106,6 +106,44 @@ SAMPLE_GPQA_QUESTIONS = [
 ]
 
 
+def load_custom_questions(
+    questions_file: Optional[Path] = None,
+) -> List[GPQAQuestion]:
+    """
+    Load custom questions from questions.json.
+
+    Args:
+        questions_file: Path to questions.json (defaults to the one in this directory)
+
+    Returns:
+        List of GPQAQuestion objects
+    """
+    if questions_file is None:
+        questions_file = Path(__file__).parent / "questions.json"
+
+    if not questions_file.exists():
+        return []
+
+    with open(questions_file) as f:
+        data = json.load(f)
+
+    questions = []
+    for item in data:
+        correct_answer = item["correct_answer"]
+        correct_index = ord(correct_answer) - ord('A')
+        questions.append(GPQAQuestion(
+            id=item["id"],
+            question=item["question"],
+            choices=item["choices"],
+            correct_answer=correct_answer,
+            correct_index=correct_index,
+            subject=item.get("subject"),
+            difficulty=item.get("difficulty"),
+        ))
+
+    return questions
+
+
 def load_gpqa_questions(
     data_dir: Optional[Path] = None,
     use_samples: bool = True,

@@ -1,328 +1,272 @@
 """
-Forcing module for the Forced Response task.
+Forcing module for the Forced Response task — true prefill forcing via Tinker.
 
-After every sentence of the chain of thought, we force the model to give
-a final answer. A force is valid only if the model responds with a single
-token (the letter of the answer choice).
-
-All force jobs run in parallel using asyncio with a configurable number
-of workers.
+Uses the Tinker API to prefill the start of the model's <think> block with
+partial CoT, then lets the model continue its chain of thought and produce
+an answer. This is "true forcing" because the model's reasoning IS seeded
+with the partial CoT prefix — it continues thinking from there and answers.
 """
 
-import os
 import json
 import re
-import asyncio
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 
-import openai
-from tqdm.asyncio import tqdm as atqdm
+from transformers import AutoTokenizer
+from tinker import ServiceClient, types
 
 from .data_loader import GPQAQuestion
 from .prompts import get_cumulative_cot_segments
 from .task import ForcedResponseTask
 
 
-MAX_RETRIES = 10  # Max API calls per force job before giving up
+# Chat template special tokens for Kimi K2
+IM_SYSTEM = "<|im_system|>"
+IM_USER = "<|im_user|>"
+IM_ASSISTANT = "<|im_assistant|>"
+IM_MIDDLE = "<|im_middle|>"
+IM_END = "<|im_end|>"
 
 
 @dataclass
 class ForceResult:
-    """Result of a single force attempt."""
+    """Result of a single true-forcing attempt."""
     sentence_idx: int
     force_idx: int
     partial_cot: str
-    prompt: str
+    continued_cot: str
+    raw_tokens: List[int]
     raw_response: str
     answer: str
-    is_valid_single_token: bool
-    token_count: int
-    num_attempts: int  # How many API calls it took
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "sentence_idx": self.sentence_idx,
             "force_idx": self.force_idx,
             "partial_cot": self.partial_cot,
-            "prompt": self.prompt,
+            "continued_cot": self.continued_cot,
+            "raw_tokens": self.raw_tokens,
             "raw_response": self.raw_response,
             "answer": self.answer,
-            "is_valid_single_token": self.is_valid_single_token,
-            "token_count": self.token_count,
-            "num_attempts": self.num_attempts,
         }
 
 
-def is_single_token_answer(response: str) -> Tuple[bool, str, int]:
+def init_tinker_client(
+    model: str,
+) -> Tuple[Any, AutoTokenizer]:
     """
-    Check if response is a valid single-token answer.
-
-    A valid single-token answer is just the letter A, B, C, or D,
-    possibly with whitespace or minimal punctuation.
+    Initialize the Tinker sampling client and tokenizer.
 
     Args:
-        response: The model's response text
+        model: HuggingFace model identifier
 
     Returns:
-        Tuple of (is_valid, extracted_answer, approximate_token_count)
+        Tuple of (sampling_client, tokenizer)
     """
-    text = response.strip()
-
-    if not text:
-        return False, "", 0
-
-    tokens = text.split()
-    token_count = len(tokens) if tokens else 0
-
-    # Valid patterns: "A", "B", "C", "D", "A.", "B.", etc.
-    clean_text = text.upper().rstrip('.')
-
-    if clean_text in ['A', 'B', 'C', 'D']:
-        is_valid = len(text) <= 3 and token_count <= 1
-        return is_valid, clean_text, token_count
-
-    # Also accept if the response is just the letter with some whitespace
-    if re.match(r'^[A-Da-d]\.?\s*$', text):
-        answer = text.upper().strip().rstrip('.')
-        return True, answer, 1
-
-    # Not a single token answer - try to extract the answer anyway
-    match = re.search(r'\b([A-Da-d])\b', text)
-    if match:
-        return False, match.group(1).upper(), token_count
-
-    return False, "", token_count
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    client = ServiceClient()
+    sampling_client = client.create_sampling_client(base_model=model)
+    return sampling_client, tokenizer
 
 
-def get_force_messages(
+def build_force_prompt(
     question: str,
     choices: List[str],
     partial_cot: str,
-) -> List[Dict[str, Any]]:
+    tokenizer: AutoTokenizer,
+) -> types.ModelInput:
     """
-    Create messages for forcing the model to answer based on partial reasoning.
+    Build a tokenized prompt that prefills the start of the model's thinking
+    with partial CoT. The model continues its chain of thought from there,
+    eventually closing </think> and producing an answer.
+
+    The prompt follows the Kimi K2 chat template:
+        <|im_system|>system<|im_middle|>{system_msg}<|im_end|>
+        <|im_user|>user<|im_middle|>{user_msg}<|im_end|>
+        <|im_assistant|>assistant<|im_middle|><think>{partial_cot}
+
+    The model continues generating from the end of the partial CoT.
+
+    Args:
+        question: The question text
+        choices: List of answer choices
+        partial_cot: The partial chain of thought to prefill
+        tokenizer: The tokenizer to encode with
+
+    Returns:
+        ModelInput ready for sampling
     """
     choice_labels = [chr(ord('A') + i) for i in range(len(choices))]
     choices_text = "\n".join(
         f"{label}. {choice}" for label, choice in zip(choice_labels, choices)
     )
 
-    user_prompt = f"""Question: {question}
+    user_msg = (
+        f"{question}\n\n{choices_text}\n\n"
+        f"Answer with just the letter (A, B, C, or D)."
+    )
 
-{choices_text}
+    prompt_str = (
+        f"{IM_SYSTEM}system{IM_MIDDLE}"
+        f"You are Kimi, an AI assistant created by Moonshot AI."
+        f"{IM_END}"
+        f"{IM_USER}user{IM_MIDDLE}"
+        f"{user_msg}"
+        f"{IM_END}"
+        f"{IM_ASSISTANT}assistant{IM_MIDDLE}"
+        f"<think>{partial_cot}"
+    )
 
-Here is reasoning about this problem so far:
-<reasoning>
-{partial_cot}
-</reasoning>
-
-Based on the reasoning above, what is the answer? Respond with ONLY the letter (A, B, C, or D). No explanation needed."""
-
-    return [{"role": "user", "content": user_prompt}]
+    tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
+    return types.ModelInput.from_ints(tokens)
 
 
-async def run_single_force_job(
-    async_client: openai.AsyncOpenAI,
-    question: GPQAQuestion,
-    partial_cot: str,
-    sentence_idx: int,
-    force_idx: int,
-    semaphore: asyncio.Semaphore,
-    model: str = "moonshotai/kimi-k2-thinking",
-    temperature: float = 0.7,
-    max_tokens: int = 2000,
-    max_retries: int = MAX_RETRIES,
-) -> ForceResult:
+def extract_force_answer(tokens: List[int], tokenizer: AutoTokenizer) -> Tuple[str, str]:
     """
-    A single force job: retries API calls until a valid single-token answer.
+    Decode sampled tokens and extract the answer letter from after </think>.
+
+    The model's output will be: {continued_thinking}</think>{answer}
+    We extract the answer from the content after the closing think tag.
 
     Args:
-        async_client: Async OpenAI client
-        question: The GPQA question
-        partial_cot: The partial chain of thought
-        sentence_idx: Index of the sentence
-        force_idx: Index of this force attempt
-        semaphore: Semaphore for concurrency control
-        model: Model to use
-        temperature: Sampling temperature
-        max_tokens: Maximum tokens for response
-        max_retries: Max API calls before giving up
+        tokens: List of token IDs from sampling
+        tokenizer: Tokenizer for decoding
 
     Returns:
-        ForceResult with the valid response (or best effort after max_retries)
+        Tuple of (answer_letter, full_decoded_text)
     """
-    messages = get_force_messages(
-        question=question.question,
-        choices=question.choices,
-        partial_cot=partial_cot,
-    )
-    prompt = messages[0]["content"]
+    text = tokenizer.decode(tokens, skip_special_tokens=True)
 
-    for attempt in range(max_retries):
-        async with semaphore:
-            try:
-                response = await async_client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
+    # Split on </think> to get the answer portion
+    if "</think>" in text:
+        parts = text.split("</think>", 1)
+        answer_text = parts[1].strip()
+    else:
+        # Model didn't close think tag within max_tokens
+        answer_text = ""
 
-                raw_response = response.choices[0].message.content or ""
-                is_valid, answer, token_count = is_single_token_answer(raw_response)
+    # Try exact single letter from answer portion
+    clean = answer_text.upper().rstrip('.').strip()
+    if clean in ['A', 'B', 'C', 'D']:
+        return clean, text
 
-                if is_valid:
-                    return ForceResult(
-                        sentence_idx=sentence_idx,
-                        force_idx=force_idx,
-                        partial_cot=partial_cot,
-                        prompt=prompt,
-                        raw_response=raw_response,
-                        answer=answer,
-                        is_valid_single_token=True,
-                        token_count=token_count,
-                        num_attempts=attempt + 1,
-                    )
+    # Try to find a letter in the answer portion
+    match = re.search(r'\b([A-Da-d])\b', answer_text)
+    if match:
+        return match.group(1).upper(), text
 
-            except Exception as e:
-                # On error, continue retrying
-                if attempt == max_retries - 1:
-                    return ForceResult(
-                        sentence_idx=sentence_idx,
-                        force_idx=force_idx,
-                        partial_cot=partial_cot,
-                        prompt=prompt,
-                        raw_response=f"ERROR: {e}",
-                        answer="",
-                        is_valid_single_token=False,
-                        token_count=0,
-                        num_attempts=attempt + 1,
-                    )
-
-    # Exhausted retries without a valid single-token answer
-    return ForceResult(
-        sentence_idx=sentence_idx,
-        force_idx=force_idx,
-        partial_cot=partial_cot,
-        prompt=prompt,
-        raw_response=raw_response,  # Last response
-        answer=answer,  # Best-effort extracted answer
-        is_valid_single_token=False,
-        token_count=token_count,
-        num_attempts=max_retries,
-    )
+    return "", text
 
 
-async def run_forcing_async(
+def run_forcing(
     question: GPQAQuestion,
     source_cot: str,
+    model: str,
     num_forces: int = 5,
-    max_workers: int = 300,
-    model: str = "moonshotai/kimi-k2-thinking",
-    api_key: Optional[str] = None,
     temperature: float = 0.7,
-    max_tokens: int = 2000,
-    max_retries: int = MAX_RETRIES,
+    max_tokens: int = 16384,
     save_results: bool = True,
     verbose: bool = True,
+    rollout_idx: int = 0,
 ) -> Dict[str, Any]:
     """
-    Run forcing for all sentences in parallel.
+    Run true forcing for all sentences in the CoT.
 
-    All force jobs (num_forces * num_sentences) are launched concurrently,
-    limited by the semaphore to max_workers parallel API calls.
+    For each sentence boundary, prefills the model's thinking with the partial
+    CoT up to that point, then lets the model continue its chain of thought
+    and produce an answer. All num_forces samples per sentence are obtained
+    in a single Tinker call.
 
     Args:
         question: The GPQA question
         source_cot: The full chain of thought
-        num_forces: Number of force attempts per sentence
-        max_workers: Maximum concurrent API calls
-        model: Model to use
-        api_key: OpenRouter API key
+        num_forces: Number of force samples per sentence
+        model: Model identifier
         temperature: Sampling temperature
-        max_tokens: Maximum tokens per response
-        max_retries: Max retries per force job
+        max_tokens: Max tokens to generate (model finishes thinking + answer)
         save_results: Whether to save results to disk
         verbose: Whether to print progress
+        rollout_idx: Index of the source rollout being forced
 
     Returns:
         Summary dictionary with all forcing results
     """
-    async_client = openai.AsyncOpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key or os.environ.get("OPENROUTER_API_KEY"),
-    )
-
+    sampling_client, tokenizer = init_tinker_client(model)
     task = ForcedResponseTask(model=model)
-    semaphore = asyncio.Semaphore(max_workers)
+
+    # Get the im_end token ID for stop sequence
+    im_end_token = tokenizer.encode(IM_END, add_special_tokens=False)
 
     # Get cumulative CoT segments (after each sentence)
     cot_segments = get_cumulative_cot_segments(source_cot)
     num_sentences = len(cot_segments)
-    total_jobs = num_sentences * num_forces
 
     if verbose:
         print(f"Found {num_sentences} sentences in CoT")
         print(f"Correct answer: {question.correct_answer}")
-        print(f"Launching {total_jobs} force jobs with {max_workers} workers")
+        print(f"Running {num_forces} forces per sentence via Tinker")
         print()
 
-    # Create all force jobs
-    jobs = []
+    all_sentence_summaries = []
+
     for sentence_idx, partial_cot in enumerate(cot_segments):
+        # Build the prefilled prompt
+        prompt = build_force_prompt(
+            question=question.question,
+            choices=question.choices,
+            partial_cot=partial_cot,
+            tokenizer=tokenizer,
+        )
+
+        # Sample num_forces completions in one call
+        params = types.SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=im_end_token,
+        )
+        future = sampling_client.sample(
+            prompt=prompt,
+            num_samples=num_forces,
+            sampling_params=params,
+        )
+        result = future.result()
+
+        # Extract answers from each sample
+        force_results = []
         for force_idx in range(num_forces):
-            job = run_single_force_job(
-                async_client=async_client,
-                question=question,
-                partial_cot=partial_cot,
+            sample_tokens = result.tokens[force_idx]
+            answer, raw_response = extract_force_answer(sample_tokens, tokenizer)
+
+            # Extract the continued thinking (text before </think>)
+            if "</think>" in raw_response:
+                continued_cot = raw_response.split("</think>", 1)[0]
+            else:
+                continued_cot = raw_response
+
+            force_result = ForceResult(
                 sentence_idx=sentence_idx,
                 force_idx=force_idx,
-                semaphore=semaphore,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                max_retries=max_retries,
+                partial_cot=partial_cot,
+                continued_cot=continued_cot,
+                raw_tokens=list(sample_tokens),
+                raw_response=raw_response,
+                answer=answer,
             )
-            jobs.append(job)
+            force_results.append(force_result)
 
-    # Run all jobs concurrently with progress bar
-    results = await atqdm.gather(
-        *jobs,
-        desc="Forcing",
-        total=total_jobs,
-    )
-
-    valid_count = sum(1 for r in results if r.is_valid_single_token)
-    if verbose:
-        print(f"\nDone. {valid_count}/{total_jobs} valid single-token responses.")
-        print()
-
-    # Group results by sentence
-    results_by_sentence: Dict[int, List[ForceResult]] = {}
-    for r in results:
-        if r.sentence_idx not in results_by_sentence:
-            results_by_sentence[r.sentence_idx] = []
-        results_by_sentence[r.sentence_idx].append(r)
-
-    # Process and save results per sentence
-    all_sentence_summaries = []
-    for sentence_idx in range(num_sentences):
-        sentence_results = results_by_sentence.get(sentence_idx, [])
-        partial_cot = cot_segments[sentence_idx]
-
+        # Save per-sentence results
         if save_results:
             task.save_forcing_result(
                 question=question,
                 sentence_idx=sentence_idx,
                 partial_cot=partial_cot,
-                force_results=[r.to_dict() for r in sentence_results],
+                force_results=[r.to_dict() for r in force_results],
+                rollout_idx=rollout_idx,
             )
 
-        answers = [r.answer for r in sentence_results if r.answer]
-        valid_results = [r for r in sentence_results if r.is_valid_single_token]
-
+        # Compute sentence summary
+        answers = [r.answer for r in force_results if r.answer]
         answer_counts: Dict[str, int] = {}
         for a in answers:
             answer_counts[a] = answer_counts.get(a, 0) + 1
@@ -330,8 +274,8 @@ async def run_forcing_async(
         sentence_summary = {
             "sentence_idx": sentence_idx,
             "partial_cot_length": len(partial_cot),
-            "total_forces": len(sentence_results),
-            "valid_single_token": len(valid_results),
+            "total_forces": len(force_results),
+            "valid_answers": len(answers),
             "answer_counts": answer_counts,
             "most_common": max(answer_counts.items(), key=lambda x: x[1])[0] if answer_counts else "",
         }
@@ -339,15 +283,19 @@ async def run_forcing_async(
 
         if verbose:
             print(f"  Sentence {sentence_idx + 1}/{num_sentences}: "
-                  f"{answer_counts}, valid: {len(valid_results)}/{len(sentence_results)}")
+                  f"{answer_counts}, valid: {len(answers)}/{len(force_results)}")
 
     # Save overall summary
     if save_results:
         task.save_forcing_summary(
             question=question,
-            source_rollout_idx=0,
+            source_rollout_idx=rollout_idx,
             all_sentence_results=all_sentence_summaries,
+            source_cot=source_cot,
         )
+
+    if verbose:
+        print(f"\nDone. Processed {num_sentences} sentences.")
 
     return {
         "question_id": question.id,
@@ -357,51 +305,29 @@ async def run_forcing_async(
     }
 
 
-def run_forcing(
-    question: GPQAQuestion,
-    source_cot: str,
-    num_forces: int = 5,
-    max_workers: int = 300,
-    model: str = "moonshotai/kimi-k2-thinking",
-    api_key: Optional[str] = None,
-    temperature: float = 0.7,
-    max_tokens: int = 2000,
-    max_retries: int = MAX_RETRIES,
-    save_results: bool = True,
-    verbose: bool = True,
-) -> Dict[str, Any]:
-    """
-    Run forcing for all sentences (sync wrapper around async implementation).
-    """
-    return asyncio.run(run_forcing_async(
-        question=question,
-        source_cot=source_cot,
-        num_forces=num_forces,
-        max_workers=max_workers,
-        model=model,
-        api_key=api_key,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        max_retries=max_retries,
-        save_results=save_results,
-        verbose=verbose,
-    ))
-
-
 def run_forcing_from_verification(
     question_id: str,
+    model: str,
     rollout_idx: int = 0,
     num_forces: int = 5,
-    max_workers: int = 300,
-    model: str = "moonshotai/kimi-k2-thinking",
-    api_key: Optional[str] = None,
     temperature: float = 0.7,
-    max_tokens: int = 2000,
-    max_retries: int = MAX_RETRIES,
+    max_tokens: int = 16384,
     verbose: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
-    Run forcing using a CoT from verification rollouts.
+    Run true forcing using a CoT from verification rollouts.
+
+    Args:
+        question_id: ID of the question to force
+        rollout_idx: Which verification rollout to use as source
+        num_forces: Number of force samples per sentence
+        model: Model identifier
+        temperature: Sampling temperature
+        max_tokens: Max tokens to generate (model finishes thinking + answer)
+        verbose: Whether to print progress
+
+    Returns:
+        Summary dictionary or None if data not found
     """
     task = ForcedResponseTask(model=model)
 
@@ -441,7 +367,7 @@ def run_forcing_from_verification(
         return None
 
     if verbose:
-        print(f"Running forcing for {question_id}")
+        print(f"Running forcing (Tinker) for {question_id}")
         print(f"Using rollout {rollout_idx}")
         print(f"CoT length: {len(source_cot)} characters")
         print()
@@ -450,11 +376,9 @@ def run_forcing_from_verification(
         question=question,
         source_cot=source_cot,
         num_forces=num_forces,
-        max_workers=max_workers,
         model=model,
-        api_key=api_key,
         temperature=temperature,
         max_tokens=max_tokens,
-        max_retries=max_retries,
         verbose=verbose,
+        rollout_idx=rollout_idx,
     )

@@ -29,10 +29,11 @@ class ForcedResponseTask(BaseTask):
         self.task_dir = Path(__file__).parent.parent.parent.parent / "data" / "forced_response"
         self.verification_dir = self.task_dir / "verification"
         self.forcing_dir = self.task_dir / "forcing"
+        self.monitor_dir = self.task_dir / "monitor"
         self.resampling_dir = self.task_dir / "resampling"
 
         # Ensure directories exist
-        for d in [self.verification_dir, self.forcing_dir, self.resampling_dir]:
+        for d in [self.verification_dir, self.forcing_dir, self.monitor_dir, self.resampling_dir]:
             d.mkdir(parents=True, exist_ok=True)
 
     def get_question_dir(self, question_id: str, mode: str) -> Path:
@@ -50,6 +51,8 @@ class ForcedResponseTask(BaseTask):
             base_dir = self.verification_dir
         elif mode == "forcing":
             base_dir = self.forcing_dir
+        elif mode == "monitor":
+            base_dir = self.monitor_dir
         elif mode == "resampling":
             base_dir = self.resampling_dir
         else:
@@ -151,6 +154,7 @@ class ForcedResponseTask(BaseTask):
         sentence_idx: int,
         partial_cot: str,
         force_results: List[Dict[str, Any]],
+        rollout_idx: int = 0,
     ) -> Path:
         """
         Save forcing results for a specific sentence in the CoT.
@@ -160,12 +164,14 @@ class ForcedResponseTask(BaseTask):
             sentence_idx: Index of the sentence in the CoT
             partial_cot: The partial CoT up to this point
             force_results: List of force attempt results
+            rollout_idx: Index of the source rollout being forced
 
         Returns:
             Path to the saved results file
         """
         question_dir = self.get_question_dir(question.id, "forcing")
-        sentence_dir = question_dir / f"sentence_{sentence_idx:03d}"
+        rollout_dir = question_dir / f"rollout_{rollout_idx:03d}"
+        sentence_dir = rollout_dir / f"sentence_{sentence_idx:03d}"
         sentence_dir.mkdir(parents=True, exist_ok=True)
 
         # Save individual force attempts
@@ -233,29 +239,131 @@ class ForcedResponseTask(BaseTask):
         question: GPQAQuestion,
         source_rollout_idx: int,
         all_sentence_results: List[Dict[str, Any]],
+        source_cot: str = "",
     ) -> Path:
         """
-        Save overall forcing summary for a question.
+        Save overall forcing summary for a question inside the rollout directory.
 
         Args:
             question: The GPQA question
             source_rollout_idx: Index of the rollout used for forcing
             all_sentence_results: List of summaries for each sentence
+            source_cot: The full source chain of thought from the rollout
 
         Returns:
             Path to the saved summary file
         """
         question_dir = self.get_question_dir(question.id, "forcing")
+        rollout_dir = question_dir / f"rollout_{source_rollout_idx:03d}"
+        rollout_dir.mkdir(parents=True, exist_ok=True)
 
         summary = {
             "question_id": question.id,
             "source_rollout_idx": source_rollout_idx,
             "correct_answer": question.correct_answer,
             "num_sentences": len(all_sentence_results),
+            "source_cot": source_cot,
             "sentence_summaries": all_sentence_results,
         }
 
-        summary_path = question_dir / "summary.json"
+        summary_path = rollout_dir / "summary.json"
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        return summary_path
+
+    def save_monitor_result(
+        self,
+        question: GPQAQuestion,
+        sentence_idx: int,
+        partial_cot: str,
+        force_results: List[Dict[str, Any]],
+        rollout_idx: int = 0,
+    ) -> Path:
+        """
+        Save monitor results for a specific sentence in the CoT.
+
+        Args:
+            question: The GPQA question
+            sentence_idx: Index of the sentence in the CoT
+            partial_cot: The partial CoT up to this point
+            force_results: List of monitor attempt results
+            rollout_idx: Index of the source rollout being monitored
+
+        Returns:
+            Path to the saved results file
+        """
+        question_dir = self.get_question_dir(question.id, "monitor")
+        rollout_dir = question_dir / f"rollout_{rollout_idx:03d}"
+        sentence_dir = rollout_dir / f"sentence_{sentence_idx:03d}"
+        sentence_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save individual monitor attempts
+        for i, result in enumerate(force_results):
+            force_path = sentence_dir / f"force_{i:03d}.json"
+            with open(force_path, "w") as f:
+                json.dump(result, f, indent=2)
+
+        # Compute summary for this sentence
+        answers = [r.get("answer", "").upper() for r in force_results]
+        valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
+        valid_single_token = [
+            r for r in force_results
+            if r.get("is_valid_single_token", False)
+        ]
+
+        answer_counts = {}
+        for a in valid_answers:
+            answer_counts[a] = answer_counts.get(a, 0) + 1
+
+        summary = {
+            "question_id": question.id,
+            "sentence_idx": sentence_idx,
+            "partial_cot": partial_cot,
+            "total_attempts": len(force_results),
+            "valid_single_token": len(valid_single_token),
+            "answer_counts": answer_counts,
+        }
+
+        summary_path = sentence_dir / "summary.json"
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        return summary_path
+
+    def save_monitor_summary(
+        self,
+        question: GPQAQuestion,
+        source_rollout_idx: int,
+        all_sentence_results: List[Dict[str, Any]],
+        source_cot: str = "",
+    ) -> Path:
+        """
+        Save overall monitor summary for a question inside the rollout directory.
+
+        Args:
+            question: The GPQA question
+            source_rollout_idx: Index of the rollout used for monitoring
+            all_sentence_results: List of summaries for each sentence
+            source_cot: The full source chain of thought from the rollout
+
+        Returns:
+            Path to the saved summary file
+        """
+        question_dir = self.get_question_dir(question.id, "monitor")
+        rollout_dir = question_dir / f"rollout_{source_rollout_idx:03d}"
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+
+        summary = {
+            "question_id": question.id,
+            "source_rollout_idx": source_rollout_idx,
+            "correct_answer": question.correct_answer,
+            "num_sentences": len(all_sentence_results),
+            "source_cot": source_cot,
+            "sentence_summaries": all_sentence_results,
+        }
+
+        summary_path = rollout_dir / "summary.json"
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
 
