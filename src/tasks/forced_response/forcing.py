@@ -7,6 +7,7 @@ an answer. This is "true forcing" because the model's reasoning IS seeded
 with the partial CoT prefix — it continues thinking from there and answers.
 """
 
+import asyncio
 import io
 import json
 import os
@@ -16,7 +17,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 
+import openai
 from tqdm import tqdm
+from tqdm.asyncio import tqdm as atqdm
 from transformers import AutoTokenizer
 from tinker import ServiceClient, types
 
@@ -169,6 +172,7 @@ def run_forcing(
     source_cot: str,
     model: str,
     num_forces: int = 5,
+    max_sentences: Optional[int] = None,
     temperature: float = 0.7,
     max_tokens: int = 2048,
     save_results: bool = True,
@@ -206,6 +210,8 @@ def run_forcing(
 
     # Get cumulative CoT segments (after each sentence)
     cot_segments = get_cumulative_cot_segments(source_cot)
+    if max_sentences is not None:
+        cot_segments = cot_segments[:max_sentences]
     num_sentences = len(cot_segments)
 
     # Create timestamped run directory
@@ -216,6 +222,7 @@ def run_forcing(
             "question_id": question.id,
             "rollout_idx": rollout_idx,
             "num_forces": num_forces,
+            "max_sentences": max_sentences,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "num_sentences": num_sentences,
@@ -379,6 +386,7 @@ def run_forcing_from_verification(
     model: str,
     rollout_idx: int = 0,
     num_forces: int = 5,
+    max_sentences: Optional[int] = None,
     temperature: float = 0.7,
     max_tokens: int = 2048,
     verbose: bool = True,
@@ -445,6 +453,7 @@ def run_forcing_from_verification(
         question=question,
         source_cot=source_cot,
         num_forces=num_forces,
+        max_sentences=max_sentences,
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,

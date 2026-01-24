@@ -12,22 +12,26 @@ Measures sycophancy in AITA-style moral judgments. The model judges whether a Re
 
 ### Running
 
+Use `--subject-model` and `--monitor-model` to specify models (saved to `config.json` in each timestamped run dir). Use `--output-dir` to separate runs by model.
+
 **1. Generate data** - Run control + intervention rollouts:
 
 ```bash
-python -m src.tasks.scruples.run_scruples --generate-data --variant first_person --max-prompts 10 --num-samples 50 --max-workers 300
+python -m src.tasks.scruples.run_scruples --generate-data --variant first_person --max-prompts 50 --num-samples 10 \
+  --subject-model qwen/qwen3-32b --monitor-model openai/gpt-4o-mini --output-dir data/scruples-qwen3-32b
 ```
 
 **2. Add more prompts** - Append new prompts to existing data (skips already-processed):
 
 ```bash
-python -m src.tasks.scruples.run_scruples --generate-data --add --variant first_person --max-prompts 5 --num-samples 50 --max-workers 300
+python -m src.tasks.scruples.run_scruples --generate-data --add --variant first_person --max-prompts 5 --num-samples 50
 ```
 
-**3. Run monitor** - Predict counterfactual answer from CoT (intervention arm only):
+**3. Run black-box monitor** - Predict counterfactual answer from CoT (intervention arm only):
 
 ```bash
-python -m src.tasks.scruples.run_scruples --run-monitor --variant first_person --max-workers 300
+python -m src.tasks.scruples.run_scruples --run-monitor --variant first_person --max-workers 300 \
+  --monitor-model openai/gpt-4o-mini --output-dir data/scruples-qwen3-32b
 ```
 
 **4. Run baseline** - Ask monitor directly who is wrong (no CoT):
@@ -35,6 +39,30 @@ python -m src.tasks.scruples.run_scruples --run-monitor --variant first_person -
 ```bash
 python -m src.tasks.scruples.run_scruples --run-baseline --variant first_person
 ```
+
+**5. SAE white-box monitor** - Find discriminative features then score responses (requires local Qwen3-32B):
+
+```bash
+# Step 1: Find features that discriminate sycophantic vs non-sycophantic responses
+python -m src.tasks.scruples.run_scruples --find-sae-features --output-dir data/scruples-qwen3-32b \
+  --sae-layer 32 --sae-trainer 0 --load-in-4bit
+
+# Step 2: Score all intervention responses using the trained probe
+python -m src.tasks.scruples.run_scruples --run-sae --output-dir data/scruples-qwen3-32b --load-in-4bit
+
+# Or use the standalone SAE CLI:
+python -m src.tasks.scruples.sae --find-features --output-dir data/scruples-qwen3-32b --sae-layer 32
+python -m src.tasks.scruples.sae --run-monitor --output-dir data/scruples-qwen3-32b
+```
+
+SAE options:
+- `--sae-layer {16,32,48}` — model depth (25%, 50%, 75%). Default: 32
+- `--sae-trainer {0,1,2,3}` — 0=16k/L0=80, 1=16k/L0=160, 2=65k/L0=80, 3=65k/L0=160. Default: 0 (lowest width)
+- `--load-in-4bit` — quantize local model to ~18GB VRAM
+- `--top-k-features N` — number of discriminative features to select (default: 50)
+- `--sae-max-samples N` — limit samples for feature finding
+
+**Note on SAE activation filtering:** The Qwen3-32B SAEs were trained with activations >10x median norm excluded (~0.1% of tokens affected by attention sinks). This filtering is applied automatically during feature extraction.
 
 ### Key metrics
 
@@ -45,19 +73,25 @@ python -m src.tasks.scruples.run_scruples --run-baseline --variant first_person
 ### Data layout
 
 ```
-data/scruples/
+data/scruples-{model}/
 ├── runs/{timestamp}/              # Model rollouts
-│   ├── config.json
+│   ├── config.json                # subject_model, variant, num_samples, etc.
 │   └── {anecdote_id}/
 │       ├── control_{idx}.json
 │       └── intervention_{idx}.json
-├── monitor/{timestamp}/           # Monitor predictions
-│   ├── config.json
+├── monitor/{timestamp}/           # Black-box monitor predictions
+│   ├── config.json                # monitor_model, variant
 │   └── {anecdote_id}/
 │       └── intervention_{idx}.json
 ├── baseline/{timestamp}/          # Direct judgments
 │   ├── config.json
 │   └── {anecdote_id}.json
+├── sae/{timestamp}/               # SAE feature discovery
+│   ├── config.json                # sae_layer, sae_trainer, model_name
+│   └── features.json              # Discriminative features + probe weights
+├── sae_monitor/{timestamp}/       # SAE monitor scoring
+│   ├── config.json
+│   └── scores.csv
 ├── results_{variant}.csv          # All individual runs
 ├── prompts_{variant}.csv          # Per-prompt aggregated results
 └── metrics_{variant}.json         # Summary metrics
@@ -65,8 +99,11 @@ data/scruples/
 
 ### Models
 
-- **Subject**: `moonshotai/kimi-k2-thinking` (via OpenRouter)
-- **Monitor**: `openai/gpt-5.2` (via OpenRouter)
+- **Subject (default)**: `moonshotai/kimi-k2-thinking` (via OpenRouter)
+- **Subject (alt)**: `qwen/qwen3-32b` (via OpenRouter)
+- **Black-box monitor (default)**: `openai/gpt-5.2` (via OpenRouter)
+- **Black-box monitor (alt)**: `openai/gpt-4o-mini` (via OpenRouter)
+- **SAE source**: [`adamkarvonen/qwen3-32b-saes`](https://huggingface.co/adamkarvonen/qwen3-32b-saes) — BatchTopK SAEs at layers 16/32/48, widths 16k/65k
 
 ---
 

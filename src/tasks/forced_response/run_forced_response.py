@@ -163,6 +163,8 @@ def cmd_force(args):
         print(f"Using verified question: {args.question_id}")
 
     print(f"Running true forcing (Tinker) with {args.num_forces} samples per sentence")
+    if args.max_sentences:
+        print(f"Limiting to first {args.max_sentences} sentences")
     print(f"Model: {args.model}")
     print()
 
@@ -170,6 +172,7 @@ def cmd_force(args):
         question_id=args.question_id,
         rollout_idx=args.rollout_idx,
         num_forces=args.num_forces,
+        max_sentences=args.max_sentences,
         model=args.model,
         verbose=True,
     )
@@ -566,6 +569,12 @@ def main():
         type=float,
         default=0.8,
         help="Agreement threshold for selecting questions (default: 0.8)",
+    )
+    force_parser.add_argument(
+        "--max-sentences", "-m",
+        type=int,
+        default=None,
+        help="Only force the first M sentences (default: all)",
     )
     force_parser.set_defaults(func=cmd_force)
 
