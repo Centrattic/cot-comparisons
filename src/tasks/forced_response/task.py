@@ -4,6 +4,7 @@ Forced Response Task
 Analyzes chain-of-thought by forcing the model to answer at different points.
 """
 
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import json
@@ -29,11 +30,13 @@ class ForcedResponseTask(BaseTask):
         self.task_dir = Path(__file__).parent.parent.parent.parent / "data" / "forced_response"
         self.verification_dir = self.task_dir / "verification"
         self.forcing_dir = self.task_dir / "forcing"
-        self.monitor_dir = self.task_dir / "monitor"
+        self.monitor_forcing_dir = self.task_dir / "monitor_forcing"
+        self.monitor_resampling_dir = self.task_dir / "monitor_resampling"
         self.resampling_dir = self.task_dir / "resampling"
 
         # Ensure directories exist
-        for d in [self.verification_dir, self.forcing_dir, self.monitor_dir, self.resampling_dir]:
+        for d in [self.verification_dir, self.forcing_dir, self.monitor_forcing_dir,
+                  self.monitor_resampling_dir, self.resampling_dir]:
             d.mkdir(parents=True, exist_ok=True)
 
     def get_question_dir(self, question_id: str, mode: str) -> Path:
@@ -42,25 +45,77 @@ class ForcedResponseTask(BaseTask):
 
         Args:
             question_id: The question ID
-            mode: "verification", "forcing", or "resampling"
+            mode: "verification", "forcing", "monitor_forcing", "monitor_resampling", or "resampling"
 
         Returns:
             Path to the question directory
         """
-        if mode == "verification":
-            base_dir = self.verification_dir
-        elif mode == "forcing":
-            base_dir = self.forcing_dir
-        elif mode == "monitor":
-            base_dir = self.monitor_dir
-        elif mode == "resampling":
-            base_dir = self.resampling_dir
-        else:
+        mode_dirs = {
+            "verification": self.verification_dir,
+            "forcing": self.forcing_dir,
+            "monitor_forcing": self.monitor_forcing_dir,
+            "monitor_resampling": self.monitor_resampling_dir,
+            "resampling": self.resampling_dir,
+        }
+        if mode not in mode_dirs:
             raise ValueError(f"Unknown mode: {mode}")
 
-        question_dir = base_dir / question_id
+        question_dir = mode_dirs[mode] / question_id
         question_dir.mkdir(parents=True, exist_ok=True)
         return question_dir
+
+    def create_run_dir(self, mode: str, question_id: str, rollout_idx: int, config: dict) -> Path:
+        """
+        Create a timestamped run directory with config.json.
+
+        Args:
+            mode: Run type ("forcing", "resampling", "monitor_forcing", "monitor_resampling")
+            question_id: The question ID
+            rollout_idx: Index of the source rollout
+            config: Configuration dict to save as config.json
+
+        Returns:
+            Path to the created timestamped run directory
+        """
+        base = self.get_question_dir(question_id, mode)
+        rollout_dir = base / f"rollout_{rollout_idx:03d}"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = rollout_dir / timestamp
+        run_dir.mkdir(parents=True, exist_ok=True)
+        config["timestamp"] = datetime.now().isoformat()
+        config["run_type"] = mode
+        with open(run_dir / "config.json", "w") as f:
+            json.dump(config, f, indent=2)
+        return run_dir
+
+    @staticmethod
+    def get_latest_run_dir(rollout_dir: Path) -> Optional[Path]:
+        """
+        Get the latest timestamped run directory inside a rollout dir.
+
+        Falls back to the rollout_dir itself if no timestamped subdirs exist
+        (for backward compatibility with migrated data).
+
+        Args:
+            rollout_dir: Path to the rollout directory
+
+        Returns:
+            Path to the latest run directory, or None if nothing exists
+        """
+        if not rollout_dir.exists():
+            return None
+        # Look for timestamped subdirs (YYYYMMDD_HHMMSS format)
+        timestamped = sorted(
+            [d for d in rollout_dir.iterdir()
+             if d.is_dir() and len(d.name) == 15 and d.name[8] == '_'],
+            reverse=True,
+        )
+        if timestamped:
+            return timestamped[0]
+        # Fallback: if summary.json exists directly in rollout_dir (pre-migration)
+        if (rollout_dir / "summary.json").exists():
+            return rollout_dir
+        return None
 
     def get_ground_truth(self, row) -> str:
         """Get the correct answer letter for a question."""
@@ -155,6 +210,7 @@ class ForcedResponseTask(BaseTask):
         partial_cot: str,
         force_results: List[Dict[str, Any]],
         rollout_idx: int = 0,
+        run_dir: Optional[Path] = None,
     ) -> Path:
         """
         Save forcing results for a specific sentence in the CoT.
@@ -165,13 +221,17 @@ class ForcedResponseTask(BaseTask):
             partial_cot: The partial CoT up to this point
             force_results: List of force attempt results
             rollout_idx: Index of the source rollout being forced
+            run_dir: Timestamped run directory (if None, falls back to legacy path)
 
         Returns:
             Path to the saved results file
         """
-        question_dir = self.get_question_dir(question.id, "forcing")
-        rollout_dir = question_dir / f"rollout_{rollout_idx:03d}"
-        sentence_dir = rollout_dir / f"sentence_{sentence_idx:03d}"
+        if run_dir:
+            sentence_dir = run_dir / f"sentence_{sentence_idx:03d}"
+        else:
+            question_dir = self.get_question_dir(question.id, "forcing")
+            rollout_dir = question_dir / f"rollout_{rollout_idx:03d}"
+            sentence_dir = rollout_dir / f"sentence_{sentence_idx:03d}"
         sentence_dir.mkdir(parents=True, exist_ok=True)
 
         # Save individual force attempts
@@ -183,10 +243,6 @@ class ForcedResponseTask(BaseTask):
         # Compute summary for this sentence
         answers = [r.get("answer", "").upper() for r in force_results]
         valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
-        valid_single_token = [
-            r for r in force_results
-            if r.get("is_valid_single_token", False)
-        ]
 
         answer_counts = {}
         for a in valid_answers:
@@ -197,7 +253,7 @@ class ForcedResponseTask(BaseTask):
             "sentence_idx": sentence_idx,
             "partial_cot": partial_cot,
             "total_attempts": len(force_results),
-            "valid_single_token": len(valid_single_token),
+            "valid_answers": len(valid_answers),
             "answer_counts": answer_counts,
         }
 
@@ -240,22 +296,27 @@ class ForcedResponseTask(BaseTask):
         source_rollout_idx: int,
         all_sentence_results: List[Dict[str, Any]],
         source_cot: str = "",
+        run_dir: Optional[Path] = None,
     ) -> Path:
         """
-        Save overall forcing summary for a question inside the rollout directory.
+        Save overall forcing summary for a question.
 
         Args:
             question: The GPQA question
             source_rollout_idx: Index of the rollout used for forcing
             all_sentence_results: List of summaries for each sentence
             source_cot: The full source chain of thought from the rollout
+            run_dir: Timestamped run directory (if None, falls back to legacy path)
 
         Returns:
             Path to the saved summary file
         """
-        question_dir = self.get_question_dir(question.id, "forcing")
-        rollout_dir = question_dir / f"rollout_{source_rollout_idx:03d}"
-        rollout_dir.mkdir(parents=True, exist_ok=True)
+        if run_dir:
+            save_dir = run_dir
+        else:
+            question_dir = self.get_question_dir(question.id, "forcing")
+            save_dir = question_dir / f"rollout_{source_rollout_idx:03d}"
+            save_dir.mkdir(parents=True, exist_ok=True)
 
         summary = {
             "question_id": question.id,
@@ -266,7 +327,7 @@ class ForcedResponseTask(BaseTask):
             "sentence_summaries": all_sentence_results,
         }
 
-        summary_path = rollout_dir / "summary.json"
+        summary_path = save_dir / "summary.json"
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
 
@@ -278,7 +339,7 @@ class ForcedResponseTask(BaseTask):
         sentence_idx: int,
         partial_cot: str,
         force_results: List[Dict[str, Any]],
-        rollout_idx: int = 0,
+        run_dir: Path,
     ) -> Path:
         """
         Save monitor results for a specific sentence in the CoT.
@@ -288,14 +349,12 @@ class ForcedResponseTask(BaseTask):
             sentence_idx: Index of the sentence in the CoT
             partial_cot: The partial CoT up to this point
             force_results: List of monitor attempt results
-            rollout_idx: Index of the source rollout being monitored
+            run_dir: Timestamped run directory
 
         Returns:
             Path to the saved results file
         """
-        question_dir = self.get_question_dir(question.id, "monitor")
-        rollout_dir = question_dir / f"rollout_{rollout_idx:03d}"
-        sentence_dir = rollout_dir / f"sentence_{sentence_idx:03d}"
+        sentence_dir = run_dir / f"sentence_{sentence_idx:03d}"
         sentence_dir.mkdir(parents=True, exist_ok=True)
 
         # Save individual monitor attempts
@@ -337,22 +396,22 @@ class ForcedResponseTask(BaseTask):
         source_rollout_idx: int,
         all_sentence_results: List[Dict[str, Any]],
         source_cot: str = "",
+        run_dir: Optional[Path] = None,
     ) -> Path:
         """
-        Save overall monitor summary for a question inside the rollout directory.
+        Save overall monitor summary.
 
         Args:
             question: The GPQA question
             source_rollout_idx: Index of the rollout used for monitoring
             all_sentence_results: List of summaries for each sentence
             source_cot: The full source chain of thought from the rollout
+            run_dir: Timestamped run directory
 
         Returns:
             Path to the saved summary file
         """
-        question_dir = self.get_question_dir(question.id, "monitor")
-        rollout_dir = question_dir / f"rollout_{source_rollout_idx:03d}"
-        rollout_dir.mkdir(parents=True, exist_ok=True)
+        save_dir = run_dir if run_dir else Path(".")
 
         summary = {
             "question_id": question.id,
@@ -363,7 +422,7 @@ class ForcedResponseTask(BaseTask):
             "sentence_summaries": all_sentence_results,
         }
 
-        summary_path = rollout_dir / "summary.json"
+        summary_path = save_dir / "summary.json"
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
 
@@ -375,6 +434,8 @@ class ForcedResponseTask(BaseTask):
         sentence_idx: int,
         forced_prefix: str,
         resample_results: List[Dict[str, Any]],
+        rollout_idx: int = 0,
+        run_dir: Optional[Path] = None,
     ) -> Path:
         """
         Save resampling results for a specific sentence in the CoT.
@@ -384,12 +445,18 @@ class ForcedResponseTask(BaseTask):
             sentence_idx: Index of the sentence in the CoT
             forced_prefix: The forced prefix used for resampling
             resample_results: List of resample attempt results
+            rollout_idx: Index of the source rollout being resampled
+            run_dir: Timestamped run directory (if None, falls back to legacy path)
 
         Returns:
             Path to the saved results file
         """
-        question_dir = self.get_question_dir(question.id, "resampling")
-        sentence_dir = question_dir / f"sentence_{sentence_idx:03d}"
+        if run_dir:
+            sentence_dir = run_dir / f"sentence_{sentence_idx:03d}"
+        else:
+            question_dir = self.get_question_dir(question.id, "resampling")
+            rollout_dir = question_dir / f"rollout_{rollout_idx:03d}"
+            sentence_dir = rollout_dir / f"sentence_{sentence_idx:03d}"
         sentence_dir.mkdir(parents=True, exist_ok=True)
 
         # Save individual resample attempts
@@ -432,6 +499,7 @@ class ForcedResponseTask(BaseTask):
         question: GPQAQuestion,
         source_rollout_idx: int,
         all_sentence_results: List[Dict[str, Any]],
+        run_dir: Optional[Path] = None,
     ) -> Path:
         """
         Save overall resampling summary for a question.
@@ -440,11 +508,17 @@ class ForcedResponseTask(BaseTask):
             question: The GPQA question
             source_rollout_idx: Index of the rollout used for resampling
             all_sentence_results: List of summaries for each sentence
+            run_dir: Timestamped run directory (if None, falls back to legacy path)
 
         Returns:
             Path to the saved summary file
         """
-        question_dir = self.get_question_dir(question.id, "resampling")
+        if run_dir:
+            save_dir = run_dir
+        else:
+            question_dir = self.get_question_dir(question.id, "resampling")
+            save_dir = question_dir / f"rollout_{source_rollout_idx:03d}"
+            save_dir.mkdir(parents=True, exist_ok=True)
 
         summary = {
             "question_id": question.id,
@@ -454,7 +528,7 @@ class ForcedResponseTask(BaseTask):
             "sentence_summaries": all_sentence_results,
         }
 
-        summary_path = question_dir / "summary.json"
+        summary_path = save_dir / "summary.json"
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
 

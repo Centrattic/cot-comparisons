@@ -9,8 +9,11 @@ Usage:
     # Run true forcing (Tinker prefill) on a verified question
     python run_forced_response.py force --question-id gpqa_sample_001 -n 5
 
-    # Run monitor (CoT in user message) on a verified question
-    python run_forced_response.py monitor --question-id gpqa_sample_001 -n 5
+    # Run forcing monitor on a verified question
+    python run_forced_response.py monitor-forcing --question-id gpqa_sample_001 -n 5
+
+    # Run resampling monitor on a verified question
+    python run_forced_response.py monitor-resampling --question-id gpqa_sample_001 -n 5
 
     # Full pipeline: verify then force
     python run_forced_response.py full --num-rollouts 50 --num-forces 5
@@ -44,12 +47,15 @@ from src.tasks.forced_response.forcing import (
     run_forcing,
     run_forcing_from_verification,
 )
-from src.tasks.forced_response.monitor import (
-    run_monitor,
-    run_monitor_from_verification,
+from src.tasks.forced_response.monitor_forcing import (
+    run_monitor_forcing,
+    run_monitor_forcing_from_verification,
+)
+from src.tasks.forced_response.monitor_resampling import (
+    run_monitor_resampling,
+    run_monitor_resampling_from_verification,
 )
 from src.tasks.forced_response.resampling import (
-    run_resampling,
     run_resampling_from_verification,
 )
 from src.tasks.forced_response.task import ForcedResponseTask
@@ -191,10 +197,9 @@ def cmd_force(args):
         return 1
 
 
-def cmd_monitor(args):
-    """Run monitor (CoT-in-user-message) on a verified question."""
+def cmd_monitor_forcing(args):
+    """Run forcing monitor on a verified question."""
     if not args.question_id:
-        # Find verified questions
         task = ForcedResponseTask(model=args.model)
         verified = task.get_verified_questions(threshold=args.threshold)
 
@@ -205,12 +210,12 @@ def cmd_monitor(args):
         args.question_id = verified[0]
         print(f"Using verified question: {args.question_id}")
 
-    print(f"Running monitor with {args.num_forces} attempts per sentence")
+    print(f"Running monitor-forcing with {args.num_forces} attempts per sentence")
     print(f"Model: {args.model}")
     print(f"Max workers: {args.max_workers}")
     print()
 
-    summary = run_monitor_from_verification(
+    summary = run_monitor_forcing_from_verification(
         question_id=args.question_id,
         rollout_idx=args.rollout_idx,
         num_forces=args.num_forces,
@@ -222,14 +227,64 @@ def cmd_monitor(args):
 
     if summary:
         print("\n" + "=" * 60)
-        print("MONITOR COMPLETE")
+        print("MONITOR-FORCING COMPLETE")
         print("=" * 60)
         print(f"Question: {summary['question_id']}")
         print(f"Correct answer: {summary['correct_answer']}")
         print(f"Sentences processed: {summary['num_sentences']}")
 
-        # Show answer progression
         print("\nAnswer progression by sentence:")
+        for result in summary["sentence_results"]:
+            idx = result["sentence_idx"]
+            counts = result["answer_counts"]
+            valid = result["valid_single_token"]
+            total = result["total_forces"]
+            most_common = result.get("most_common", "?")
+            print(f"  Sentence {idx + 1}: {counts} (valid: {valid}/{total}, most common: {most_common})")
+
+        return 0
+    else:
+        return 1
+
+
+def cmd_monitor_resampling(args):
+    """Run resampling monitor on a verified question."""
+    if not args.question_id:
+        task = ForcedResponseTask(model=args.model)
+        verified = task.get_verified_questions(threshold=args.threshold)
+
+        if not verified:
+            print("No verified questions found. Run 'verify' first.")
+            return 1
+
+        args.question_id = verified[0]
+        print(f"Using verified question: {args.question_id}")
+
+    print(f"Running monitor-resampling with {args.num_forces} attempts at ~{args.num_prefix_points} prefix points")
+    print(f"Model: {args.model}")
+    print(f"Max workers: {args.max_workers}")
+    print()
+
+    summary = run_monitor_resampling_from_verification(
+        question_id=args.question_id,
+        rollout_idx=args.rollout_idx,
+        num_forces=args.num_forces,
+        num_prefix_points=args.num_prefix_points,
+        max_workers=args.max_workers,
+        model=args.model,
+        api_key=args.api_key,
+        verbose=True,
+    )
+
+    if summary:
+        print("\n" + "=" * 60)
+        print("MONITOR-RESAMPLING COMPLETE")
+        print("=" * 60)
+        print(f"Question: {summary['question_id']}")
+        print(f"Correct answer: {summary['correct_answer']}")
+        print(f"Prefix points: {summary['num_prefix_points']} (stride {summary['stride']}, {summary['num_sentences']} total sentences)")
+
+        print("\nAnswer progression by prefix point:")
         for result in summary["sentence_results"]:
             idx = result["sentence_idx"]
             counts = result["answer_counts"]
@@ -305,6 +360,56 @@ def cmd_full(args):
         return 1
 
 
+def cmd_resample(args):
+    """Run resampling (Tinker prefix continuation) on a verified question."""
+    if not args.question_id:
+        task = ForcedResponseTask(model=args.model)
+        verified = task.get_verified_questions(threshold=args.threshold)
+
+        if not verified:
+            print("No verified questions found. Run 'verify' first.")
+            return 1
+
+        args.question_id = verified[0]
+        print(f"Using verified question: {args.question_id}")
+
+    print(f"Running resampling (Tinker) with {args.num_resamples} samples at ~{args.num_prefix_points} prefix points")
+    print(f"Model: {args.model}")
+    print()
+
+    summary = run_resampling_from_verification(
+        question_id=args.question_id,
+        model=args.model,
+        rollout_idx=args.rollout_idx,
+        num_resamples=args.num_resamples,
+        num_prefix_points=args.num_prefix_points,
+        verbose=True,
+    )
+
+    if summary:
+        print("\n" + "=" * 60)
+        print("RESAMPLING COMPLETE (Tinker)")
+        print("=" * 60)
+        print(f"Question: {summary['question_id']}")
+        print(f"Correct answer: {summary['correct_answer']}")
+        print(f"Prefix points: {summary['num_prefix_points']} (stride {summary['stride']}, {summary['num_sentences']} total sentences)")
+        print(f"Resamples per point: {summary['num_resamples']}")
+
+        print("\nAnswer distribution by prefix point:")
+        for result in summary["sentence_results"]:
+            idx = result["sentence_idx"]
+            counts = result["answer_counts"]
+            valid = result["valid_answers"]
+            total = result["total_resamples"]
+            most_common = result.get("most_common", "?")
+            rate = result.get("agreement_rate", 0)
+            print(f"  Sentence {idx + 1}: {counts} (valid: {valid}/{total}, most common: {most_common} @ {rate:.0%})")
+
+        return 0
+    else:
+        return 1
+
+
 def cmd_list(args):
     """List verified questions and their status."""
     task = ForcedResponseTask(model=args.model)
@@ -328,14 +433,20 @@ def cmd_list(args):
                 print(f"    Agreement: {agreement:.1%} (meets threshold: {meets})")
                 print(f"    Most common: {most_common} ({correct})")
 
-    # Show forcing and monitor results
-    for label, data_dir in [("Forcing (Tinker)", task.forcing_dir), ("Monitor", task.monitor_dir)]:
+    # Show results for each mode
+    modes = [
+        ("Forcing (Tinker)", task.forcing_dir),
+        ("Monitor-Forcing", task.monitor_forcing_dir),
+        ("Resampling (Tinker)", task.resampling_dir),
+        ("Monitor-Resampling", task.monitor_resampling_dir),
+    ]
+    for label, data_dir in modes:
         print()
         print(f"{label} Results:")
         print("-" * 60)
 
         if not data_dir.exists():
-            print(f"No {label.lower()} data found.")
+            print(f"  No data found.")
             continue
 
         for question_dir in sorted(data_dir.iterdir()):
@@ -346,19 +457,14 @@ def cmd_list(args):
                 if rollout_dirs:
                     print(f"  {question_dir.name}:")
                     for rollout_dir in rollout_dirs:
-                        summary_path = rollout_dir / "summary.json"
-                        if summary_path.exists():
-                            with open(summary_path) as f:
+                        # Find latest timestamped run
+                        latest = task.get_latest_run_dir(rollout_dir)
+                        if latest and (latest / "summary.json").exists():
+                            with open(latest / "summary.json") as f:
                                 summary = json.load(f)
                             num_sentences = summary.get("num_sentences", 0)
-                            print(f"    {rollout_dir.name}: {num_sentences} sentences processed")
-                else:
-                    summary_path = question_dir / "summary.json"
-                    if summary_path.exists():
-                        with open(summary_path) as f:
-                            summary = json.load(f)
-                        num_sentences = summary.get("num_sentences", 0)
-                        print(f"  {question_dir.name}: {num_sentences} sentences processed")
+                            run_label = latest.name if latest != rollout_dir else "(legacy)"
+                            print(f"    {rollout_dir.name} [{run_label}]: {num_sentences} sentences")
 
     return 0
 
@@ -463,40 +569,81 @@ def main():
     )
     force_parser.set_defaults(func=cmd_force)
 
-    # Monitor command (CoT-in-user-message approach)
-    monitor_parser = subparsers.add_parser(
-        "monitor",
-        help="Run monitor (CoT in user message) on a verified question",
+    # Monitor-forcing command
+    mf_parser = subparsers.add_parser(
+        "monitor-forcing",
+        help="Run forcing monitor (predicts answer from prefill context)",
     )
-    monitor_parser.add_argument(
+    mf_parser.add_argument(
         "--question-id", "-q",
         help="Question ID to monitor (default: first verified question)",
     )
-    monitor_parser.add_argument(
+    mf_parser.add_argument(
         "--rollout-idx", "-r",
         type=int,
         default=0,
         help="Which verification rollout to use as source (default: 0)",
     )
-    monitor_parser.add_argument(
+    mf_parser.add_argument(
         "--num-forces", "-n",
         type=int,
         default=5,
         help="Number of monitor attempts per sentence (default: 5)",
     )
-    monitor_parser.add_argument(
+    mf_parser.add_argument(
         "--threshold", "-t",
         type=float,
         default=0.8,
         help="Agreement threshold for selecting questions (default: 0.8)",
     )
-    monitor_parser.add_argument(
+    mf_parser.add_argument(
         "--max-workers", "-w",
         type=int,
         default=300,
         help="Maximum concurrent API calls (default: 300)",
     )
-    monitor_parser.set_defaults(func=cmd_monitor)
+    mf_parser.set_defaults(func=cmd_monitor_forcing)
+
+    # Monitor-resampling command
+    mr_parser = subparsers.add_parser(
+        "monitor-resampling",
+        help="Run resampling monitor (predicts majority answer from prefix)",
+    )
+    mr_parser.add_argument(
+        "--question-id", "-q",
+        help="Question ID to monitor (default: first verified question)",
+    )
+    mr_parser.add_argument(
+        "--rollout-idx", "-r",
+        type=int,
+        default=0,
+        help="Which verification rollout to use as source (default: 0)",
+    )
+    mr_parser.add_argument(
+        "--num-forces", "-n",
+        type=int,
+        default=5,
+        help="Number of monitor attempts per prefix point (default: 5)",
+    )
+    mr_parser.add_argument(
+        "--num-prefix-points",
+        type=int,
+        default=20,
+        help="Target number of evenly-spaced prefix points (default: 20)",
+    )
+    mr_parser.add_argument(
+        "--threshold", "-t",
+        type=float,
+        default=0.8,
+        help="Agreement threshold for selecting questions (default: 0.8)",
+    )
+    mr_parser.add_argument(
+        "--max-workers", "-w",
+        type=int,
+        default=300,
+        help="Maximum concurrent API calls (default: 300)",
+    )
+    mr_parser.set_defaults(func=cmd_monitor_resampling)
 
     # Full command
     full_parser = subparsers.add_parser(
@@ -549,6 +696,41 @@ def main():
     )
     full_parser.set_defaults(func=cmd_full)
 
+    # Resample command (Tinker-based prefix continuation)
+    resample_parser = subparsers.add_parser(
+        "resample",
+        help="Run resampling (Tinker prefix continuation) on a verified question",
+    )
+    resample_parser.add_argument(
+        "--question-id", "-q",
+        help="Question ID to resample (default: first verified question)",
+    )
+    resample_parser.add_argument(
+        "--rollout-idx", "-r",
+        type=int,
+        default=0,
+        help="Which verification rollout to use as source (default: 0)",
+    )
+    resample_parser.add_argument(
+        "--num-resamples", "-n",
+        type=int,
+        default=20,
+        help="Number of continuations per prefix point (default: 20)",
+    )
+    resample_parser.add_argument(
+        "--num-prefix-points",
+        type=int,
+        default=20,
+        help="Target number of evenly-spaced prefix points (default: 20)",
+    )
+    resample_parser.add_argument(
+        "--threshold", "-t",
+        type=float,
+        default=0.8,
+        help="Agreement threshold for selecting questions (default: 0.8)",
+    )
+    resample_parser.set_defaults(func=cmd_resample)
+
     # List command
     list_parser = subparsers.add_parser(
         "list",
@@ -558,8 +740,8 @@ def main():
 
     args = parser.parse_args()
 
-    # Check for API key (not needed for 'force' which uses Tinker, or 'list')
-    if args.command not in ("force", "list"):
+    # Check for API key (not needed for Tinker-based commands or 'list')
+    if args.command not in ("force", "resample", "list"):
         if not args.api_key and not os.environ.get("OPENROUTER_API_KEY"):
             print("Error: No API key provided. Set OPENROUTER_API_KEY or use --api-key")
             return 1

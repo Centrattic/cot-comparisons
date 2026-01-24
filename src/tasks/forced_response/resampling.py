@@ -1,22 +1,33 @@
 """
-Resampling module for the Forced Response task.
+Resampling module — Tinker-based prefix continuation.
 
-Unlike forcing (which asks for just the answer given partial CoT as context),
-resampling forces the partial CoT as the assistant's prefix and lets the model
-continue generating. We run N resamples to see the output distribution.
+Takes ~20 evenly-spaced prefixes of a CoT, forces each as the start of
+the model's <think> block, and lets the model generate 20 continuations
+per prefix. This gives the resampled answer distribution at each point.
 """
 
-import os
+import io
 import json
-from pathlib import Path
+import re
+import contextlib
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
-import openai
+
+from tqdm import tqdm
+from transformers import AutoTokenizer
+from tinker import ServiceClient, types
 
 from .data_loader import GPQAQuestion
-from .prompts import get_question_prompt, get_cumulative_cot_segments
-from .verification import extract_answer
+from .prompts import get_cumulative_cot_segments
 from .task import ForcedResponseTask
+
+
+# Kimi K2 chat template tokens
+IM_SYSTEM = "<|im_system|>"
+IM_USER = "<|im_user|>"
+IM_ASSISTANT = "<|im_assistant|>"
+IM_MIDDLE = "<|im_middle|>"
+IM_END = "<|im_end|>"
 
 
 @dataclass
@@ -27,8 +38,8 @@ class ResampleResult:
     forced_prefix: str
     continuation: str
     full_response: str
-    thinking: str
     answer: str
+    raw_tokens: List[int]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -37,337 +48,112 @@ class ResampleResult:
             "forced_prefix": self.forced_prefix,
             "continuation": self.continuation,
             "full_response": self.full_response,
-            "thinking": self.thinking,
             "answer": self.answer,
+            "raw_tokens": self.raw_tokens,
         }
 
 
-def get_resample_messages(
+def init_tinker_client(model: str) -> Tuple[Any, AutoTokenizer]:
+    """Initialize the Tinker sampling client and tokenizer."""
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    client = ServiceClient()
+    sampling_client = client.create_sampling_client(base_model=model)
+    return sampling_client, tokenizer
+
+
+def build_resample_prompt(
     question: str,
     choices: List[str],
-    forced_prefix: str,
-) -> List[Dict[str, Any]]:
+    partial_cot: str,
+    tokenizer: AutoTokenizer,
+) -> types.ModelInput:
     """
-    Create messages for resampling with a forced prefix.
-
-    Uses assistant prefill: we provide the partial CoT as an incomplete
-    assistant message, and the model continues from there.
-
-    Args:
-        question: The question text
-        choices: List of answer choices
-        forced_prefix: The partial CoT to force as prefix
-
-    Returns:
-        List of messages with assistant prefill
+    Build a tokenized prompt that prefills the start of the model's thinking
+    with partial CoT. The model continues generating from there.
     """
     choice_labels = [chr(ord('A') + i) for i in range(len(choices))]
     choices_text = "\n".join(
         f"{label}. {choice}" for label, choice in zip(choice_labels, choices)
     )
 
-    user_prompt = f"""Answer the following multiple choice question. Think through the problem step by step, then provide your final answer.
-
-Question: {question}
-
-{choices_text}
-
-After your reasoning, provide your final answer as just the letter (A, B, C, or D) on a new line."""
-
-    # Use assistant prefill to force the prefix
-    messages = [
-        {"role": "user", "content": user_prompt},
-        {"role": "assistant", "content": forced_prefix},
-    ]
-    return messages
-
-
-def run_single_resample(
-    client: openai.OpenAI,
-    question: GPQAQuestion,
-    forced_prefix: str,
-    sentence_idx: int,
-    resample_idx: int,
-    model: str = "moonshotai/kimi-k2-thinking",
-    temperature: float = 0.7,
-    max_tokens: int = 8000,
-) -> ResampleResult:
-    """
-    Run a single resample by forcing a prefix and letting the model continue.
-
-    Args:
-        client: OpenAI client configured for OpenRouter
-        question: The GPQA question
-        forced_prefix: The partial CoT to force as prefix
-        sentence_idx: Index of the sentence we're resampling at
-        resample_idx: Index of this resample attempt
-        model: Model to use
-        temperature: Sampling temperature
-        max_tokens: Maximum tokens for continuation
-
-    Returns:
-        ResampleResult with the continuation and answer
-    """
-    messages = get_resample_messages(
-        question=question.question,
-        choices=question.choices,
-        forced_prefix=forced_prefix,
+    user_msg = (
+        f"{question}\n\n{choices_text}\n\n"
+        f"Answer with just the letter (A, B, C, or D)."
     )
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-
-        choice = response.choices[0]
-        message = choice.message
-
-        # Extract thinking (for thinking models)
-        thinking = ""
-        if hasattr(message, 'reasoning') and message.reasoning:
-            thinking = message.reasoning
-        elif hasattr(message, 'reasoning_content') and message.reasoning_content:
-            thinking = message.reasoning_content
-
-        # The continuation is what the model generated
-        continuation = message.content or ""
-
-        # Full response is prefix + continuation
-        full_response = forced_prefix + continuation
-
-        # Extract answer from the full response
-        answer = extract_answer(full_response)
-
-        return ResampleResult(
-            sentence_idx=sentence_idx,
-            resample_idx=resample_idx,
-            forced_prefix=forced_prefix,
-            continuation=continuation,
-            full_response=full_response,
-            thinking=thinking,
-            answer=answer,
-        )
-
-    except Exception as e:
-        print(f"Error in resample {resample_idx} at sentence {sentence_idx}: {e}")
-        return ResampleResult(
-            sentence_idx=sentence_idx,
-            resample_idx=resample_idx,
-            forced_prefix=forced_prefix,
-            continuation=f"ERROR: {e}",
-            full_response=forced_prefix,
-            thinking="",
-            answer="",
-        )
-
-
-def run_resampling_for_sentence(
-    client: openai.OpenAI,
-    question: GPQAQuestion,
-    forced_prefix: str,
-    sentence_idx: int,
-    num_resamples: int = 50,
-    model: str = "moonshotai/kimi-k2-thinking",
-    temperature: float = 0.7,
-    verbose: bool = True,
-) -> List[ResampleResult]:
-    """
-    Run multiple resamples for a single sentence position.
-
-    Args:
-        client: OpenAI client configured for OpenRouter
-        question: The GPQA question
-        forced_prefix: The partial CoT to force as prefix
-        sentence_idx: Index of the sentence
-        num_resamples: Number of resample attempts
-        model: Model to use
-        temperature: Sampling temperature
-        verbose: Whether to print progress
-
-    Returns:
-        List of ResampleResult objects
-    """
-    results = []
-
-    for i in range(num_resamples):
-        if verbose:
-            print(f"    Resample {i+1}/{num_resamples}...", end=" ", flush=True)
-
-        result = run_single_resample(
-            client=client,
-            question=question,
-            forced_prefix=forced_prefix,
-            sentence_idx=sentence_idx,
-            resample_idx=i,
-            model=model,
-            temperature=temperature,
-        )
-        results.append(result)
-
-        if verbose:
-            print(f"Answer: {result.answer or 'N/A'}")
-
-    return results
-
-
-def run_resampling(
-    question: GPQAQuestion,
-    source_cot: str,
-    num_resamples: int = 50,
-    model: str = "moonshotai/kimi-k2-thinking",
-    api_key: Optional[str] = None,
-    temperature: float = 0.7,
-    sentence_indices: Optional[List[int]] = None,
-    save_results: bool = True,
-    verbose: bool = True,
-) -> Dict[str, Any]:
-    """
-    Run resampling for sentences in a chain of thought.
-
-    Args:
-        question: The GPQA question
-        source_cot: The full chain of thought to resample from
-        num_resamples: Number of resample attempts per sentence
-        model: Model to use
-        api_key: OpenRouter API key
-        temperature: Sampling temperature
-        sentence_indices: Optional list of specific sentence indices to resample
-                         (if None, resamples all sentences)
-        save_results: Whether to save results to disk
-        verbose: Whether to print progress
-
-    Returns:
-        Summary dictionary with all resampling results
-    """
-    # Initialize client
-    client = openai.OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key or os.environ.get("OPENROUTER_API_KEY"),
+    prompt_str = (
+        f"{IM_SYSTEM}system{IM_MIDDLE}"
+        f"You are Kimi, an AI assistant created by Moonshot AI."
+        f"{IM_END}"
+        f"{IM_USER}user{IM_MIDDLE}"
+        f"{user_msg}"
+        f"{IM_END}"
+        f"{IM_ASSISTANT}assistant{IM_MIDDLE}"
+        f"<think>{partial_cot}"
     )
 
-    task = ForcedResponseTask(model=model)
+    with contextlib.redirect_stdout(io.StringIO()):
+        tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
+    return types.ModelInput.from_ints(tokens)
 
-    # Get cumulative CoT segments (after each sentence)
-    cot_segments = get_cumulative_cot_segments(source_cot)
 
-    if verbose:
-        print(f"Found {len(cot_segments)} sentences in CoT")
-        print(f"Correct answer: {question.correct_answer}")
-        print(f"Resamples per sentence: {num_resamples}")
-        print()
+def extract_resample_answer(tokens: List[int], tokenizer: AutoTokenizer) -> Tuple[str, str, str]:
+    """
+    Decode sampled tokens and extract the answer from after </think>.
 
-    # Determine which sentences to process
-    if sentence_indices is None:
-        indices_to_process = list(range(len(cot_segments)))
+    Returns:
+        Tuple of (answer_letter, continued_cot, full_decoded_text)
+    """
+    text = tokenizer.decode(tokens, skip_special_tokens=True)
+
+    if "</think>" in text:
+        parts = text.split("</think>", 1)
+        continued_cot = parts[0]
+        answer_text = parts[1].strip()
     else:
-        indices_to_process = [i for i in sentence_indices if i < len(cot_segments)]
+        continued_cot = text
+        answer_text = ""
 
-    all_results = []
+    # Extract answer letter
+    clean = answer_text.upper().rstrip('.').strip()
+    if clean in ['A', 'B', 'C', 'D']:
+        return clean, continued_cot, text
 
-    for sentence_idx in indices_to_process:
-        forced_prefix = cot_segments[sentence_idx]
+    match = re.search(r'\b([A-Da-d])\b', answer_text)
+    if match:
+        return match.group(1).upper(), continued_cot, text
 
-        if verbose:
-            # Show first 100 chars of the prefix
-            preview = forced_prefix[:100] + "..." if len(forced_prefix) > 100 else forced_prefix
-            print(f"  Sentence {sentence_idx + 1}/{len(cot_segments)}: {preview}")
-
-        resample_results = run_resampling_for_sentence(
-            client=client,
-            question=question,
-            forced_prefix=forced_prefix,
-            sentence_idx=sentence_idx,
-            num_resamples=num_resamples,
-            model=model,
-            temperature=temperature,
-            verbose=verbose,
-        )
-
-        # Save results for this sentence
-        if save_results:
-            task.save_resampling_result(
-                question=question,
-                sentence_idx=sentence_idx,
-                forced_prefix=forced_prefix,
-                resample_results=[r.to_dict() for r in resample_results],
-            )
-
-        # Compute summary for this sentence
-        answers = [r.answer for r in resample_results if r.answer]
-        valid_answers = [a for a in answers if a in ['A', 'B', 'C', 'D']]
-
-        answer_counts = {}
-        for a in valid_answers:
-            answer_counts[a] = answer_counts.get(a, 0) + 1
-
-        total_valid = len(valid_answers)
-        most_common = max(answer_counts.items(), key=lambda x: x[1]) if answer_counts else ("", 0)
-
-        sentence_summary = {
-            "sentence_idx": sentence_idx,
-            "forced_prefix_length": len(forced_prefix),
-            "total_resamples": len(resample_results),
-            "valid_answers": total_valid,
-            "answer_counts": answer_counts,
-            "most_common": most_common[0],
-            "most_common_count": most_common[1],
-            "agreement_rate": most_common[1] / total_valid if total_valid > 0 else 0,
-        }
-        all_results.append(sentence_summary)
-
-        if verbose:
-            print(f"    Summary: {answer_counts}")
-            print(f"    Most common: {most_common[0]} ({most_common[1]}/{total_valid})")
-            print()
-
-    # Save overall summary
-    if save_results:
-        task.save_resampling_summary(
-            question=question,
-            source_rollout_idx=0,  # Could be parameterized
-            all_sentence_results=all_results,
-        )
-
-    summary = {
-        "question_id": question.id,
-        "correct_answer": question.correct_answer,
-        "num_sentences": len(cot_segments),
-        "sentences_processed": len(indices_to_process),
-        "num_resamples": num_resamples,
-        "sentence_results": all_results,
-    }
-
-    return summary
+    return "", continued_cot, text
 
 
 def run_resampling_from_verification(
     question_id: str,
+    model: str,
     rollout_idx: int = 0,
-    num_resamples: int = 50,
-    model: str = "moonshotai/kimi-k2-thinking",
-    api_key: Optional[str] = None,
+    num_resamples: int = 20,
+    num_prefix_points: int = 20,
     temperature: float = 0.7,
-    sentence_indices: Optional[List[int]] = None,
+    max_tokens: int = 2048,
     verbose: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
     Run resampling using a CoT from verification rollouts.
 
+    Selects ~num_prefix_points evenly-spaced prefix points from the CoT,
+    then runs num_resamples continuations at each point via Tinker.
+
     Args:
-        question_id: ID of the verified question
-        rollout_idx: Which rollout to use as source (default: first)
-        num_resamples: Number of resample attempts per sentence
-        model: Model to use
-        api_key: OpenRouter API key
+        question_id: ID of the question to resample
+        model: HuggingFace model identifier for Tinker
+        rollout_idx: Which verification rollout to use as source
+        num_resamples: Number of continuations per prefix point
+        num_prefix_points: Target number of prefix points (~20)
         temperature: Sampling temperature
-        sentence_indices: Optional list of specific sentence indices to resample
+        max_tokens: Max tokens to generate per continuation
         verbose: Whether to print progress
 
     Returns:
-        Resampling summary, or None if verification data not found
+        Summary dictionary or None if data not found
     """
     task = ForcedResponseTask(model=model)
 
@@ -377,7 +163,6 @@ def run_resampling_from_verification(
         print(f"No verification data found for {question_id}")
         return None
 
-    # Load the specified rollout
     rollout_path = verification_dir / "rollouts" / f"rollout_{rollout_idx:03d}.json"
     if not rollout_path.exists():
         print(f"Rollout {rollout_idx} not found for {question_id}")
@@ -386,12 +171,10 @@ def run_resampling_from_verification(
     with open(rollout_path) as f:
         rollout_data = json.load(f)
 
-    # Load question from summary
     summary_path = verification_dir / "summary.json"
     with open(summary_path) as f:
         summary = json.load(f)
 
-    # Reconstruct question object
     question = GPQAQuestion(
         id=summary["question_id"],
         question=summary["question"],
@@ -403,26 +186,176 @@ def run_resampling_from_verification(
     # Get the CoT from the rollout
     source_cot = rollout_data.get("thinking", "")
     if not source_cot:
-        # Fall back to full response if no separate thinking
         source_cot = rollout_data.get("full_response", "")
 
     if not source_cot:
         print(f"No CoT found in rollout {rollout_idx}")
         return None
 
+    # Get cumulative CoT segments
+    cot_segments = get_cumulative_cot_segments(source_cot)
+    num_sentences = len(cot_segments)
+
+    # Compute stride for ~num_prefix_points evenly-spaced points
+    stride = max(num_sentences // num_prefix_points, 1)
+    selected_indices = list(range(0, num_sentences, stride))
+
     if verbose:
-        print(f"Running resampling for {question_id}")
+        print(f"Running resampling (Tinker) for {question_id}")
         print(f"Using rollout {rollout_idx}")
         print(f"CoT length: {len(source_cot)} characters")
+        print(f"Total sentences: {num_sentences}, stride: {stride}, prefix points: {len(selected_indices)}")
+        print(f"Resamples per point: {num_resamples}")
         print()
 
-    return run_resampling(
-        question=question,
-        source_cot=source_cot,
-        num_resamples=num_resamples,
-        model=model,
-        api_key=api_key,
+    # Initialize Tinker
+    sampling_client, tokenizer = init_tinker_client(model)
+    with contextlib.redirect_stdout(io.StringIO()):
+        im_end_token = tokenizer.encode(IM_END, add_special_tokens=False)
+
+    # Create timestamped run directory
+    config = {
+        "model": model,
+        "question_id": question.id,
+        "rollout_idx": rollout_idx,
+        "num_resamples": num_resamples,
+        "num_prefix_points": len(selected_indices),
+        "stride": stride,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "num_sentences": num_sentences,
+    }
+    run_dir = task.create_run_dir("resampling", question.id, rollout_idx, config)
+    if verbose:
+        print(f"Run dir: {run_dir}")
+        print()
+
+    params = types.SamplingParams(
+        max_tokens=max_tokens,
         temperature=temperature,
-        sentence_indices=sentence_indices,
-        verbose=verbose,
+        stop=im_end_token,
     )
+
+    # Submit all futures upfront
+    futures = []
+    for sentence_idx in selected_indices:
+        partial_cot = cot_segments[sentence_idx]
+        prompt = build_resample_prompt(
+            question=question.question,
+            choices=question.choices,
+            partial_cot=partial_cot,
+            tokenizer=tokenizer,
+        )
+        future = sampling_client.sample(
+            prompt=prompt,
+            num_samples=num_resamples,
+            sampling_params=params,
+        )
+        futures.append((sentence_idx, partial_cot, future))
+
+    # Collect results with progress bar
+    all_sentence_summaries = []
+
+    for sentence_idx, partial_cot, future in tqdm(
+        futures, desc="Resampling", unit="prefix", disable=not verbose
+    ):
+        valid_results: List[ResampleResult] = []
+        result = future.result()
+
+        for i in range(len(result.sequences)):
+            sample_tokens = result.sequences[i].tokens
+            answer, continued_cot, full_text = extract_resample_answer(sample_tokens, tokenizer)
+
+            if answer:
+                resample_result = ResampleResult(
+                    sentence_idx=sentence_idx,
+                    resample_idx=len(valid_results),
+                    forced_prefix=partial_cot,
+                    continuation=continued_cot,
+                    full_response=partial_cot + full_text,
+                    answer=answer,
+                    raw_tokens=list(sample_tokens),
+                )
+                valid_results.append(resample_result)
+
+        # One retry if not enough valid answers
+        if len(valid_results) < num_resamples:
+            needed = num_resamples - len(valid_results)
+            prompt = build_resample_prompt(
+                question=question.question,
+                choices=question.choices,
+                partial_cot=partial_cot,
+                tokenizer=tokenizer,
+            )
+            retry_result = sampling_client.sample(
+                prompt=prompt,
+                num_samples=needed,
+                sampling_params=params,
+            ).result()
+
+            for i in range(len(retry_result.sequences)):
+                sample_tokens = retry_result.sequences[i].tokens
+                answer, continued_cot, full_text = extract_resample_answer(sample_tokens, tokenizer)
+
+                if answer:
+                    resample_result = ResampleResult(
+                        sentence_idx=sentence_idx,
+                        resample_idx=len(valid_results),
+                        forced_prefix=partial_cot,
+                        continuation=continued_cot,
+                        full_response=partial_cot + full_text,
+                        answer=answer,
+                        raw_tokens=list(sample_tokens),
+                    )
+                    valid_results.append(resample_result)
+
+        # Save per-prefix results
+        task.save_resampling_result(
+            question=question,
+            sentence_idx=sentence_idx,
+            forced_prefix=partial_cot,
+            resample_results=[r.to_dict() for r in valid_results],
+            rollout_idx=rollout_idx,
+            run_dir=run_dir,
+        )
+
+        # Compute summary for this prefix point
+        answer_counts: Dict[str, int] = {}
+        for r in valid_results:
+            answer_counts[r.answer] = answer_counts.get(r.answer, 0) + 1
+
+        total_valid = len(valid_results)
+        most_common = max(answer_counts.items(), key=lambda x: x[1]) if answer_counts else ("", 0)
+
+        sentence_summary = {
+            "sentence_idx": sentence_idx,
+            "forced_prefix_length": len(partial_cot),
+            "total_resamples": total_valid,
+            "valid_answers": total_valid,
+            "answer_counts": answer_counts,
+            "most_common": most_common[0],
+            "most_common_count": most_common[1],
+            "agreement_rate": most_common[1] / total_valid if total_valid > 0 else 0,
+        }
+        all_sentence_summaries.append(sentence_summary)
+
+    # Save overall summary
+    task.save_resampling_summary(
+        question=question,
+        source_rollout_idx=rollout_idx,
+        all_sentence_results=all_sentence_summaries,
+        run_dir=run_dir,
+    )
+
+    if verbose:
+        print(f"\nDone. Processed {len(selected_indices)} prefix points.")
+
+    return {
+        "question_id": question.id,
+        "correct_answer": question.correct_answer,
+        "num_sentences": num_sentences,
+        "num_prefix_points": len(selected_indices),
+        "stride": stride,
+        "num_resamples": num_resamples,
+        "sentence_results": all_sentence_summaries,
+    }

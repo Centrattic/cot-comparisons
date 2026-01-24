@@ -7,12 +7,16 @@ an answer. This is "true forcing" because the model's reasoning IS seeded
 with the partial CoT prefix — it continues thinking from there and answers.
 """
 
+import io
 import json
+import os
 import re
+import contextlib
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 
+from tqdm import tqdm
 from transformers import AutoTokenizer
 from tinker import ServiceClient, types
 
@@ -118,7 +122,8 @@ def build_force_prompt(
         f"<think>{partial_cot}"
     )
 
-    tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
     return types.ModelInput.from_ints(tokens)
 
 
@@ -165,7 +170,7 @@ def run_forcing(
     model: str,
     num_forces: int = 5,
     temperature: float = 0.7,
-    max_tokens: int = 16384,
+    max_tokens: int = 2048,
     save_results: bool = True,
     verbose: bool = True,
     rollout_idx: int = 0,
@@ -196,64 +201,131 @@ def run_forcing(
     task = ForcedResponseTask(model=model)
 
     # Get the im_end token ID for stop sequence
-    im_end_token = tokenizer.encode(IM_END, add_special_tokens=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        im_end_token = tokenizer.encode(IM_END, add_special_tokens=False)
 
     # Get cumulative CoT segments (after each sentence)
     cot_segments = get_cumulative_cot_segments(source_cot)
     num_sentences = len(cot_segments)
 
+    # Create timestamped run directory
+    run_dir = None
+    if save_results:
+        config = {
+            "model": model,
+            "question_id": question.id,
+            "rollout_idx": rollout_idx,
+            "num_forces": num_forces,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "num_sentences": num_sentences,
+        }
+        run_dir = task.create_run_dir("forcing", question.id, rollout_idx, config)
+
     if verbose:
         print(f"Found {num_sentences} sentences in CoT")
         print(f"Correct answer: {question.correct_answer}")
         print(f"Running {num_forces} forces per sentence via Tinker")
+        if run_dir:
+            print(f"Run dir: {run_dir}")
         print()
 
     all_sentence_summaries = []
 
+    # Tokenize full source CoT once to compute per-sentence max_tokens
+    with contextlib.redirect_stdout(io.StringIO()):
+        source_cot_token_count = len(tokenizer.encode(source_cot, add_special_tokens=False))
+
+    # Submit all sampling requests upfront for maximum parallelism
+    futures = []
     for sentence_idx, partial_cot in enumerate(cot_segments):
-        # Build the prefilled prompt
+        # max_tokens = remaining CoT tokens + buffer for </think> and answer
+        remaining_frac = 1.0 - len(partial_cot) / max(len(source_cot), 1)
+        sentence_max_tokens = int(source_cot_token_count * remaining_frac) + 100
+        sentence_max_tokens = max(sentence_max_tokens, 100)
+
+        params = types.SamplingParams(
+            max_tokens=sentence_max_tokens,
+            temperature=temperature,
+            stop=im_end_token,
+        )
+
         prompt = build_force_prompt(
             question=question.question,
             choices=question.choices,
             partial_cot=partial_cot,
             tokenizer=tokenizer,
         )
-
-        # Sample num_forces completions in one call
-        params = types.SamplingParams(
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stop=im_end_token,
-        )
         future = sampling_client.sample(
             prompt=prompt,
             num_samples=num_forces,
             sampling_params=params,
         )
+        futures.append((sentence_idx, partial_cot, params, future))
+
+    # Collect results with progress bar
+    for sentence_idx, partial_cot, params, future in tqdm(
+        futures, desc="Forcing", unit="sentence", disable=not verbose
+    ):
+        valid_results: List[ForceResult] = []
         result = future.result()
 
-        # Extract answers from each sample
-        force_results = []
-        for force_idx in range(num_forces):
-            sample_tokens = result.tokens[force_idx]
+        for i in range(len(result.sequences)):
+            sample_tokens = result.sequences[i].tokens
             answer, raw_response = extract_force_answer(sample_tokens, tokenizer)
 
-            # Extract the continued thinking (text before </think>)
-            if "</think>" in raw_response:
-                continued_cot = raw_response.split("</think>", 1)[0]
-            else:
-                continued_cot = raw_response
+            if answer:
+                if "</think>" in raw_response:
+                    continued_cot = raw_response.split("</think>", 1)[0]
+                else:
+                    continued_cot = raw_response
 
-            force_result = ForceResult(
-                sentence_idx=sentence_idx,
-                force_idx=force_idx,
+                force_result = ForceResult(
+                    sentence_idx=sentence_idx,
+                    force_idx=len(valid_results),
+                    partial_cot=partial_cot,
+                    continued_cot=continued_cot,
+                    raw_tokens=list(sample_tokens),
+                    raw_response=raw_response,
+                    answer=answer,
+                )
+                valid_results.append(force_result)
+
+        # One retry if not enough valid answers
+        if len(valid_results) < num_forces:
+            needed = num_forces - len(valid_results)
+            prompt = build_force_prompt(
+                question=question.question,
+                choices=question.choices,
                 partial_cot=partial_cot,
-                continued_cot=continued_cot,
-                raw_tokens=list(sample_tokens),
-                raw_response=raw_response,
-                answer=answer,
+                tokenizer=tokenizer,
             )
-            force_results.append(force_result)
+            retry_result = sampling_client.sample(
+                prompt=prompt,
+                num_samples=needed,
+                sampling_params=params,
+            ).result()
+
+            for i in range(len(retry_result.sequences)):
+                sample_tokens = retry_result.sequences[i].tokens
+                answer, raw_response = extract_force_answer(sample_tokens, tokenizer)
+
+                if answer:
+                    if "</think>" in raw_response:
+                        continued_cot = raw_response.split("</think>", 1)[0]
+                    else:
+                        continued_cot = raw_response
+
+                    force_result = ForceResult(
+                        sentence_idx=sentence_idx,
+                        force_idx=len(valid_results),
+                        partial_cot=partial_cot,
+                        continued_cot=continued_cot,
+                        raw_tokens=list(sample_tokens),
+                        raw_response=raw_response,
+                        answer=answer,
+                    )
+                    valid_results.append(force_result)
 
         # Save per-sentence results
         if save_results:
@@ -261,29 +333,25 @@ def run_forcing(
                 question=question,
                 sentence_idx=sentence_idx,
                 partial_cot=partial_cot,
-                force_results=[r.to_dict() for r in force_results],
+                force_results=[r.to_dict() for r in valid_results],
                 rollout_idx=rollout_idx,
+                run_dir=run_dir,
             )
 
         # Compute sentence summary
-        answers = [r.answer for r in force_results if r.answer]
         answer_counts: Dict[str, int] = {}
-        for a in answers:
-            answer_counts[a] = answer_counts.get(a, 0) + 1
+        for r in valid_results:
+            answer_counts[r.answer] = answer_counts.get(r.answer, 0) + 1
 
         sentence_summary = {
             "sentence_idx": sentence_idx,
             "partial_cot_length": len(partial_cot),
-            "total_forces": len(force_results),
-            "valid_answers": len(answers),
+            "total_forces": len(valid_results),
+            "valid_answers": len(valid_results),
             "answer_counts": answer_counts,
             "most_common": max(answer_counts.items(), key=lambda x: x[1])[0] if answer_counts else "",
         }
         all_sentence_summaries.append(sentence_summary)
-
-        if verbose:
-            print(f"  Sentence {sentence_idx + 1}/{num_sentences}: "
-                  f"{answer_counts}, valid: {len(answers)}/{len(force_results)}")
 
     # Save overall summary
     if save_results:
@@ -292,6 +360,7 @@ def run_forcing(
             source_rollout_idx=rollout_idx,
             all_sentence_results=all_sentence_summaries,
             source_cot=source_cot,
+            run_dir=run_dir,
         )
 
     if verbose:
@@ -311,7 +380,7 @@ def run_forcing_from_verification(
     rollout_idx: int = 0,
     num_forces: int = 5,
     temperature: float = 0.7,
-    max_tokens: int = 16384,
+    max_tokens: int = 2048,
     verbose: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
