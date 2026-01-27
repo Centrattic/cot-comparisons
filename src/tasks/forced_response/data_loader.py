@@ -6,14 +6,14 @@ GPQA is a challenging multiple-choice dataset designed to test expert-level reas
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, asdict
 import pandas as pd
 
 
 @dataclass
 class GPQAQuestion:
-    """A single GPQA question."""
+    """A single GPQA question (multiple choice)."""
     id: str
     question: str
     choices: List[str]
@@ -21,12 +21,31 @@ class GPQAQuestion:
     correct_index: int   # 0-indexed
     subject: Optional[str] = None
     difficulty: Optional[str] = None
+    question_type: str = "multiple_choice"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GPQAQuestion":
+        return cls(**data)
+
+
+@dataclass
+class BinaryJudgeQuestion:
+    """A question that requires an LLM judge to classify the response."""
+    id: str
+    question: str
+    judge_prompt: str  # Prompt template for the judge, with {response} placeholder
+    bad_outcome: str   # What the judge returns if the model misbehaves (e.g., "YES")
+    subject: Optional[str] = None
+    question_type: str = "binary_judge"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "BinaryJudgeQuestion":
         return cls(**data)
 
 
@@ -106,17 +125,23 @@ SAMPLE_GPQA_QUESTIONS = [
 ]
 
 
+# Type alias for any question type
+Question = Union[GPQAQuestion, BinaryJudgeQuestion]
+
+
 def load_custom_questions(
     questions_file: Optional[Path] = None,
-) -> List[GPQAQuestion]:
+) -> List[Question]:
     """
     Load custom questions from questions.json.
+
+    Supports both multiple_choice and binary_judge question types.
 
     Args:
         questions_file: Path to questions.json (defaults to the one in this directory)
 
     Returns:
-        List of GPQAQuestion objects
+        List of Question objects (GPQAQuestion or BinaryJudgeQuestion)
     """
     if questions_file is None:
         questions_file = Path(__file__).parent / "questions.json"
@@ -127,19 +152,31 @@ def load_custom_questions(
     with open(questions_file) as f:
         data = json.load(f)
 
-    questions = []
+    questions: List[Question] = []
     for item in data:
-        correct_answer = item["correct_answer"]
-        correct_index = ord(correct_answer) - ord('A')
-        questions.append(GPQAQuestion(
-            id=item["id"],
-            question=item["question"],
-            choices=item["choices"],
-            correct_answer=correct_answer,
-            correct_index=correct_index,
-            subject=item.get("subject"),
-            difficulty=item.get("difficulty"),
-        ))
+        question_type = item.get("type", "multiple_choice")
+
+        if question_type == "binary_judge":
+            questions.append(BinaryJudgeQuestion(
+                id=item["id"],
+                question=item["question"],
+                judge_prompt=item["judge_prompt"],
+                bad_outcome=item["bad_outcome"],
+                subject=item.get("subject"),
+            ))
+        else:
+            # Default to multiple choice
+            correct_answer = item["correct_answer"]
+            correct_index = ord(correct_answer) - ord('A')
+            questions.append(GPQAQuestion(
+                id=item["id"],
+                question=item["question"],
+                choices=item["choices"],
+                correct_answer=correct_answer,
+                correct_index=correct_index,
+                subject=item.get("subject"),
+                difficulty=item.get("difficulty"),
+            ))
 
     return questions
 

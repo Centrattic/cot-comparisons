@@ -18,7 +18,8 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from tinker import ServiceClient, types
 
-from .data_loader import GPQAQuestion
+from .data_loader import GPQAQuestion, BinaryJudgeQuestion, Question
+from .judge import extract_outcome_from_response
 from .prompts import get_cumulative_cot_segments
 from .task import ForcedResponseTask
 
@@ -63,8 +64,7 @@ def init_tinker_client(model: str) -> Tuple[Any, AutoTokenizer]:
 
 
 def build_resample_prompt(
-    question: str,
-    choices: List[str],
+    question_obj: Question,
     partial_cot: str,
     tokenizer: AutoTokenizer,
 ) -> types.ModelInput:
@@ -72,15 +72,19 @@ def build_resample_prompt(
     Build a tokenized prompt that prefills the start of the model's thinking
     with partial CoT. The model continues generating from there.
     """
-    choice_labels = [chr(ord('A') + i) for i in range(len(choices))]
-    choices_text = "\n".join(
-        f"{label}. {choice}" for label, choice in zip(choice_labels, choices)
-    )
-
-    user_msg = (
-        f"{question}\n\n{choices_text}\n\n"
-        f"Answer with just the letter (A, B, C, or D)."
-    )
+    if isinstance(question_obj, BinaryJudgeQuestion):
+        # Binary judge questions: just the question text, no choices
+        user_msg = question_obj.question
+    else:
+        # Multiple choice questions: include choices
+        choice_labels = [chr(ord('A') + i) for i in range(len(question_obj.choices))]
+        choices_text = "\n".join(
+            f"{label}. {choice}" for label, choice in zip(choice_labels, question_obj.choices)
+        )
+        user_msg = (
+            f"{question_obj.question}\n\n{choices_text}\n\n"
+            f"Answer with just the letter (A, B, C, or D)."
+        )
 
     prompt_str = (
         f"{IM_SYSTEM}system{IM_MIDDLE}"
@@ -98,9 +102,9 @@ def build_resample_prompt(
     return types.ModelInput.from_ints(tokens)
 
 
-def extract_resample_answer(tokens: List[int], tokenizer: AutoTokenizer) -> Tuple[str, str, str]:
+def extract_resample_answer_multiple_choice(tokens: List[int], tokenizer: AutoTokenizer) -> Tuple[str, str, str]:
     """
-    Decode sampled tokens and extract the answer from after </think>.
+    Decode sampled tokens and extract the answer letter from after </think>.
 
     Returns:
         Tuple of (answer_letter, continued_cot, full_decoded_text)
@@ -125,6 +129,49 @@ def extract_resample_answer(tokens: List[int], tokenizer: AutoTokenizer) -> Tupl
         return match.group(1).upper(), continued_cot, text
 
     return "", continued_cot, text
+
+
+def extract_resample_answer(
+    tokens: List[int],
+    tokenizer: AutoTokenizer,
+    question_obj: Question,
+) -> Tuple[str, str, str, bool]:
+    """
+    Decode sampled tokens and extract the answer based on question type.
+
+    For multiple_choice: extracts A/B/C/D from after </think>
+    For binary_judge: calls LLM judge to classify the full response
+
+    Args:
+        tokens: List of token IDs from sampling
+        tokenizer: Tokenizer for decoding
+        question_obj: The question (determines extraction method)
+
+    Returns:
+        Tuple of (answer, continued_cot, full_decoded_text, is_valid)
+    """
+    text = tokenizer.decode(tokens, skip_special_tokens=True)
+
+    if "</think>" in text:
+        parts = text.split("</think>", 1)
+        continued_cot = parts[0]
+    else:
+        continued_cot = text
+
+    if isinstance(question_obj, BinaryJudgeQuestion):
+        # Binary judge: call the LLM judge to classify the response
+        outcome, is_valid = extract_outcome_from_response(
+            response=text,
+            question_type="binary_judge",
+            judge_prompt=question_obj.judge_prompt,
+            bad_outcome=question_obj.bad_outcome,
+        )
+        return outcome, continued_cot, text, is_valid
+    else:
+        # Multiple choice: extract A/B/C/D
+        answer, cot, decoded = extract_resample_answer_multiple_choice(tokens, tokenizer)
+        is_valid = answer != ""
+        return answer, cot, decoded, is_valid
 
 
 def run_resampling_from_verification(
@@ -176,13 +223,24 @@ def run_resampling_from_verification(
     with open(summary_path) as f:
         summary = json.load(f)
 
-    question = GPQAQuestion(
-        id=summary["question_id"],
-        question=summary["question"],
-        choices=summary["choices"],
-        correct_answer=summary["correct_answer"],
-        correct_index=ord(summary["correct_answer"]) - ord('A'),
-    )
+    # Create the appropriate question type
+    question_type = summary.get("question_type", "multiple_choice")
+    if question_type == "binary_judge":
+        question: Question = BinaryJudgeQuestion(
+            id=summary["question_id"],
+            question=summary["question"],
+            judge_prompt=summary["judge_prompt"],
+            bad_outcome=summary["bad_outcome"],
+            subject=summary.get("subject"),
+        )
+    else:
+        question = GPQAQuestion(
+            id=summary["question_id"],
+            question=summary["question"],
+            choices=summary["choices"],
+            correct_answer=summary["correct_answer"],
+            correct_index=ord(summary["correct_answer"]) - ord('A'),
+        )
 
     # Get the CoT from the rollout
     source_cot = rollout_data.get("thinking", "")
@@ -239,8 +297,7 @@ def run_resampling_from_verification(
     def resample_single(sentence_idx: int, resample_idx: int, partial_cot: str) -> Optional[ResampleResult]:
         """Run a single resample - one job per (sentence, resample) pair."""
         prompt = build_resample_prompt(
-            question=question.question,
-            choices=question.choices,
+            question_obj=question,
             partial_cot=partial_cot,
             tokenizer=tokenizer,
         )
@@ -252,9 +309,11 @@ def run_resampling_from_verification(
         ).result()
 
         sample_tokens = result.sequences[0].tokens
-        answer, continued_cot, full_text = extract_resample_answer(sample_tokens, tokenizer)
+        answer, continued_cot, full_text, is_valid = extract_resample_answer(
+            sample_tokens, tokenizer, question
+        )
 
-        if answer:
+        if is_valid and answer:
             return ResampleResult(
                 sentence_idx=sentence_idx,
                 resample_idx=resample_idx,
@@ -347,12 +406,17 @@ def run_resampling_from_verification(
     if verbose:
         print(f"\nDone. Processed {len(selected_indices)} prefix points.")
 
-    return {
+    result = {
         "question_id": question.id,
-        "correct_answer": question.correct_answer,
+        "question_type": question.question_type,
         "num_sentences": num_sentences,
         "num_prefix_points": len(selected_indices),
         "stride": stride,
         "num_resamples": num_resamples,
         "sentence_results": all_sentence_summaries,
     }
+    if isinstance(question, GPQAQuestion):
+        result["correct_answer"] = question.correct_answer
+    else:
+        result["bad_outcome"] = question.bad_outcome
+    return result

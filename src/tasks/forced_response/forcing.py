@@ -24,7 +24,8 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 from transformers import AutoTokenizer
 
-from .data_loader import GPQAQuestion
+from .data_loader import GPQAQuestion, BinaryJudgeQuestion, Question
+from .judge import extract_outcome_from_response
 from .prompts import get_cumulative_cot_segments
 from .task import ForcedResponseTask
 
@@ -79,8 +80,7 @@ def init_tinker_client(
 
 
 def build_force_prompt(
-    question: str,
-    choices: List[str],
+    question_obj: Question,
     partial_cot: str,
     tokenizer: AutoTokenizer,
 ) -> types.ModelInput:
@@ -97,22 +97,25 @@ def build_force_prompt(
     The model continues generating from the end of the partial CoT.
 
     Args:
-        question: The question text
-        choices: List of answer choices
+        question_obj: The question (GPQAQuestion or BinaryJudgeQuestion)
         partial_cot: The partial chain of thought to prefill
         tokenizer: The tokenizer to encode with
 
     Returns:
         ModelInput ready for sampling
     """
-    choice_labels = [chr(ord("A") + i) for i in range(len(choices))]
-    choices_text = "\n".join(
-        f"{label}. {choice}" for label, choice in zip(choice_labels, choices)
-    )
-
-    user_msg = (
-        f"{question}\n\n{choices_text}\n\nAnswer with just the letter (A, B, C, or D)."
-    )
+    if isinstance(question_obj, BinaryJudgeQuestion):
+        # Binary judge questions: just the question text, no choices
+        user_msg = question_obj.question
+    else:
+        # Multiple choice questions: include choices
+        choice_labels = [chr(ord("A") + i) for i in range(len(question_obj.choices))]
+        choices_text = "\n".join(
+            f"{label}. {choice}" for label, choice in zip(choice_labels, question_obj.choices)
+        )
+        user_msg = (
+            f"{question_obj.question}\n\n{choices_text}\n\nAnswer with just the letter (A, B, C, or D)."
+        )
 
     prompt_str = (
         f"{IM_SYSTEM}system{IM_MIDDLE}"
@@ -130,7 +133,7 @@ def build_force_prompt(
     return types.ModelInput.from_ints(tokens)
 
 
-def extract_force_answer(
+def extract_force_answer_multiple_choice(
     tokens: List[int], tokenizer: AutoTokenizer
 ) -> Tuple[str, str]:
     """
@@ -169,8 +172,46 @@ def extract_force_answer(
     return "", text
 
 
+def extract_force_answer(
+    tokens: List[int],
+    tokenizer: AutoTokenizer,
+    question_obj: Question,
+) -> Tuple[str, str, bool]:
+    """
+    Decode sampled tokens and extract the answer based on question type.
+
+    For multiple_choice: extracts A/B/C/D from after </think>
+    For binary_judge: calls LLM judge to classify the full response
+
+    Args:
+        tokens: List of token IDs from sampling
+        tokenizer: Tokenizer for decoding
+        question_obj: The question (determines extraction method)
+
+    Returns:
+        Tuple of (answer, full_decoded_text, is_valid)
+    """
+    text = tokenizer.decode(tokens, skip_special_tokens=True)
+
+    if isinstance(question_obj, BinaryJudgeQuestion):
+        # Binary judge: get the full response (including any tool use)
+        # and call the LLM judge to classify it
+        outcome, is_valid = extract_outcome_from_response(
+            response=text,
+            question_type="binary_judge",
+            judge_prompt=question_obj.judge_prompt,
+            bad_outcome=question_obj.bad_outcome,
+        )
+        return outcome, text, is_valid
+    else:
+        # Multiple choice: extract A/B/C/D
+        answer, decoded = extract_force_answer_multiple_choice(tokens, tokenizer)
+        is_valid = answer != ""
+        return answer, decoded, is_valid
+
+
 def run_forcing(
-    question: GPQAQuestion,
+    question: Question,
     source_cot: str,
     model: str,
     num_forces: int = 5,
@@ -233,7 +274,10 @@ def run_forcing(
 
     if verbose:
         print(f"Found {num_sentences} sentences in CoT")
-        print(f"Correct answer: {question.correct_answer}")
+        if isinstance(question, GPQAQuestion):
+            print(f"Correct answer: {question.correct_answer}")
+        else:
+            print(f"Question type: binary_judge (bad outcome: {question.bad_outcome})")
         print(f"Running {num_forces} forces per sentence via Tinker")
         if run_dir:
             print(f"Run dir: {run_dir}")
@@ -260,8 +304,7 @@ def run_forcing(
         )
 
         prompt = build_force_prompt(
-            question=question.question,
-            choices=question.choices,
+            question_obj=question,
             partial_cot=partial_cot,
             tokenizer=tokenizer,
         )
@@ -274,9 +317,11 @@ def run_forcing(
         ).result()
 
         sample_tokens = result.sequences[0].tokens
-        answer, raw_response = extract_force_answer(sample_tokens, tokenizer)
+        answer, raw_response, is_valid = extract_force_answer(
+            sample_tokens, tokenizer, question
+        )
 
-        if answer:
+        if is_valid and answer:
             if "</think>" in raw_response:
                 continued_cot = raw_response.split("</think>", 1)[0]
             else:
@@ -380,12 +425,17 @@ def run_forcing(
     if verbose:
         print(f"\nDone. Processed {num_sentences} sentences.")
 
-    return {
+    result = {
         "question_id": question.id,
-        "correct_answer": question.correct_answer,
+        "question_type": question.question_type,
         "num_sentences": num_sentences,
         "sentence_results": all_sentence_summaries,
     }
+    if isinstance(question, GPQAQuestion):
+        result["correct_answer"] = question.correct_answer
+    else:
+        result["bad_outcome"] = question.bad_outcome
+    return result
 
 
 def run_forcing_from_verification(
@@ -433,13 +483,24 @@ def run_forcing_from_verification(
     with open(summary_path) as f:
         summary = json.load(f)
 
-    question = GPQAQuestion(
-        id=summary["question_id"],
-        question=summary["question"],
-        choices=summary["choices"],
-        correct_answer=summary["correct_answer"],
-        correct_index=ord(summary["correct_answer"]) - ord("A"),
-    )
+    # Create the appropriate question type
+    question_type = summary.get("question_type", "multiple_choice")
+    if question_type == "binary_judge":
+        question: Question = BinaryJudgeQuestion(
+            id=summary["question_id"],
+            question=summary["question"],
+            judge_prompt=summary["judge_prompt"],
+            bad_outcome=summary["bad_outcome"],
+            subject=summary.get("subject"),
+        )
+    else:
+        question = GPQAQuestion(
+            id=summary["question_id"],
+            question=summary["question"],
+            choices=summary["choices"],
+            correct_answer=summary["correct_answer"],
+            correct_index=ord(summary["correct_answer"]) - ord("A"),
+        )
 
     # Get the CoT from the rollout
     source_cot = rollout_data.get("thinking", "")

@@ -11,7 +11,7 @@ import json
 import pandas as pd
 
 from ..base import BaseTask
-from .data_loader import GPQAQuestion, load_gpqa_questions
+from .data_loader import GPQAQuestion, BinaryJudgeQuestion, Question, load_gpqa_questions
 
 
 class ForcedResponseTask(BaseTask):
@@ -147,14 +147,14 @@ class ForcedResponseTask(BaseTask):
 
     def save_verification_result(
         self,
-        question: GPQAQuestion,
+        question: Question,
         rollouts: List[Dict[str, Any]],
     ) -> Path:
         """
         Save verification results for a question.
 
         Args:
-            question: The GPQA question
+            question: The question (GPQAQuestion or BinaryJudgeQuestion)
             rollouts: List of rollout results
 
         Returns:
@@ -170,9 +170,12 @@ class ForcedResponseTask(BaseTask):
             with open(rollout_path, "w") as f:
                 json.dump(rollout, f, indent=2)
 
-        # Compute summary statistics
+        # Compute summary statistics - valid answers depend on question type
         answers = [r.get("answer", "").upper() for r in rollouts if r.get("answer")]
-        valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
+        if isinstance(question, BinaryJudgeQuestion):
+            valid_answers = [a for a in answers if a in ["YES", "NO"]]
+        else:
+            valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
 
         answer_counts = {}
         for a in valid_answers:
@@ -182,20 +185,29 @@ class ForcedResponseTask(BaseTask):
         most_common = max(answer_counts.items(), key=lambda x: x[1]) if answer_counts else ("", 0)
         agreement_rate = most_common[1] / total_valid if total_valid > 0 else 0
 
+        # Build summary - different fields for different question types
         summary = {
             "question_id": question.id,
             "question": question.question,
-            "choices": question.choices,
-            "correct_answer": question.correct_answer,
+            "question_type": question.question_type,
             "total_rollouts": len(rollouts),
             "valid_rollouts": total_valid,
             "answer_counts": answer_counts,
             "most_common_answer": most_common[0],
             "most_common_count": most_common[1],
             "agreement_rate": agreement_rate,
-            "is_correct": most_common[0] == question.correct_answer,
             "meets_threshold": agreement_rate >= 0.8,
         }
+
+        if isinstance(question, BinaryJudgeQuestion):
+            summary["judge_prompt"] = question.judge_prompt
+            summary["bad_outcome"] = question.bad_outcome
+            summary["bad_outcome_rate"] = answer_counts.get(question.bad_outcome.upper(), 0) / total_valid if total_valid > 0 else 0
+            summary["subject"] = question.subject
+        else:
+            summary["choices"] = question.choices
+            summary["correct_answer"] = question.correct_answer
+            summary["is_correct"] = most_common[0] == question.correct_answer
 
         summary_path = question_dir / "summary.json"
         with open(summary_path, "w") as f:
@@ -205,7 +217,7 @@ class ForcedResponseTask(BaseTask):
 
     def save_forcing_result(
         self,
-        question: GPQAQuestion,
+        question: Question,
         sentence_idx: int,
         partial_cot: str,
         force_results: List[Dict[str, Any]],
@@ -216,7 +228,7 @@ class ForcedResponseTask(BaseTask):
         Save forcing results for a specific sentence in the CoT.
 
         Args:
-            question: The GPQA question
+            question: The question (GPQAQuestion or BinaryJudgeQuestion)
             sentence_idx: Index of the sentence in the CoT
             partial_cot: The partial CoT up to this point
             force_results: List of force attempt results
@@ -240,9 +252,12 @@ class ForcedResponseTask(BaseTask):
             with open(force_path, "w") as f:
                 json.dump(result, f, indent=2)
 
-        # Compute summary for this sentence
+        # Compute summary for this sentence - valid answers depend on question type
         answers = [r.get("answer", "").upper() for r in force_results]
-        valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
+        if isinstance(question, BinaryJudgeQuestion):
+            valid_answers = [a for a in answers if a in ["YES", "NO"]]
+        else:
+            valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
 
         answer_counts = {}
         for a in valid_answers:
@@ -250,6 +265,7 @@ class ForcedResponseTask(BaseTask):
 
         summary = {
             "question_id": question.id,
+            "question_type": question.question_type,
             "sentence_idx": sentence_idx,
             "partial_cot": partial_cot,
             "total_attempts": len(force_results),
@@ -292,7 +308,7 @@ class ForcedResponseTask(BaseTask):
 
     def save_forcing_summary(
         self,
-        question: GPQAQuestion,
+        question: Question,
         source_rollout_idx: int,
         all_sentence_results: List[Dict[str, Any]],
         source_cot: str = "",
@@ -302,7 +318,7 @@ class ForcedResponseTask(BaseTask):
         Save overall forcing summary for a question.
 
         Args:
-            question: The GPQA question
+            question: The question (GPQAQuestion or BinaryJudgeQuestion)
             source_rollout_idx: Index of the rollout used for forcing
             all_sentence_results: List of summaries for each sentence
             source_cot: The full source chain of thought from the rollout
@@ -320,12 +336,17 @@ class ForcedResponseTask(BaseTask):
 
         summary = {
             "question_id": question.id,
+            "question_type": question.question_type,
             "source_rollout_idx": source_rollout_idx,
-            "correct_answer": question.correct_answer,
             "num_sentences": len(all_sentence_results),
             "source_cot": source_cot,
             "sentence_summaries": all_sentence_results,
         }
+
+        if isinstance(question, BinaryJudgeQuestion):
+            summary["bad_outcome"] = question.bad_outcome
+        else:
+            summary["correct_answer"] = question.correct_answer
 
         summary_path = save_dir / "summary.json"
         with open(summary_path, "w") as f:
@@ -335,7 +356,7 @@ class ForcedResponseTask(BaseTask):
 
     def save_monitor_result(
         self,
-        question: GPQAQuestion,
+        question: Question,
         sentence_idx: int,
         partial_cot: str,
         force_results: List[Dict[str, Any]],
@@ -345,7 +366,7 @@ class ForcedResponseTask(BaseTask):
         Save monitor results for a specific sentence in the CoT.
 
         Args:
-            question: The GPQA question
+            question: The question (GPQAQuestion or BinaryJudgeQuestion)
             sentence_idx: Index of the sentence in the CoT
             partial_cot: The partial CoT up to this point
             force_results: List of monitor attempt results
@@ -363,9 +384,12 @@ class ForcedResponseTask(BaseTask):
             with open(force_path, "w") as f:
                 json.dump(result, f, indent=2)
 
-        # Compute summary for this sentence
+        # Compute summary for this sentence - valid answers depend on question type
         answers = [r.get("answer", "").upper() for r in force_results]
-        valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
+        if isinstance(question, BinaryJudgeQuestion):
+            valid_answers = [a for a in answers if a in ["YES", "NO"]]
+        else:
+            valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
         valid_single_token = [
             r for r in force_results
             if r.get("is_valid_single_token", False)
@@ -377,6 +401,7 @@ class ForcedResponseTask(BaseTask):
 
         summary = {
             "question_id": question.id,
+            "question_type": question.question_type,
             "sentence_idx": sentence_idx,
             "partial_cot": partial_cot,
             "total_attempts": len(force_results),
@@ -392,7 +417,7 @@ class ForcedResponseTask(BaseTask):
 
     def save_monitor_summary(
         self,
-        question: GPQAQuestion,
+        question: Question,
         source_rollout_idx: int,
         all_sentence_results: List[Dict[str, Any]],
         source_cot: str = "",
@@ -402,7 +427,7 @@ class ForcedResponseTask(BaseTask):
         Save overall monitor summary.
 
         Args:
-            question: The GPQA question
+            question: The question (GPQAQuestion or BinaryJudgeQuestion)
             source_rollout_idx: Index of the rollout used for monitoring
             all_sentence_results: List of summaries for each sentence
             source_cot: The full source chain of thought from the rollout
@@ -415,12 +440,17 @@ class ForcedResponseTask(BaseTask):
 
         summary = {
             "question_id": question.id,
+            "question_type": question.question_type,
             "source_rollout_idx": source_rollout_idx,
-            "correct_answer": question.correct_answer,
             "num_sentences": len(all_sentence_results),
             "source_cot": source_cot,
             "sentence_summaries": all_sentence_results,
         }
+
+        if isinstance(question, BinaryJudgeQuestion):
+            summary["bad_outcome"] = question.bad_outcome
+        else:
+            summary["correct_answer"] = question.correct_answer
 
         summary_path = save_dir / "summary.json"
         with open(summary_path, "w") as f:
@@ -430,7 +460,7 @@ class ForcedResponseTask(BaseTask):
 
     def save_resampling_result(
         self,
-        question: GPQAQuestion,
+        question: Question,
         sentence_idx: int,
         forced_prefix: str,
         resample_results: List[Dict[str, Any]],
@@ -441,7 +471,7 @@ class ForcedResponseTask(BaseTask):
         Save resampling results for a specific sentence in the CoT.
 
         Args:
-            question: The GPQA question
+            question: The question (GPQAQuestion or BinaryJudgeQuestion)
             sentence_idx: Index of the sentence in the CoT
             forced_prefix: The forced prefix used for resampling
             resample_results: List of resample attempt results
@@ -465,9 +495,12 @@ class ForcedResponseTask(BaseTask):
             with open(resample_path, "w") as f:
                 json.dump(result, f, indent=2)
 
-        # Compute summary for this sentence
+        # Compute summary for this sentence - valid answers depend on question type
         answers = [r.get("answer", "").upper() for r in resample_results]
-        valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
+        if isinstance(question, BinaryJudgeQuestion):
+            valid_answers = [a for a in answers if a in ["YES", "NO"]]
+        else:
+            valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
 
         answer_counts = {}
         for a in valid_answers:
@@ -478,6 +511,7 @@ class ForcedResponseTask(BaseTask):
 
         summary = {
             "question_id": question.id,
+            "question_type": question.question_type,
             "sentence_idx": sentence_idx,
             "forced_prefix": forced_prefix,
             "total_resamples": len(resample_results),
@@ -496,7 +530,7 @@ class ForcedResponseTask(BaseTask):
 
     def save_resampling_summary(
         self,
-        question: GPQAQuestion,
+        question: Question,
         source_rollout_idx: int,
         all_sentence_results: List[Dict[str, Any]],
         run_dir: Optional[Path] = None,
@@ -505,7 +539,7 @@ class ForcedResponseTask(BaseTask):
         Save overall resampling summary for a question.
 
         Args:
-            question: The GPQA question
+            question: The question (GPQAQuestion or BinaryJudgeQuestion)
             source_rollout_idx: Index of the rollout used for resampling
             all_sentence_results: List of summaries for each sentence
             run_dir: Timestamped run directory (if None, falls back to legacy path)
@@ -522,11 +556,16 @@ class ForcedResponseTask(BaseTask):
 
         summary = {
             "question_id": question.id,
+            "question_type": question.question_type,
             "source_rollout_idx": source_rollout_idx,
-            "correct_answer": question.correct_answer,
             "num_sentences": len(all_sentence_results),
             "sentence_summaries": all_sentence_results,
         }
+
+        if isinstance(question, BinaryJudgeQuestion):
+            summary["bad_outcome"] = question.bad_outcome
+        else:
+            summary["correct_answer"] = question.correct_answer
 
         summary_path = save_dir / "summary.json"
         with open(summary_path, "w") as f:

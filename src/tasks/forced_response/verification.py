@@ -19,7 +19,8 @@ from dataclasses import dataclass
 import openai
 from tqdm.asyncio import tqdm as atqdm
 
-from .data_loader import GPQAQuestion, load_gpqa_questions
+from .data_loader import GPQAQuestion, BinaryJudgeQuestion, Question, load_gpqa_questions
+from .judge import extract_outcome_from_response
 from .prompts import get_question_prompt
 from .task import ForcedResponseTask
 
@@ -75,7 +76,7 @@ def extract_answer(response_text: str) -> str:
 
 async def run_single_rollout_async(
     async_client: openai.AsyncOpenAI,
-    question: GPQAQuestion,
+    question: Question,
     rollout_idx: int,
     semaphore: asyncio.Semaphore,
     model: str = "moonshotai/kimi-k2-thinking",
@@ -83,7 +84,11 @@ async def run_single_rollout_async(
     max_tokens: int = 8000,
 ) -> RolloutResult:
     """Run a single rollout for a question (async)."""
-    prompt = get_question_prompt(question.question, question.choices)
+    # Build prompt based on question type
+    if isinstance(question, BinaryJudgeQuestion):
+        prompt = question.question  # Binary judge: just the question text
+    else:
+        prompt = get_question_prompt(question.question, question.choices)
 
     async with semaphore:
         try:
@@ -104,7 +109,19 @@ async def run_single_rollout_async(
                 thinking = message.reasoning_content
 
             full_response = message.content or ""
-            answer = extract_answer(full_response)
+
+            # Extract answer based on question type
+            if isinstance(question, BinaryJudgeQuestion):
+                answer, is_valid = extract_outcome_from_response(
+                    response=full_response,
+                    question_type="binary_judge",
+                    judge_prompt=question.judge_prompt,
+                    bad_outcome=question.bad_outcome,
+                )
+                if not is_valid:
+                    answer = ""
+            else:
+                answer = extract_answer(full_response)
 
             return RolloutResult(
                 rollout_idx=rollout_idx,
@@ -126,10 +143,17 @@ async def run_single_rollout_async(
             )
 
 
-def compute_summary(question: GPQAQuestion, rollouts: List[Dict[str, Any]]) -> Dict[str, Any]:
+def compute_summary(question: Question, rollouts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Compute agreement summary from rollout results."""
     answers = [r["answer"].upper() for r in rollouts if r["answer"]]
-    valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
+
+    # Valid answers depend on question type
+    if isinstance(question, BinaryJudgeQuestion):
+        # Binary judge: YES/NO are valid answers
+        valid_answers = [a for a in answers if a in ["YES", "NO"]]
+    else:
+        # Multiple choice: A/B/C/D are valid answers
+        valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
 
     answer_counts = {}
     for a in valid_answers:
@@ -139,20 +163,31 @@ def compute_summary(question: GPQAQuestion, rollouts: List[Dict[str, Any]]) -> D
     most_common = max(answer_counts.items(), key=lambda x: x[1]) if answer_counts else ("", 0)
     agreement_rate = most_common[1] / total_valid if total_valid > 0 else 0
 
-    return {
+    summary = {
         "question_id": question.id,
+        "question_type": question.question_type,
         "total_rollouts": len(rollouts),
         "valid_rollouts": total_valid,
         "answer_counts": answer_counts,
         "most_common_answer": most_common[0],
         "agreement_rate": agreement_rate,
-        "is_correct": most_common[0] == question.correct_answer,
         "meets_threshold": agreement_rate >= 0.8,
     }
 
+    # Add type-specific fields
+    if isinstance(question, BinaryJudgeQuestion):
+        # For binary_judge, "correct" means the model did NOT exhibit the bad behavior
+        summary["bad_outcome"] = question.bad_outcome
+        summary["bad_outcome_rate"] = answer_counts.get(question.bad_outcome.upper(), 0) / total_valid if total_valid > 0 else 0
+    else:
+        summary["correct_answer"] = question.correct_answer
+        summary["is_correct"] = most_common[0] == question.correct_answer
+
+    return summary
+
 
 async def run_verification_async(
-    question: GPQAQuestion,
+    question: Question,
     num_rollouts: int = 50,
     model: str = "moonshotai/kimi-k2-thinking",
     api_key: Optional[str] = None,
@@ -233,15 +268,19 @@ async def run_verification_async(
         print(f"\n  Summary for {question.id}:")
         print(f"    Answer distribution: {summary['answer_counts']}")
         print(f"    Agreement rate: {summary['agreement_rate']:.1%}")
-        print(f"    Correct answer: {question.correct_answer}")
-        print(f"    Most common: {summary['most_common_answer']} "
-              f"({'correct' if summary['is_correct'] else 'incorrect'})")
+        if isinstance(question, BinaryJudgeQuestion):
+            print(f"    Bad outcome: {question.bad_outcome}")
+            print(f"    Bad outcome rate: {summary['bad_outcome_rate']:.1%}")
+        else:
+            print(f"    Correct answer: {question.correct_answer}")
+            print(f"    Most common: {summary['most_common_answer']} "
+                  f"({'correct' if summary['is_correct'] else 'incorrect'})")
 
     return summary
 
 
 def run_verification(
-    question: GPQAQuestion,
+    question: Question,
     num_rollouts: int = 50,
     model: str = "moonshotai/kimi-k2-thinking",
     api_key: Optional[str] = None,
@@ -264,7 +303,7 @@ def run_verification(
 
 
 async def find_questions_async(
-    questions: List[GPQAQuestion],
+    questions: List[Question],
     num_rollouts: int = 50,
     model: str = "moonshotai/kimi-k2-thinking",
     api_key: Optional[str] = None,

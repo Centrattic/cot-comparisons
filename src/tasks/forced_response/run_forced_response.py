@@ -249,7 +249,10 @@ def cmd_monitor_forcing(args):
         print("MONITOR-FORCING COMPLETE")
         print("=" * 60)
         print(f"Question: {summary['question_id']}")
-        print(f"Correct answer: {summary['correct_answer']}")
+        if "correct_answer" in summary:
+            print(f"Correct answer: {summary['correct_answer']}")
+        else:
+            print(f"Bad outcome: {summary.get('bad_outcome', '?')}")
         print(f"Sentences processed: {summary['num_sentences']}")
 
         print("\nPredicted distributions by sentence:")
@@ -282,7 +285,7 @@ def cmd_monitor_resampling(args):
         print(f"Using verified question: {args.question_id}")
 
     print(
-        f"Running monitor-resampling with {args.num_forces} attempts at ~{args.num_prefix_points} prefix points"
+        f"Running monitor-resampling at ~{args.num_prefix_points} prefix points (predicting distribution over {args.num_resamples} resamples)"
     )
     print(f"Model: {args.model}")
     print(f"Max workers: {args.max_workers}")
@@ -291,7 +294,7 @@ def cmd_monitor_resampling(args):
     summary = run_monitor_resampling_from_verification(
         question_id=args.question_id,
         rollout_idx=args.rollout_idx,
-        num_forces=args.num_forces,
+        num_resamples=args.num_resamples,
         num_prefix_points=args.num_prefix_points,
         max_workers=args.max_workers,
         model=args.model,
@@ -304,21 +307,24 @@ def cmd_monitor_resampling(args):
         print("MONITOR-RESAMPLING COMPLETE")
         print("=" * 60)
         print(f"Question: {summary['question_id']}")
-        print(f"Correct answer: {summary['correct_answer']}")
+        if "correct_answer" in summary:
+            print(f"Correct answer: {summary['correct_answer']}")
+        else:
+            print(f"Bad outcome: {summary.get('bad_outcome', '?')}")
         print(
             f"Prefix points: {summary['num_prefix_points']} (stride {summary['stride']}, {summary['num_sentences']} total sentences)"
         )
 
-        print("\nAnswer progression by prefix point:")
+        print("\nPredicted distributions by prefix point:")
         for result in summary["sentence_results"]:
             idx = result["sentence_idx"]
-            counts = result["answer_counts"]
-            valid = result["valid_single_token"]
-            total = result["total_forces"]
-            most_common = result.get("most_common", "?")
-            print(
-                f"  Sentence {idx + 1}: {counts} (valid: {valid}/{total}, most common: {most_common})"
-            )
+            dist = result.get("distribution", {})
+            most_likely = result.get("most_likely", "?")
+            is_valid = result.get("is_valid", False)
+            # Format distribution nicely
+            dist_str = " ".join(f"{k}:{v:.0%}" for k, v in sorted(dist.items()) if v > 0)
+            status = "✓" if is_valid else "✗"
+            print(f"  Sentence {idx + 1}: [{dist_str}] → {most_likely} {status}")
 
         return 0
     else:
@@ -380,7 +386,10 @@ def cmd_full(args):
         print("PIPELINE COMPLETE")
         print("=" * 60)
         print(f"Question: {summary['question_id']}")
-        print(f"Correct answer: {summary['correct_answer']}")
+        if "correct_answer" in summary:
+            print(f"Correct answer: {summary['correct_answer']}")
+        else:
+            print(f"Bad outcome: {summary.get('bad_outcome', '?')}")
         print(f"Sentences processed: {summary['num_sentences']}")
         return 0
     else:
@@ -420,7 +429,10 @@ def cmd_resample(args):
         print("RESAMPLING COMPLETE (Tinker)")
         print("=" * 60)
         print(f"Question: {summary['question_id']}")
-        print(f"Correct answer: {summary['correct_answer']}")
+        if "correct_answer" in summary:
+            print(f"Correct answer: {summary['correct_answer']}")
+        else:
+            print(f"Bad outcome: {summary.get('bad_outcome', '?')}")
         print(
             f"Prefix points: {summary['num_prefix_points']} (stride {summary['stride']}, {summary['num_sentences']} total sentences)"
         )
@@ -460,11 +472,17 @@ def cmd_list(args):
             if summary:
                 agreement = summary.get("agreement_rate", 0)
                 meets = "YES" if summary.get("meets_threshold", False) else "NO"
-                correct = "correct" if summary.get("is_correct", False) else "incorrect"
                 most_common = summary.get("most_common_answer", "?")
+                question_type = summary.get("question_type", "multiple_choice")
                 print(f"  {question_dir.name}:")
                 print(f"    Agreement: {agreement:.1%} (meets threshold: {meets})")
-                print(f"    Most common: {most_common} ({correct})")
+                if question_type == "binary_judge":
+                    bad_rate = summary.get("bad_outcome_rate", 0)
+                    bad_outcome = summary.get("bad_outcome", "?")
+                    print(f"    Most common: {most_common} (bad outcome '{bad_outcome}' rate: {bad_rate:.1%})")
+                else:
+                    correct = "correct" if summary.get("is_correct", False) else "incorrect"
+                    print(f"    Most common: {most_common} ({correct})")
 
     # Show results for each mode
     modes = [
@@ -680,7 +698,7 @@ def main():
     # Monitor-resampling command
     mr_parser = subparsers.add_parser(
         "monitor-resampling",
-        help="Run resampling monitor (predicts majority answer from prefix)",
+        help="Run resampling monitor (predicts answer distribution from prefix)",
     )
     mr_parser.add_argument(
         "--question-id",
@@ -695,11 +713,11 @@ def main():
         help="Which verification rollout to use as source (default: 0)",
     )
     mr_parser.add_argument(
-        "--num-forces",
+        "--num-resamples",
         "-n",
         type=int,
-        default=5,
-        help="Number of monitor attempts per prefix point (default: 5)",
+        default=20,
+        help="Number of hypothetical resamples to predict distribution over (default: 20)",
     )
     mr_parser.add_argument(
         "--num-prefix-points",

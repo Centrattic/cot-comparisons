@@ -62,7 +62,7 @@ Two approaches available:
 ```bash
 # Find features with high Cohen's d between sycophantic vs non-sycophantic rollouts
 # Trains logistic regression probe → outputs P(sycophantic) for each rollout
-python -m src.tasks.scruples.sae --find-features --output-dir data/scruples-qwen3-32b --load-in-4bit
+python -m src.tasks.scruples.sae --find-features --output-dir data/scruples-qwen3-32b --load-in-4bit --variant first_person
 ```
 
 **Contrastive approach** (per-prompt regression): How much does this prompt induce switching?
@@ -70,12 +70,12 @@ python -m src.tasks.scruples.sae --find-features --output-dir data/scruples-qwen
 # Computes feature_delta = mean(intervention) - mean(control) per prompt
 # Finds features where delta correlates with switch_rate
 # Trains ridge regression → predicts switch_rate from feature deltas
-python -m src.tasks.scruples.sae --find-features --contrastive --output-dir data/scruples-qwen3-32b --load-in-4bit
+python -m src.tasks.scruples.sae --find-features --contrastive --output-dir data/scruples-qwen3-32b --load-in-4bit --variant first_person
 ```
 
 **Score responses** using trained probe:
 ```bash
-python -m src.tasks.scruples.sae --run-monitor --output-dir data/scruples-qwen3-32b --load-in-4bit
+python -m src.tasks.scruples.sae --run-monitor --output-dir data/scruples-qwen3-32b --load-in-4bit --variant first_person
 ```
 
 SAE options:

@@ -170,3 +170,48 @@ def get_cumulative_cot_segments(cot_text: str) -> List[str]:
         cumulative.append(current)
 
     return cumulative
+
+
+def build_forcing_prompt(
+    question: str,
+    choices: List[str],
+    partial_cot: str,
+    choice_labels: Optional[List[str]] = None,
+) -> str:
+    """
+    Build the full prompt used for forcing, including partial CoT.
+
+    This constructs the text that would be sent to a model when forcing it
+    to continue from a partial chain of thought. The format mimics what
+    would be prefilled in the model's thinking/assistant turn.
+
+    Args:
+        question: The question text
+        choices: List of answer choices
+        partial_cot: The partial chain of thought prefix
+        choice_labels: Optional labels (defaults to A, B, C, D, ...)
+
+    Returns:
+        Full prompt string including question, choices, and partial CoT
+    """
+    if choice_labels is None:
+        choice_labels = [chr(ord('A') + i) for i in range(len(choices))]
+
+    choices_text = "\n".join(
+        f"{label}. {choice}" for label, choice in zip(choice_labels, choices)
+    )
+
+    # Format as a user message followed by assistant's partial thinking
+    # This is the format that would be used for activation extraction
+    prompt = f"""Answer the following multiple choice question. Think through the problem step by step, then provide your final answer.
+
+Question: {question}
+
+{choices_text}
+
+After your reasoning, provide your final answer as just the letter (A, B, C, or D) on a new line.
+
+<think>
+{partial_cot}"""
+
+    return prompt
