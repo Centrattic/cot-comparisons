@@ -319,11 +319,15 @@ async def run_monitor_forcing_async(
     save_results: bool = True,
     verbose: bool = True,
     rollout_idx: int = 0,
+    max_sentences: Optional[int] = None,
+    num_samples: int = 1,
 ) -> Dict[str, Any]:
     """
     Run forcing monitor for all sentences in parallel.
 
-    One job per sentence - asks monitor to predict distribution over answers.
+    Args:
+        num_samples: Number of times to run monitor per sentence (default: 1)
+        max_sentences: Maximum number of sentences to process (default: all)
     """
     async_client = openai.AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -334,15 +338,21 @@ async def run_monitor_forcing_async(
     semaphore = asyncio.Semaphore(max_workers)
 
     cot_segments = get_cumulative_cot_segments(source_cot)
+    if max_sentences is not None:
+        cot_segments = cot_segments[:max_sentences]
     num_sentences = len(cot_segments)
 
+    total_jobs = num_sentences * num_samples
     if verbose:
         print(f"Found {num_sentences} sentences in CoT")
         if isinstance(question, BinaryJudgeQuestion):
             print(f"Bad outcome: {question.bad_outcome}")
         else:
             print(f"Correct answer: {question.correct_answer}")
-        print(f"Launching {num_sentences} monitor jobs (predicting distribution over {num_forces} forces)")
+        if num_samples > 1:
+            print(f"Launching {total_jobs} monitor jobs ({num_sentences} sentences × {num_samples} samples, predicting over {num_forces} forces)")
+        else:
+            print(f"Launching {num_sentences} monitor jobs (predicting distribution over {num_forces} forces)")
         print()
 
     # Create timestamped run directory
@@ -354,6 +364,7 @@ async def run_monitor_forcing_async(
             "question_id": question.id,
             "rollout_idx": rollout_idx,
             "num_forces": num_forces,
+            "num_samples": num_samples,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "num_sentences": num_sentences,
@@ -363,46 +374,56 @@ async def run_monitor_forcing_async(
             print(f"Run dir: {run_dir}")
             print()
 
-    # Create one monitor job per sentence
+    # Create monitor jobs (num_samples per sentence)
     jobs = []
-    job_indices = []  # Track which sentence_idx each job corresponds to
+    job_keys = []  # Track (sentence_idx, sample_idx) for each job
     for sentence_idx, partial_cot in enumerate(cot_segments):
-        job = _run_single_forcing_monitor_job(
-            async_client=async_client,
-            question=question,
-            partial_cot=partial_cot,
-            sentence_idx=sentence_idx,
-            num_forces=num_forces,
-            semaphore=semaphore,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            max_retries=max_retries,
-        )
-        jobs.append(job)
-        job_indices.append(sentence_idx)
+        for sample_idx in range(num_samples):
+            job = _run_single_forcing_monitor_job(
+                async_client=async_client,
+                question=question,
+                partial_cot=partial_cot,
+                sentence_idx=sentence_idx,
+                num_forces=num_forces,
+                semaphore=semaphore,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_retries=max_retries,
+            )
+            jobs.append(job)
+            job_keys.append((sentence_idx, sample_idx))
 
     # Run all jobs concurrently with progress bar
-    results = await atqdm.gather(
+    raw_results = await atqdm.gather(
         *jobs,
         desc="Monitor (forcing)",
-        total=num_sentences,
+        total=total_jobs,
     )
 
-    # Build results dict keyed by sentence_idx
-    results_by_idx: Dict[int, MonitorForcingResult] = {r.sentence_idx: r for r in results}
+    # Group results by sentence_idx
+    results_by_sentence: Dict[int, List[MonitorForcingResult]] = {i: [] for i in range(num_sentences)}
+    for result in raw_results:
+        results_by_sentence[result.sentence_idx].append(result)
 
     # Re-queue failed jobs until all valid or max rounds reached
     for requeue_round in range(MAX_REQUEUE_ROUNDS):
-        failed_indices = [idx for idx, r in results_by_idx.items() if not r.is_valid]
-        if not failed_indices:
+        # Find (sentence_idx, sample_idx) pairs that need retrying
+        failed_keys = []
+        for sentence_idx in range(num_sentences):
+            valid_count = sum(1 for r in results_by_sentence[sentence_idx] if r.is_valid)
+            needed = num_samples - valid_count
+            if needed > 0:
+                failed_keys.extend([(sentence_idx, i) for i in range(needed)])
+
+        if not failed_keys:
             break
 
         if verbose:
-            print(f"\nRe-queuing {len(failed_indices)} failed jobs (round {requeue_round + 1}/{MAX_REQUEUE_ROUNDS})...")
+            print(f"\nRe-queuing {len(failed_keys)} failed jobs (round {requeue_round + 1}/{MAX_REQUEUE_ROUNDS})...")
 
         retry_jobs = []
-        for sentence_idx in failed_indices:
+        for sentence_idx, _ in failed_keys:
             partial_cot = cot_segments[sentence_idx]
             job = _run_single_forcing_monitor_job(
                 async_client=async_client,
@@ -424,13 +445,47 @@ async def run_monitor_forcing_async(
             total=len(retry_jobs),
         )
 
-        # Update results with successful retries
+        # Add successful retries to results
         for r in retry_results:
-            if r.is_valid or not results_by_idx[r.sentence_idx].is_valid:
-                results_by_idx[r.sentence_idx] = r
+            if r.is_valid:
+                results_by_sentence[r.sentence_idx].append(r)
 
-    # Convert back to list ordered by sentence_idx
-    results = [results_by_idx[i] for i in range(num_sentences)]
+    # Aggregate results per sentence (average distributions if num_samples > 1)
+    results: List[MonitorForcingResult] = []
+    for sentence_idx in range(num_sentences):
+        sentence_results = results_by_sentence[sentence_idx]
+        valid_results = [r for r in sentence_results if r.is_valid]
+
+        if not valid_results:
+            # Use first invalid result if no valid ones
+            results.append(sentence_results[0] if sentence_results else MonitorForcingResult(
+                sentence_idx=sentence_idx,
+                partial_cot=cot_segments[sentence_idx],
+                prompt="",
+                raw_response="",
+                distribution={},
+                is_valid=False,
+                num_attempts=0,
+            ))
+        elif len(valid_results) == 1:
+            results.append(valid_results[0])
+        else:
+            # Average distributions across samples
+            avg_dist: Dict[str, float] = {}
+            for r in valid_results:
+                for key, val in r.distribution.items():
+                    avg_dist[key] = avg_dist.get(key, 0.0) + val / len(valid_results)
+
+            # Create aggregated result
+            results.append(MonitorForcingResult(
+                sentence_idx=sentence_idx,
+                partial_cot=valid_results[0].partial_cot,
+                prompt=valid_results[0].prompt,
+                raw_response=f"[Aggregated from {len(valid_results)} samples]",
+                distribution=avg_dist,
+                is_valid=True,
+                num_attempts=sum(r.num_attempts for r in valid_results),
+            ))
 
     valid_count = sum(1 for r in results if r.is_valid)
     if verbose:
@@ -501,6 +556,8 @@ def run_monitor_forcing(
     save_results: bool = True,
     verbose: bool = True,
     rollout_idx: int = 0,
+    max_sentences: Optional[int] = None,
+    num_samples: int = 1,
 ) -> Dict[str, Any]:
     """Run forcing monitor for all sentences (sync wrapper)."""
     return asyncio.run(run_monitor_forcing_async(
@@ -516,6 +573,8 @@ def run_monitor_forcing(
         save_results=save_results,
         verbose=verbose,
         rollout_idx=rollout_idx,
+        max_sentences=max_sentences,
+        num_samples=num_samples,
     ))
 
 
@@ -530,6 +589,8 @@ def run_monitor_forcing_from_verification(
     max_tokens: int = 2000,
     max_retries: int = MAX_RETRIES,
     verbose: bool = True,
+    max_sentences: Optional[int] = None,
+    num_samples: int = 1,
 ) -> Optional[Dict[str, Any]]:
     """Run forcing monitor using a CoT from verification rollouts."""
     task = ForcedResponseTask(model=model)
@@ -555,6 +616,8 @@ def run_monitor_forcing_from_verification(
         max_retries=max_retries,
         verbose=verbose,
         rollout_idx=rollout_idx,
+        max_sentences=max_sentences,
+        num_samples=num_samples,
     )
 
 

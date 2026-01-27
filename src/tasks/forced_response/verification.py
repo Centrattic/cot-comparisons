@@ -20,7 +20,7 @@ import openai
 from tqdm.asyncio import tqdm as atqdm
 
 from .data_loader import GPQAQuestion, BinaryJudgeQuestion, Question, load_gpqa_questions
-from .judge import extract_outcome_from_response
+from .judge import extract_outcome_from_response_async
 from .prompts import get_question_prompt
 from .task import ForcedResponseTask
 
@@ -82,6 +82,7 @@ async def run_single_rollout_async(
     model: str = "moonshotai/kimi-k2-thinking",
     temperature: float = 0.7,
     max_tokens: int = 8000,
+    no_reasoning: bool = False,
 ) -> RolloutResult:
     """Run a single rollout for a question (async)."""
     # Build prompt based on question type
@@ -92,12 +93,19 @@ async def run_single_rollout_async(
 
     async with semaphore:
         try:
-            response = await async_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
+            # Build API call parameters
+            api_params = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+
+            # Disable reasoning if requested (for models that support it)
+            if no_reasoning:
+                api_params["extra_body"] = {"reasoning_effort": "none"}
+
+            response = await async_client.chat.completions.create(**api_params)
 
             choice = response.choices[0]
             message = choice.message
@@ -112,7 +120,7 @@ async def run_single_rollout_async(
 
             # Extract answer based on question type
             if isinstance(question, BinaryJudgeQuestion):
-                answer, is_valid = extract_outcome_from_response(
+                answer, is_valid = await extract_outcome_from_response_async(
                     response=full_response,
                     question_type="binary_judge",
                     judge_prompt=question.judge_prompt,
@@ -195,8 +203,11 @@ async def run_verification_async(
     max_workers: int = 250,
     save_results: bool = True,
     verbose: bool = True,
+    no_reasoning: bool = False,
+    max_tokens: int = 8000,
     _async_client: Optional[openai.AsyncOpenAI] = None,
     _semaphore: Optional[asyncio.Semaphore] = None,
+    _run_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Run verification rollouts for a single question (async, parallel).
@@ -212,20 +223,29 @@ async def run_verification_async(
         verbose: Whether to print progress
         _async_client: Shared async client (for multi-question runs)
         _semaphore: Shared semaphore (for multi-question runs)
+        _run_dir: Shared run directory (for multi-question runs)
 
     Returns:
         Summary dictionary with agreement statistics
     """
     task = ForcedResponseTask(model=model)
 
-    # Skip if already verified (unless called internally with shared client)
-    if _async_client is None:
-        existing = task.load_verification_summary(question.id)
-        if existing:
-            if verbose:
-                print(f"  {question.id}: already verified "
-                      f"(agreement: {existing['agreement_rate']:.0%}), skipping")
-            return existing
+    # Create timestamped run directory if saving and not already provided
+    run_dir = _run_dir
+    if run_dir is None and save_results:
+        config = {
+            "model": model,
+            "question_id": question.id,
+            "question_type": question.question_type,
+            "num_rollouts": num_rollouts,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "max_workers": max_workers,
+            "no_reasoning": no_reasoning,
+        }
+        run_dir = task.create_verification_run_dir(question.id, config)
+        if verbose:
+            print(f"  Created run dir: {run_dir}")
 
     async_client = _async_client or openai.AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -245,6 +265,8 @@ async def run_verification_async(
             semaphore=semaphore,
             model=model,
             temperature=temperature,
+            max_tokens=max_tokens,
+            no_reasoning=no_reasoning,
         )
         for i in range(num_rollouts)
     ]
@@ -259,7 +281,7 @@ async def run_verification_async(
 
     # Save results
     if save_results:
-        task.save_verification_result(question, rollouts)
+        task.save_verification_result(question, rollouts, run_dir=run_dir)
 
     # Compute summary
     summary = compute_summary(question, rollouts)
@@ -288,6 +310,8 @@ def run_verification(
     max_workers: int = 250,
     save_results: bool = True,
     verbose: bool = True,
+    no_reasoning: bool = False,
+    max_tokens: int = 8000,
 ) -> Dict[str, Any]:
     """Run verification rollouts (sync wrapper)."""
     return asyncio.run(run_verification_async(
@@ -299,6 +323,8 @@ def run_verification(
         max_workers=max_workers,
         save_results=save_results,
         verbose=verbose,
+        no_reasoning=no_reasoning,
+        max_tokens=max_tokens,
     ))
 
 

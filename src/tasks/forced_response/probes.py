@@ -2,28 +2,33 @@
 White-box probes for the Forced Response task.
 
 Uses activations from the last token of partial CoT prefixes to predict
-answer distributions. Trains a 4-class classifier (A, B, C, D) where the
-softmax probabilities represent the predicted fraction of each answer.
+answer distributions.
+
+Supports two question types:
+- multiple_choice (bgel): 4-class classifier (A, B, C, D)
+- binary_judge (blackmail): 2-class classifier (YES=blackmail, NO=no_blackmail)
 
 Model: Qwen/Qwen2.5-32B-Instruct (or similar)
 Activations: Residual stream at mid layer, last token of partial CoT prefix
 """
 
+import contextlib
+import io
 import json
 import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from .data_loader import GPQAQuestion
-from .prompts import get_cumulative_cot_segments, build_forcing_prompt
+from .data_loader import GPQAQuestion, BinaryJudgeQuestion, Question
+from .prompts import get_cumulative_cot_segments
 from .task import ForcedResponseTask
 
 
@@ -31,23 +36,28 @@ from .task import ForcedResponseTask
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-32B-Instruct"
 DEFAULT_PROBE_LAYER = 32  # Mid layer for 64-layer model
 
+# Label definitions for different question types
+MULTIPLE_CHOICE_LABELS = ["A", "B", "C", "D"]
+BINARY_JUDGE_LABELS = ["YES", "NO"]  # YES = bad outcome (blackmail), NO = no blackmail
+
 
 @dataclass
 class ActivationSample:
     """A single activation sample for training/inference."""
     sentence_idx: int
     activation: np.ndarray  # [hidden_dim] - last token activation
-    answer_counts: Dict[str, int]  # {"A": 5, "B": 10, ...} from forcing
+    answer_counts: Dict[str, int]  # {"A": 5, "B": 10, ...} or {"YES": 2, "NO": 8}
     answer_distribution: Dict[str, float]  # Normalized to sum to 1
     partial_cot_length: int
     question_id: str = ""
+    question_type: str = "multiple_choice"
 
 
 @dataclass
 class ProbeResult:
     """Result of probe prediction for a single prefix."""
     sentence_idx: int
-    predicted_distribution: Dict[str, float]  # {"A": 0.1, "B": 0.7, ...}
+    predicted_distribution: Dict[str, float]  # {"A": 0.1, ...} or {"YES": 0.3, "NO": 0.7}
     actual_distribution: Optional[Dict[str, float]] = None
     kl_divergence: Optional[float] = None
 
@@ -60,6 +70,7 @@ class ProbeTrainingResult:
     per_class_accuracy: Dict[str, float]
     n_train: int
     n_val: int
+    question_type: str = "multiple_choice"
 
 
 class ActivationExtractor:
@@ -179,7 +190,7 @@ class ActivationExtractor:
 
     def extract_for_prefix(
         self,
-        question: GPQAQuestion,
+        question: Question,
         partial_cot: str,
     ) -> np.ndarray:
         """
@@ -188,42 +199,87 @@ class ActivationExtractor:
         Builds the full forcing prompt and extracts the last token activation.
 
         Args:
-            question: The GPQA question
+            question: The question (GPQAQuestion or BinaryJudgeQuestion)
             partial_cot: The partial chain-of-thought prefix
 
         Returns:
             Activation vector [hidden_dim]
         """
-        # Build the prompt that would be used for forcing
-        # This includes the question, choices, and partial CoT in <think> tags
-        prompt = build_forcing_prompt(
-            question=question.question,
-            choices=question.choices,
-            partial_cot=partial_cot,
-        )
-
+        prompt = build_forcing_prompt(question, partial_cot)
         return self.extract_last_token_activation(prompt)
 
 
-class ForcingProbe(nn.Module):
+def build_forcing_prompt(
+    question: Question,
+    partial_cot: str,
+) -> str:
     """
-    4-class classifier for predicting forcing answer distributions.
+    Build the full prompt used for forcing, including partial CoT.
 
-    Takes residual stream activations and outputs softmax probabilities
-    over [A, B, C, D], representing the predicted fraction of each answer.
+    This constructs the text that would be sent to a model when forcing it
+    to continue from a partial chain of thought.
+
+    Args:
+        question: The question (GPQAQuestion or BinaryJudgeQuestion)
+        partial_cot: The partial chain of thought prefix
+
+    Returns:
+        Full prompt string including question and partial CoT
+    """
+    if isinstance(question, BinaryJudgeQuestion):
+        # Binary judge questions: just the question text
+        user_msg = question.question
+    else:
+        # Multiple choice questions: include choices
+        choice_labels = [chr(ord("A") + i) for i in range(len(question.choices))]
+        choices_text = "\n".join(
+            f"{label}. {choice}" for label, choice in zip(choice_labels, question.choices)
+        )
+        user_msg = (
+            f"Answer the following multiple choice question. Think through the problem "
+            f"step by step, then provide your final answer.\n\n"
+            f"Question: {question.question}\n\n"
+            f"{choices_text}\n\n"
+            f"After your reasoning, provide your final answer as just the letter (A, B, C, or D) on a new line."
+        )
+
+    # Format as user message followed by assistant's partial thinking
+    prompt = f"""{user_msg}
+
+<think>
+{partial_cot}"""
+
+    return prompt
+
+
+class AnswerProbe(nn.Module):
+    """
+    Classifier for predicting forcing answer distributions.
+
+    Supports both multiple choice (4-class: A, B, C, D) and
+    binary judge (2-class: YES, NO) question types.
     """
 
     def __init__(
         self,
         hidden_dim: int,
+        question_type: Literal["multiple_choice", "binary_judge"] = "multiple_choice",
         use_mlp: bool = False,
         mlp_hidden: int = 256,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.question_type = question_type
         self.use_mlp = use_mlp
-        self.n_classes = 4  # A, B, C, D
+
+        # Set number of classes based on question type
+        if question_type == "binary_judge":
+            self.n_classes = 2
+            self.labels = BINARY_JUDGE_LABELS
+        else:
+            self.n_classes = 4
+            self.labels = MULTIPLE_CHOICE_LABELS
 
         if use_mlp:
             self.probe = nn.Sequential(
@@ -244,7 +300,7 @@ class ForcingProbe(nn.Module):
             x: Activations [batch, hidden_dim]
 
         Returns:
-            Logits [batch, 4]
+            Logits [batch, n_classes]
         """
         return self.probe(x)
 
@@ -256,7 +312,7 @@ class ForcingProbe(nn.Module):
             x: Activation [hidden_dim] or [1, hidden_dim]
 
         Returns:
-            Distribution dict {"A": prob, "B": prob, "C": prob, "D": prob}
+            Distribution dict {"A": prob, ...} or {"YES": prob, "NO": prob}
         """
         if x.dim() == 1:
             x = x.unsqueeze(0)
@@ -265,13 +321,25 @@ class ForcingProbe(nn.Module):
             logits = self.forward(x)
             probs = torch.softmax(logits, dim=-1).squeeze(0)
 
-        labels = ["A", "B", "C", "D"]
-        return {label: float(probs[i]) for i, label in enumerate(labels)}
+        return {label: float(probs[i]) for i, label in enumerate(self.labels)}
+
+    def predict_class(self, x: torch.Tensor) -> str:
+        """
+        Predict the most likely class for a single sample.
+
+        Args:
+            x: Activation [hidden_dim] or [1, hidden_dim]
+
+        Returns:
+            Predicted class label
+        """
+        dist = self.predict_distribution(x)
+        return max(dist.items(), key=lambda x: x[1])[0]
 
 
-class ForcingProbeTrainer:
+class ProbeTrainer:
     """
-    Trains and evaluates the forcing probe.
+    Trains and evaluates probes for both question types.
 
     Uses forcing run data to train a classifier that predicts answer
     distributions from activations.
@@ -280,13 +348,14 @@ class ForcingProbeTrainer:
     def __init__(
         self,
         extractor: ActivationExtractor,
-        probe: Optional[ForcingProbe] = None,
+        probe: Optional[AnswerProbe] = None,
         device: str = "cuda",
     ):
         self.extractor = extractor
         self.device = device
         self.probe = probe
         self._scaler = None  # StandardScaler for activations
+        self.question_type = "multiple_choice"
 
     def collect_training_data(
         self,
@@ -330,13 +399,34 @@ class ForcingProbeTrainer:
         with open(summary_path) as f:
             summary = json.load(f)
 
-        question = GPQAQuestion(
-            id=summary["question_id"],
-            question=summary["question"],
-            choices=summary["choices"],
-            correct_answer=summary["correct_answer"],
-            correct_index=ord(summary["correct_answer"]) - ord("A"),
-        )
+        # Determine question type and create appropriate question object
+        question_type = summary.get("question_type", "multiple_choice")
+        self.question_type = question_type
+
+        if question_type == "binary_judge":
+            # Load from verification summary for judge prompt
+            verification_dir = task.verification_dir / question_id
+            verification_summary_path = verification_dir / "summary.json"
+            with open(verification_summary_path) as f:
+                verification_summary = json.load(f)
+
+            question: Question = BinaryJudgeQuestion(
+                id=summary["question_id"],
+                question=verification_summary["question"],
+                judge_prompt=verification_summary["judge_prompt"],
+                bad_outcome=verification_summary["bad_outcome"],
+                subject=verification_summary.get("subject"),
+            )
+            valid_labels = BINARY_JUDGE_LABELS
+        else:
+            question = GPQAQuestion(
+                id=summary["question_id"],
+                question=summary.get("question", ""),
+                choices=summary.get("choices", []),
+                correct_answer=summary.get("correct_answer", ""),
+                correct_index=ord(summary.get("correct_answer", "A")) - ord("A"),
+            )
+            valid_labels = MULTIPLE_CHOICE_LABELS
 
         # Load source CoT
         source_cot = summary.get("source_cot", "")
@@ -356,9 +446,11 @@ class ForcingProbeTrainer:
 
         # Load forcing results per sentence
         samples = []
-        sentence_results = summary.get("sentence_results", [])
+        sentence_results = summary.get("sentence_results", summary.get("sentence_summaries", []))
 
         if verbose:
+            print(f"Question type: {question_type}")
+            print(f"Valid labels: {valid_labels}")
             print(f"Collecting activations for {len(sentence_results)} sentences...")
 
         for result in tqdm(sentence_results, disable=not verbose, desc="Extracting activations"):
@@ -373,16 +465,11 @@ class ForcingProbeTrainer:
                 continue
             partial_cot = cot_segments[sentence_idx]
 
-            # Compute distribution
-            total = sum(answer_counts.values())
+            # Compute distribution (only over valid labels)
+            total = sum(answer_counts.get(label, 0) for label in valid_labels)
             if total == 0:
                 continue
-            distribution = {k: v / total for k, v in answer_counts.items()}
-
-            # Ensure all labels present
-            for label in ["A", "B", "C", "D"]:
-                if label not in distribution:
-                    distribution[label] = 0.0
+            distribution = {label: answer_counts.get(label, 0) / total for label in valid_labels}
 
             # Extract activation
             activation = self.extractor.extract_for_prefix(question, partial_cot)
@@ -394,10 +481,123 @@ class ForcingProbeTrainer:
                 answer_distribution=distribution,
                 partial_cot_length=len(partial_cot),
                 question_id=question_id,
+                question_type=question_type,
             ))
 
         if verbose:
             print(f"Collected {len(samples)} samples")
+
+        return samples
+
+    def collect_training_data_from_verification(
+        self,
+        question_id: str,
+        max_rollouts: Optional[int] = None,
+        verbose: bool = True,
+    ) -> List[ActivationSample]:
+        """
+        Collect activation samples directly from verification rollouts.
+
+        This is useful when forcing data doesn't exist yet. Each rollout
+        provides one sample at the final answer point.
+
+        Args:
+            question_id: Question ID to collect data for
+            max_rollouts: Maximum number of rollouts to use
+            verbose: Print progress
+
+        Returns:
+            List of ActivationSample objects
+        """
+        task = ForcedResponseTask()
+
+        # Load verification summary
+        verification_dir = task.verification_dir / question_id
+        summary_path = verification_dir / "summary.json"
+        if not summary_path.exists():
+            raise FileNotFoundError(f"No verification data at {summary_path}")
+
+        with open(summary_path) as f:
+            summary = json.load(f)
+
+        # Determine question type
+        question_type = summary.get("question_type", "multiple_choice")
+        self.question_type = question_type
+
+        if question_type == "binary_judge":
+            question: Question = BinaryJudgeQuestion(
+                id=summary["question_id"],
+                question=summary["question"],
+                judge_prompt=summary["judge_prompt"],
+                bad_outcome=summary["bad_outcome"],
+                subject=summary.get("subject"),
+            )
+            valid_labels = BINARY_JUDGE_LABELS
+        else:
+            question = GPQAQuestion(
+                id=summary["question_id"],
+                question=summary["question"],
+                choices=summary["choices"],
+                correct_answer=summary["correct_answer"],
+                correct_index=ord(summary["correct_answer"]) - ord("A"),
+            )
+            valid_labels = MULTIPLE_CHOICE_LABELS
+
+        # Get answer counts from summary
+        answer_counts = summary.get("answer_counts", {})
+
+        # Load rollouts
+        rollouts_dir = verification_dir / "rollouts"
+        rollout_files = sorted(rollouts_dir.glob("rollout_*.json"))
+        if max_rollouts is not None:
+            rollout_files = rollout_files[:max_rollouts]
+
+        if verbose:
+            print(f"Question type: {question_type}")
+            print(f"Valid labels: {valid_labels}")
+            print(f"Answer counts from verification: {answer_counts}")
+            print(f"Loading {len(rollout_files)} rollouts...")
+
+        samples = []
+        for rollout_path in tqdm(rollout_files, disable=not verbose, desc="Extracting activations"):
+            with open(rollout_path) as f:
+                rollout_data = json.load(f)
+
+            # Get the answer for this rollout
+            answer = rollout_data.get("answer", "").upper()
+            if answer not in valid_labels:
+                continue
+
+            # Get the full CoT
+            source_cot = rollout_data.get("thinking", "") or rollout_data.get("full_response", "")
+            if not source_cot:
+                continue
+
+            # Extract activation at end of CoT
+            activation = self.extractor.extract_for_prefix(question, source_cot)
+
+            # Create one-hot distribution for this sample
+            distribution = {label: 1.0 if label == answer else 0.0 for label in valid_labels}
+
+            samples.append(ActivationSample(
+                sentence_idx=-1,  # Full CoT, not a prefix
+                activation=activation,
+                answer_counts={answer: 1},
+                answer_distribution=distribution,
+                partial_cot_length=len(source_cot),
+                question_id=question_id,
+                question_type=question_type,
+            ))
+
+        if verbose:
+            print(f"Collected {len(samples)} samples")
+            # Show class distribution
+            class_counts = {}
+            for s in samples:
+                for label, prob in s.answer_distribution.items():
+                    if prob > 0.5:
+                        class_counts[label] = class_counts.get(label, 0) + 1
+            print(f"Class distribution: {class_counts}")
 
         return samples
 
@@ -431,11 +631,23 @@ class ForcingProbeTrainer:
         from sklearn.model_selection import train_test_split
         from sklearn.preprocessing import StandardScaler
 
+        if not samples:
+            raise ValueError("No samples provided for training")
+
+        # Determine question type from samples
+        question_type = samples[0].question_type
+        self.question_type = question_type
+
+        if question_type == "binary_judge":
+            labels = BINARY_JUDGE_LABELS
+        else:
+            labels = MULTIPLE_CHOICE_LABELS
+
         # Prepare data
         X = np.stack([s.activation for s in samples])
-        # Convert distributions to probability vectors [n_samples, 4]
+        # Convert distributions to probability vectors
         y = np.array([
-            [s.answer_distribution.get(label, 0.0) for label in ["A", "B", "C", "D"]]
+            [s.answer_distribution.get(label, 0.0) for label in labels]
             for s in samples
         ])
 
@@ -457,7 +669,11 @@ class ForcingProbeTrainer:
 
         # Initialize probe
         hidden_dim = X_train.shape[1]
-        self.probe = ForcingProbe(hidden_dim=hidden_dim, use_mlp=use_mlp).to(self.device)
+        self.probe = AnswerProbe(
+            hidden_dim=hidden_dim,
+            question_type=question_type,
+            use_mlp=use_mlp,
+        ).to(self.device)
 
         # Training setup
         optimizer = torch.optim.AdamW(
@@ -511,13 +727,12 @@ class ForcingProbeTrainer:
             accuracy = (pred_labels == true_labels).float().mean().item()
 
             # KL divergence (actual || predicted)
-            # Add small epsilon for numerical stability
             eps = 1e-8
             kl_div = (y_val_t * (torch.log(y_val_t + eps) - torch.log(val_probs + eps))).sum(dim=-1).mean().item()
 
             # Per-class accuracy
             per_class_acc = {}
-            for i, label in enumerate(["A", "B", "C", "D"]):
+            for i, label in enumerate(labels):
                 mask = true_labels == i
                 if mask.sum() > 0:
                     per_class_acc[label] = (pred_labels[mask] == i).float().mean().item()
@@ -526,6 +741,7 @@ class ForcingProbeTrainer:
 
         if verbose:
             print(f"\nTraining complete:")
+            print(f"  Question type: {question_type}")
             print(f"  Validation accuracy: {accuracy:.3f}")
             print(f"  Mean KL divergence: {kl_div:.4f}")
             print(f"  Per-class accuracy: {per_class_acc}")
@@ -536,22 +752,23 @@ class ForcingProbeTrainer:
             per_class_accuracy=per_class_acc,
             n_train=len(X_train),
             n_val=len(X_val),
+            question_type=question_type,
         )
 
     def predict(
         self,
-        question: GPQAQuestion,
+        question: Question,
         partial_cot: str,
     ) -> Dict[str, float]:
         """
         Predict answer distribution for a single prefix.
 
         Args:
-            question: The GPQA question
+            question: The question (GPQAQuestion or BinaryJudgeQuestion)
             partial_cot: The partial chain-of-thought prefix
 
         Returns:
-            Predicted distribution {"A": prob, "B": prob, "C": prob, "D": prob}
+            Predicted distribution {"A": prob, ...} or {"YES": prob, "NO": prob}
         """
         if self.probe is None:
             raise RuntimeError("Probe not trained. Call train() first.")
@@ -570,7 +787,7 @@ class ForcingProbeTrainer:
 
     def predict_all_prefixes(
         self,
-        question: GPQAQuestion,
+        question: Question,
         source_cot: str,
         verbose: bool = True,
     ) -> List[ProbeResult]:
@@ -578,7 +795,7 @@ class ForcingProbeTrainer:
         Predict distributions for all prefix points in a CoT.
 
         Args:
-            question: The GPQA question
+            question: The question (GPQAQuestion or BinaryJudgeQuestion)
             source_cot: Full chain-of-thought to extract prefixes from
             verbose: Print progress
 
@@ -616,6 +833,9 @@ class ForcingProbeTrainer:
         config = {
             "hidden_dim": self.probe.hidden_dim,
             "use_mlp": self.probe.use_mlp,
+            "question_type": self.probe.question_type,
+            "n_classes": self.probe.n_classes,
+            "labels": self.probe.labels,
             "model_name": self.extractor.model_name,
             "layer": self.extractor.layer,
         }
@@ -635,8 +855,10 @@ class ForcingProbeTrainer:
             config = json.load(f)
 
         # Initialize probe
-        self.probe = ForcingProbe(
+        self.question_type = config.get("question_type", "multiple_choice")
+        self.probe = AnswerProbe(
             hidden_dim=config["hidden_dim"],
+            question_type=self.question_type,
             use_mlp=config["use_mlp"],
         ).to(self.device)
 
@@ -653,7 +875,7 @@ class ForcingProbeTrainer:
         self._scaler.var_ = self._scaler.scale_ ** 2
         self._scaler.n_features_in_ = len(self._scaler.mean_)
 
-        print(f"Loaded probe from {path}")
+        print(f"Loaded probe from {path} (question_type: {self.question_type})")
 
 
 def run_probe_training(
@@ -666,13 +888,15 @@ def run_probe_training(
     load_in_4bit: bool = True,
     device: str = "cuda",
     verbose: bool = True,
+    use_verification_data: bool = False,
+    max_rollouts: Optional[int] = None,
 ) -> Path:
     """
-    Train a forcing probe on data from a single question.
+    Train a probe on data from a single question.
 
     Args:
         question_id: Question ID with forcing data
-        rollout_idx: Rollout index
+        rollout_idx: Rollout index (for forcing data)
         model_name: Model to extract activations from
         layer: Layer to extract from
         use_mlp: Use MLP instead of linear probe
@@ -680,6 +904,8 @@ def run_probe_training(
         load_in_4bit: Load model in 4-bit
         device: Device for training
         verbose: Print progress
+        use_verification_data: If True, use verification rollouts instead of forcing data
+        max_rollouts: Max rollouts to use (for verification data)
 
     Returns:
         Path to saved probe
@@ -693,14 +919,21 @@ def run_probe_training(
     )
 
     # Initialize trainer
-    trainer = ForcingProbeTrainer(extractor=extractor, device=device)
+    trainer = ProbeTrainer(extractor=extractor, device=device)
 
     # Collect training data
-    samples = trainer.collect_training_data(
-        question_id=question_id,
-        rollout_idx=rollout_idx,
-        verbose=verbose,
-    )
+    if use_verification_data:
+        samples = trainer.collect_training_data_from_verification(
+            question_id=question_id,
+            max_rollouts=max_rollouts,
+            verbose=verbose,
+        )
+    else:
+        samples = trainer.collect_training_data(
+            question_id=question_id,
+            rollout_idx=rollout_idx,
+            verbose=verbose,
+        )
 
     if len(samples) < 10:
         raise ValueError(f"Not enough samples ({len(samples)}). Need at least 10.")
@@ -716,7 +949,8 @@ def run_probe_training(
     # Save
     task = ForcedResponseTask()
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    probe_dir = task.data_dir / "probes" / question_id / f"rollout_{rollout_idx:03d}" / timestamp
+    data_source = "verification" if use_verification_data else f"rollout_{rollout_idx:03d}"
+    probe_dir = task.data_dir / "probes" / question_id / data_source / timestamp
     trainer.save(probe_dir)
 
     # Save training result
@@ -728,7 +962,8 @@ def run_probe_training(
             "n_train": result.n_train,
             "n_val": result.n_val,
             "question_id": question_id,
-            "rollout_idx": rollout_idx,
+            "question_type": result.question_type,
+            "data_source": data_source,
             "model_name": model_name,
             "layer": layer,
             "use_mlp": use_mlp,
@@ -768,28 +1003,44 @@ def run_probe_inference(
 
     # Find probe
     if probe_path is None:
-        probe_base = task.data_dir / "probes" / question_id / f"rollout_{rollout_idx:03d}"
+        probe_base = task.data_dir / "probes" / question_id
         if not probe_base.exists():
             raise FileNotFoundError(f"No probe found at {probe_base}")
-        # Use latest
-        timestamps = sorted(probe_base.iterdir())
-        if not timestamps:
-            raise FileNotFoundError("No probe timestamps found")
-        probe_path = timestamps[-1]
+        # Try rollout-specific first, then verification
+        for subdir in [f"rollout_{rollout_idx:03d}", "verification"]:
+            subpath = probe_base / subdir
+            if subpath.exists():
+                timestamps = sorted(subpath.iterdir())
+                if timestamps:
+                    probe_path = timestamps[-1]
+                    break
+        if probe_path is None:
+            raise FileNotFoundError(f"No probe timestamps found in {probe_base}")
 
-    # Load question and CoT
+    # Load verification summary to get question info
     verification_dir = task.verification_dir / question_id
     summary_path = verification_dir / "summary.json"
     with open(summary_path) as f:
         summary = json.load(f)
 
-    question = GPQAQuestion(
-        id=summary["question_id"],
-        question=summary["question"],
-        choices=summary["choices"],
-        correct_answer=summary["correct_answer"],
-        correct_index=ord(summary["correct_answer"]) - ord("A"),
-    )
+    # Create appropriate question object
+    question_type = summary.get("question_type", "multiple_choice")
+    if question_type == "binary_judge":
+        question: Question = BinaryJudgeQuestion(
+            id=summary["question_id"],
+            question=summary["question"],
+            judge_prompt=summary["judge_prompt"],
+            bad_outcome=summary["bad_outcome"],
+            subject=summary.get("subject"),
+        )
+    else:
+        question = GPQAQuestion(
+            id=summary["question_id"],
+            question=summary["question"],
+            choices=summary["choices"],
+            correct_answer=summary["correct_answer"],
+            correct_index=ord(summary["correct_answer"]) - ord("A"),
+        )
 
     rollout_path = verification_dir / "rollouts" / f"rollout_{rollout_idx:03d}.json"
     with open(rollout_path) as f:
@@ -803,7 +1054,7 @@ def run_probe_inference(
         device=device,
         load_in_4bit=load_in_4bit,
     )
-    trainer = ForcingProbeTrainer(extractor=extractor, device=device)
+    trainer = ProbeTrainer(extractor=extractor, device=device)
     trainer.load(probe_path)
 
     # Run inference
@@ -812,7 +1063,7 @@ def run_probe_inference(
     # Format output
     output = {
         "question_id": question_id,
-        "correct_answer": question.correct_answer,
+        "question_type": question_type,
         "num_sentences": len(results),
         "sentence_results": [
             {
@@ -822,6 +1073,11 @@ def run_probe_inference(
             for r in results
         ],
     }
+
+    if isinstance(question, GPQAQuestion):
+        output["correct_answer"] = question.correct_answer
+    else:
+        output["bad_outcome"] = question.bad_outcome
 
     # Save results
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -839,7 +1095,7 @@ def run_probe_inference(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train and run forcing probes")
+    parser = argparse.ArgumentParser(description="Train and run probes for forced response task")
     parser.add_argument("command", choices=["train", "infer"], help="Command to run")
     parser.add_argument("--question-id", "-q", required=True, help="Question ID")
     parser.add_argument("--rollout-idx", "-r", type=int, default=0, help="Rollout index")
@@ -851,6 +1107,10 @@ if __name__ == "__main__":
     parser.add_argument("--load-in-4bit", action="store_true", default=True, help="Load model in 4-bit")
     parser.add_argument("--device", default="cuda", help="Device")
     parser.add_argument("--quiet", action="store_true", help="Suppress output")
+    parser.add_argument("--use-verification-data", action="store_true",
+                        help="Use verification rollouts instead of forcing data")
+    parser.add_argument("--max-rollouts", type=int, default=None,
+                        help="Max rollouts to use (for verification data)")
 
     args = parser.parse_args()
 
@@ -865,6 +1125,8 @@ if __name__ == "__main__":
             load_in_4bit=args.load_in_4bit,
             device=args.device,
             verbose=not args.quiet,
+            use_verification_data=args.use_verification_data,
+            max_rollouts=args.max_rollouts,
         )
         print(f"\nProbe saved to: {probe_path}")
 

@@ -88,6 +88,27 @@ class ForcedResponseTask(BaseTask):
             json.dump(config, f, indent=2)
         return run_dir
 
+    def create_verification_run_dir(self, question_id: str, config: dict) -> Path:
+        """
+        Create a timestamped run directory for verification with config.json.
+
+        Args:
+            question_id: The question ID
+            config: Configuration dict to save as config.json
+
+        Returns:
+            Path to the created timestamped run directory
+        """
+        base = self.get_question_dir(question_id, "verification")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = base / timestamp
+        run_dir.mkdir(parents=True, exist_ok=True)
+        config["timestamp"] = datetime.now().isoformat()
+        config["run_type"] = "verification"
+        with open(run_dir / "config.json", "w") as f:
+            json.dump(config, f, indent=2)
+        return run_dir
+
     @staticmethod
     def get_latest_run_dir(rollout_dir: Path) -> Optional[Path]:
         """
@@ -149,6 +170,7 @@ class ForcedResponseTask(BaseTask):
         self,
         question: Question,
         rollouts: List[Dict[str, Any]],
+        run_dir: Optional[Path] = None,
     ) -> Path:
         """
         Save verification results for a question.
@@ -156,12 +178,16 @@ class ForcedResponseTask(BaseTask):
         Args:
             question: The question (GPQAQuestion or BinaryJudgeQuestion)
             rollouts: List of rollout results
+            run_dir: Timestamped run directory (if None, falls back to legacy path)
 
         Returns:
             Path to the saved summary file
         """
-        question_dir = self.get_question_dir(question.id, "verification")
-        rollouts_dir = question_dir / "rollouts"
+        if run_dir:
+            save_dir = run_dir
+        else:
+            save_dir = self.get_question_dir(question.id, "verification")
+        rollouts_dir = save_dir / "rollouts"
         rollouts_dir.mkdir(parents=True, exist_ok=True)
 
         # Save individual rollouts
@@ -209,7 +235,7 @@ class ForcedResponseTask(BaseTask):
             summary["correct_answer"] = question.correct_answer
             summary["is_correct"] = most_common[0] == question.correct_answer
 
-        summary_path = question_dir / "summary.json"
+        summary_path = save_dir / "summary.json"
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
 
@@ -279,12 +305,43 @@ class ForcedResponseTask(BaseTask):
 
         return summary_path
 
+    def get_latest_verification_dir(self, question_id: str) -> Optional[Path]:
+        """
+        Get the latest timestamped verification directory for a question.
+
+        Falls back to question_dir itself if no timestamped subdirs exist
+        (for backward compatibility with pre-migration data).
+
+        Args:
+            question_id: The question ID
+
+        Returns:
+            Path to the latest verification run directory, or None if nothing exists
+        """
+        question_dir = self.verification_dir / question_id
+        if not question_dir.exists():
+            return None
+        # Look for timestamped subdirs (YYYYMMDD_HHMMSS format)
+        timestamped = sorted(
+            [d for d in question_dir.iterdir()
+             if d.is_dir() and len(d.name) == 15 and d.name[8] == '_'],
+            reverse=True,
+        )
+        if timestamped:
+            return timestamped[0]
+        # Fallback: if summary.json exists directly in question_dir (pre-migration)
+        if (question_dir / "summary.json").exists():
+            return question_dir
+        return None
+
     def load_verification_summary(self, question_id: str) -> Optional[Dict[str, Any]]:
-        """Load verification summary for a question."""
-        summary_path = self.verification_dir / question_id / "summary.json"
-        if summary_path.exists():
-            with open(summary_path) as f:
-                return json.load(f)
+        """Load verification summary for a question (from latest timestamped run)."""
+        run_dir = self.get_latest_verification_dir(question_id)
+        if run_dir:
+            summary_path = run_dir / "summary.json"
+            if summary_path.exists():
+                with open(summary_path) as f:
+                    return json.load(f)
         return None
 
     def get_verified_questions(self, threshold: float = 0.8) -> List[str]:

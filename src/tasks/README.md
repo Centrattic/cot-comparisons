@@ -217,3 +217,63 @@ python3 plots/forced_response/plot_majority_answer.py -q custom_bagel_001 -r 0
 ```
 
 Produces a plot comparing majority answer (A/B/C/D) vs sentence index across all four methods.
+
+### Probes (White-box)
+
+Train linear probes on model activations to predict the answer from the last token of the reasoning prefix. Supports both question types:
+
+- **multiple_choice** (e.g., `custom_bagel_001`): 4-class classifier predicting A/B/C/D
+- **binary_judge** (e.g., `blackmail_001`): 2-class classifier predicting YES (blackmail) or NO (no blackmail)
+
+#### Training
+
+```bash
+# Train from verification rollouts (each rollout = one sample at end of CoT)
+python3 -m src.tasks.forced_response.probes train -q custom_bagel_001 --use-verification-data
+
+# Train from forcing data (each sentence = one sample with soft labels from answer distribution)
+python3 -m src.tasks.forced_response.probes train -q custom_bagel_001 -r 0
+
+# Train for blackmail question
+python3 -m src.tasks.forced_response.probes train -q blackmail_001 --use-verification-data
+```
+
+Options:
+- `--use-verification-data` — use verification rollouts instead of forcing data
+- `--max-rollouts N` — limit number of rollouts (for verification data)
+- `--use-mlp` — use 2-layer MLP instead of linear probe
+- `--epochs N` — training epochs (default: 100)
+- `--layer N` — model layer to extract activations from (default: 32)
+- `--model-name` — model for activation extraction (default: `Qwen/Qwen2.5-32B-Instruct`)
+
+#### Inference
+
+```bash
+# Run probe on all prefix points in a CoT
+python3 -m src.tasks.forced_response.probes infer -q custom_bagel_001 -r 0
+
+# Specify probe path explicitly
+python3 -m src.tasks.forced_response.probes infer -q blackmail_001 -r 0 --probe-path data/forced_response/probes/blackmail_001/verification/2025-01-27_12-00-00
+```
+
+#### Output
+
+Probes output probability distributions at each prefix point:
+- **multiple_choice**: `{"A": 0.1, "B": 0.3, "C": 0.5, "D": 0.1}`
+- **binary_judge**: `{"YES": 0.2, "NO": 0.8}` (YES = bad outcome, e.g., blackmail)
+
+#### Data layout
+
+```
+data/forced_response/
+├── probes/{question_id}/
+│   ├── verification/{timestamp}/      # Trained from verification rollouts
+│   │   ├── config.json
+│   │   ├── probe.pt
+│   │   ├── scaler.npz
+│   │   └── training_result.json
+│   └── rollout_000/{timestamp}/       # Trained from forcing data
+│       └── ...
+└── probe_inference/{question_id}/rollout_000/{timestamp}/
+    └── results.json                   # Per-sentence predictions
+```
