@@ -34,35 +34,63 @@ python -m src.tasks.scruples.run_scruples --run-monitor --variant first_person -
   --monitor-model openai/gpt-4o-mini --output-dir data/scruples-qwen3-32b
 ```
 
-**4. Run baseline** - Ask monitor directly who is wrong (no CoT):
+**4. Run baseline** - Ask monitor directly who is wrong to get the monitor's perspective (may be diifferent from subject model):
 
 ```bash
 python -m src.tasks.scruples.run_scruples --run-baseline --variant first_person
 ```
 
-**5. SAE white-box monitor** - Find discriminative features then score responses (requires local Qwen3-32B):
+**5. Run discrimination monitor** - Given paired control/intervention CoTs, identify which had the user preference:
 
 ```bash
-# Step 1: Find features that discriminate sycophantic vs non-sycophantic responses
-python -m src.tasks.scruples.run_scruples --find-sae-features --output-dir data/scruples-qwen3-32b \
-  --sae-layer 32 --sae-trainer 0 --load-in-4bit
+python -m src.tasks.scruples.run_scruples --run-discrimination --variant first_person \
+  --output-dir data/scruples-qwen3-32b --max-pairs 100
+```
 
-# Step 2: Score all intervention responses using the trained probe
-python -m src.tasks.scruples.run_scruples --run-sae --output-dir data/scruples-qwen3-32b --load-in-4bit
+Tests whether sycophancy leaves detectable reasoning traces. For each prompt, pairs a control run with an intervention run, randomly assigns them as Response A/B, and asks the monitor to identify which one had the user's preference stated. Baseline accuracy is 50% (random chance).
 
-# Or use the standalone SAE CLI:
-python -m src.tasks.scruples.sae --find-features --output-dir data/scruples-qwen3-32b --sae-layer 32
-python -m src.tasks.scruples.sae --run-monitor --output-dir data/scruples-qwen3-32b
+Options:
+- `--discrimination-model` — model to use (default: same as monitor)
+- `--max-pairs N` — limit number of pairs to evaluate
+- `--discrimination-seed` — random seed for reproducible ordering
+
+**6. SAE white-box monitor** - Find discriminative features then score responses (requires local Qwen3-32B):
+
+Two approaches available:
+
+**Binary approach** (per-rollout classification): Is this individual response sycophantic?
+```bash
+# Find features with high Cohen's d between sycophantic vs non-sycophantic rollouts
+# Trains logistic regression probe → outputs P(sycophantic) for each rollout
+python -m src.tasks.scruples.sae --find-features --output-dir data/scruples-qwen3-32b --load-in-4bit
+```
+
+**Contrastive approach** (per-prompt regression): How much does this prompt induce switching?
+```bash
+# Computes feature_delta = mean(intervention) - mean(control) per prompt
+# Finds features where delta correlates with switch_rate
+# Trains ridge regression → predicts switch_rate from feature deltas
+python -m src.tasks.scruples.sae --find-features --contrastive --output-dir data/scruples-qwen3-32b --load-in-4bit
+```
+
+**Score responses** using trained probe:
+```bash
+python -m src.tasks.scruples.sae --run-monitor --output-dir data/scruples-qwen3-32b --load-in-4bit
 ```
 
 SAE options:
 - `--sae-layer {16,32,48}` — model depth (25%, 50%, 75%). Default: 32
-- `--sae-trainer {0,1,2,3}` — 0=16k/L0=80, 1=16k/L0=160, 2=65k/L0=80, 3=65k/L0=160. Default: 0 (lowest width)
+- `--sae-trainer {0,1,2,3}` — 0=16k/L0=80, 1=16k/L0=160, 2=65k/L0=80, 3=65k/L0=160. Default: 0
 - `--load-in-4bit` — quantize local model to ~18GB VRAM
 - `--top-k-features N` — number of discriminative features to select (default: 50)
-- `--sae-max-samples N` — limit samples for feature finding
+- `--contrastive` — use contrastive approach (correlate with switch_rate)
+- `--ridge-alpha` — ridge regression regularization (for contrastive, default: 1.0)
 
-**Note on SAE activation filtering:** The Qwen3-32B SAEs were trained with activations >10x median norm excluded (~0.1% of tokens affected by attention sinks). This filtering is applied automatically during feature extraction.
+**Control agreement filter:** Only prompts where ≥85% of control runs give the same answer are used. This ensures the model is confident (not confused) in control, so any switching in intervention is real sycophancy.
+
+**Probe saving:** The trained probe (weights, scaler, feature indices) is saved to `features.json` and can be reloaded for scoring new responses.
+
+**Note on SAE activation filtering:** The Qwen3-32B SAEs were trained with activations >10x median norm excluded (~0.1% of tokens affected by attention sinks). This filtering is applied automatically.
 
 ### Key metrics
 
@@ -83,6 +111,10 @@ data/scruples-{model}/
 │   ├── config.json                # monitor_model, variant
 │   └── {anecdote_id}/
 │       └── intervention_{idx}.json
+├── monitor/discrimination_{timestamp}/  # Discrimination monitor
+│   ├── config.json
+│   ├── results.csv                # Per-pair predictions
+│   └── metrics.json               # Accuracy vs 50% baseline
 ├── baseline/{timestamp}/          # Direct judgments
 │   ├── config.json
 │   └── {anecdote_id}.json

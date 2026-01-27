@@ -8,25 +8,25 @@ with the partial CoT prefix — it continues thinking from there and answers.
 """
 
 import asyncio
+import contextlib
 import io
 import json
 import os
 import re
-import contextlib
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import openai
+from tinker import ServiceClient, types
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 from transformers import AutoTokenizer
-from tinker import ServiceClient, types
 
 from .data_loader import GPQAQuestion
 from .prompts import get_cumulative_cot_segments
 from .task import ForcedResponseTask
-
 
 # Chat template special tokens for Kimi K2
 IM_SYSTEM = "<|im_system|>"
@@ -39,6 +39,7 @@ IM_END = "<|im_end|>"
 @dataclass
 class ForceResult:
     """Result of a single true-forcing attempt."""
+
     sentence_idx: int
     force_idx: int
     partial_cot: str
@@ -104,14 +105,13 @@ def build_force_prompt(
     Returns:
         ModelInput ready for sampling
     """
-    choice_labels = [chr(ord('A') + i) for i in range(len(choices))]
+    choice_labels = [chr(ord("A") + i) for i in range(len(choices))]
     choices_text = "\n".join(
         f"{label}. {choice}" for label, choice in zip(choice_labels, choices)
     )
 
     user_msg = (
-        f"{question}\n\n{choices_text}\n\n"
-        f"Answer with just the letter (A, B, C, or D)."
+        f"{question}\n\n{choices_text}\n\nAnswer with just the letter (A, B, C, or D)."
     )
 
     prompt_str = (
@@ -130,7 +130,9 @@ def build_force_prompt(
     return types.ModelInput.from_ints(tokens)
 
 
-def extract_force_answer(tokens: List[int], tokenizer: AutoTokenizer) -> Tuple[str, str]:
+def extract_force_answer(
+    tokens: List[int], tokenizer: AutoTokenizer
+) -> Tuple[str, str]:
     """
     Decode sampled tokens and extract the answer letter from after </think>.
 
@@ -155,12 +157,12 @@ def extract_force_answer(tokens: List[int], tokenizer: AutoTokenizer) -> Tuple[s
         answer_text = ""
 
     # Try exact single letter from answer portion
-    clean = answer_text.upper().rstrip('.').strip()
-    if clean in ['A', 'B', 'C', 'D']:
+    clean = answer_text.upper().rstrip(".").strip()
+    if clean in ["A", "B", "C", "D"]:
         return clean, text
 
     # Try to find a letter in the answer portion
-    match = re.search(r'\b([A-Da-d])\b', answer_text)
+    match = re.search(r"\b([A-Da-d])\b", answer_text)
     if match:
         return match.group(1).upper(), text
 
@@ -237,24 +239,24 @@ def run_forcing(
             print(f"Run dir: {run_dir}")
         print()
 
-    all_sentence_summaries = []
-
     # Tokenize full source CoT once to compute per-sentence max_tokens
     with contextlib.redirect_stdout(io.StringIO()):
-        source_cot_token_count = len(tokenizer.encode(source_cot, add_special_tokens=False))
+        source_cot_token_count = len(
+            tokenizer.encode(source_cot, add_special_tokens=False)
+        )
 
-    # Submit all sampling requests upfront for maximum parallelism
-    futures = []
-    for sentence_idx, partial_cot in enumerate(cot_segments):
-        # max_tokens = remaining CoT tokens + buffer for </think> and answer
+    def force_single_sample(
+        sentence_idx: int, force_idx: int, partial_cot: str
+    ) -> Optional[ForceResult]:
+        """Force a single sample - runs in thread pool. Returns ForceResult or None."""
+        # max_tokens = remaining CoT tokens + buffer, capped at 1024
         remaining_frac = 1.0 - len(partial_cot) / max(len(source_cot), 1)
         sentence_max_tokens = int(source_cot_token_count * remaining_frac) + 100
-        sentence_max_tokens = max(sentence_max_tokens, 100)
+        sentence_max_tokens = min(max(sentence_max_tokens, 100), 1024)
 
         params = types.SamplingParams(
             max_tokens=sentence_max_tokens,
             temperature=temperature,
-            stop=im_end_token,
         )
 
         prompt = build_force_prompt(
@@ -263,102 +265,107 @@ def run_forcing(
             partial_cot=partial_cot,
             tokenizer=tokenizer,
         )
-        future = sampling_client.sample(
+
+        # num_samples=1 like friend's code
+        result = sampling_client.sample(
             prompt=prompt,
-            num_samples=num_forces,
+            num_samples=1,
             sampling_params=params,
-        )
-        futures.append((sentence_idx, partial_cot, params, future))
+        ).result()
 
-    # Collect results with progress bar
-    for sentence_idx, partial_cot, params, future in tqdm(
-        futures, desc="Forcing", unit="sentence", disable=not verbose
-    ):
-        valid_results: List[ForceResult] = []
-        result = future.result()
+        sample_tokens = result.sequences[0].tokens
+        answer, raw_response = extract_force_answer(sample_tokens, tokenizer)
 
-        for i in range(len(result.sequences)):
-            sample_tokens = result.sequences[i].tokens
-            answer, raw_response = extract_force_answer(sample_tokens, tokenizer)
+        if answer:
+            if "</think>" in raw_response:
+                continued_cot = raw_response.split("</think>", 1)[0]
+            else:
+                continued_cot = raw_response
 
-            if answer:
-                if "</think>" in raw_response:
-                    continued_cot = raw_response.split("</think>", 1)[0]
-                else:
-                    continued_cot = raw_response
-
-                force_result = ForceResult(
-                    sentence_idx=sentence_idx,
-                    force_idx=len(valid_results),
-                    partial_cot=partial_cot,
-                    continued_cot=continued_cot,
-                    raw_tokens=list(sample_tokens),
-                    raw_response=raw_response,
-                    answer=answer,
-                )
-                valid_results.append(force_result)
-
-        # One retry if not enough valid answers
-        if len(valid_results) < num_forces:
-            needed = num_forces - len(valid_results)
-            prompt = build_force_prompt(
-                question=question.question,
-                choices=question.choices,
+            return ForceResult(
+                sentence_idx=sentence_idx,
+                force_idx=force_idx,
                 partial_cot=partial_cot,
-                tokenizer=tokenizer,
+                continued_cot=continued_cot,
+                raw_tokens=list(sample_tokens),
+                raw_response=raw_response,
+                answer=answer,
             )
-            retry_result = sampling_client.sample(
-                prompt=prompt,
-                num_samples=needed,
-                sampling_params=params,
-            ).result()
+        return None
 
-            for i in range(len(retry_result.sequences)):
-                sample_tokens = retry_result.sequences[i].tokens
-                answer, raw_response = extract_force_answer(sample_tokens, tokenizer)
+    # Build all (sentence_idx, force_idx) tasks
+    all_tasks = [
+        (sent_idx, force_idx, cot_segments[sent_idx])
+        for sent_idx in range(num_sentences)
+        for force_idx in range(num_forces)
+    ]
+    total_tasks = len(all_tasks)
 
-                if answer:
-                    if "</think>" in raw_response:
-                        continued_cot = raw_response.split("</think>", 1)[0]
-                    else:
-                        continued_cot = raw_response
+    if verbose:
+        print(
+            f"Submitting {total_tasks} parallel jobs ({num_sentences} sentences × {num_forces} forces)"
+        )
 
-                    force_result = ForceResult(
-                        sentence_idx=sentence_idx,
-                        force_idx=len(valid_results),
-                        partial_cot=partial_cot,
-                        continued_cot=continued_cot,
-                        raw_tokens=list(sample_tokens),
-                        raw_response=raw_response,
-                        answer=answer,
-                    )
-                    valid_results.append(force_result)
+    # Run ALL samples in parallel with ThreadPoolExecutor
+    all_results: List[ForceResult] = []
+    num_workers = min(300, total_tasks)
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(force_single_sample, sent_idx, force_idx, partial_cot): (
+                sent_idx,
+                force_idx,
+            )
+            for sent_idx, force_idx, partial_cot in all_tasks
+        }
 
-        # Save per-sentence results
+        with tqdm(
+            total=total_tasks, desc="Forcing", unit="sample", disable=not verbose
+        ) as pbar:
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    all_results.append(result)
+                pbar.update(1)
+
+    # Group results by sentence
+    results_by_sentence: Dict[int, List[ForceResult]] = {}
+    for r in all_results:
+        if r.sentence_idx not in results_by_sentence:
+            results_by_sentence[r.sentence_idx] = []
+        results_by_sentence[r.sentence_idx].append(r)
+
+    # Build summaries and save
+    all_sentence_summaries = []
+    for sent_idx in range(num_sentences):
+        sent_results = results_by_sentence.get(sent_idx, [])
+        partial_cot = cot_segments[sent_idx]
+
         if save_results:
             task.save_forcing_result(
                 question=question,
-                sentence_idx=sentence_idx,
+                sentence_idx=sent_idx,
                 partial_cot=partial_cot,
-                force_results=[r.to_dict() for r in valid_results],
+                force_results=[r.to_dict() for r in sent_results],
                 rollout_idx=rollout_idx,
                 run_dir=run_dir,
             )
 
-        # Compute sentence summary
         answer_counts: Dict[str, int] = {}
-        for r in valid_results:
+        for r in sent_results:
             answer_counts[r.answer] = answer_counts.get(r.answer, 0) + 1
 
-        sentence_summary = {
-            "sentence_idx": sentence_idx,
-            "partial_cot_length": len(partial_cot),
-            "total_forces": len(valid_results),
-            "valid_answers": len(valid_results),
-            "answer_counts": answer_counts,
-            "most_common": max(answer_counts.items(), key=lambda x: x[1])[0] if answer_counts else "",
-        }
-        all_sentence_summaries.append(sentence_summary)
+        all_sentence_summaries.append(
+            {
+                "sentence_idx": sent_idx,
+                "partial_cot_length": len(partial_cot),
+                "total_forces": len(sent_results),
+                "valid_answers": len(sent_results),
+                "answer_counts": answer_counts,
+                "most_common": max(answer_counts.items(), key=lambda x: x[1])[0]
+                if answer_counts
+                else "",
+            }
+        )
 
     # Save overall summary
     if save_results:
@@ -431,7 +438,7 @@ def run_forcing_from_verification(
         question=summary["question"],
         choices=summary["choices"],
         correct_answer=summary["correct_answer"],
-        correct_index=ord(summary["correct_answer"]) - ord('A'),
+        correct_index=ord(summary["correct_answer"]) - ord("A"),
     )
 
     # Get the CoT from the rollout

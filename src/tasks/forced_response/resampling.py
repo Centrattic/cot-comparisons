@@ -10,6 +10,7 @@ import io
 import json
 import re
 import contextlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 
@@ -233,102 +234,98 @@ def run_resampling_from_verification(
     params = types.SamplingParams(
         max_tokens=max_tokens,
         temperature=temperature,
-        stop=im_end_token,
     )
 
-    # Submit all futures upfront
-    futures = []
-    for sentence_idx in selected_indices:
-        partial_cot = cot_segments[sentence_idx]
+    def resample_single(sentence_idx: int, resample_idx: int, partial_cot: str) -> Optional[ResampleResult]:
+        """Run a single resample - one job per (sentence, resample) pair."""
         prompt = build_resample_prompt(
             question=question.question,
             choices=question.choices,
             partial_cot=partial_cot,
             tokenizer=tokenizer,
         )
-        future = sampling_client.sample(
+
+        result = sampling_client.sample(
             prompt=prompt,
-            num_samples=num_resamples,
+            num_samples=1,
             sampling_params=params,
-        )
-        futures.append((sentence_idx, partial_cot, future))
+        ).result()
 
-    # Collect results with progress bar
-    all_sentence_summaries = []
+        sample_tokens = result.sequences[0].tokens
+        answer, continued_cot, full_text = extract_resample_answer(sample_tokens, tokenizer)
 
-    for sentence_idx, partial_cot, future in tqdm(
-        futures, desc="Resampling", unit="prefix", disable=not verbose
-    ):
-        valid_results: List[ResampleResult] = []
-        result = future.result()
-
-        for i in range(len(result.sequences)):
-            sample_tokens = result.sequences[i].tokens
-            answer, continued_cot, full_text = extract_resample_answer(sample_tokens, tokenizer)
-
-            if answer:
-                resample_result = ResampleResult(
-                    sentence_idx=sentence_idx,
-                    resample_idx=len(valid_results),
-                    forced_prefix=partial_cot,
-                    continuation=continued_cot,
-                    full_response=partial_cot + full_text,
-                    answer=answer,
-                    raw_tokens=list(sample_tokens),
-                )
-                valid_results.append(resample_result)
-
-        # One retry if not enough valid answers
-        if len(valid_results) < num_resamples:
-            needed = num_resamples - len(valid_results)
-            prompt = build_resample_prompt(
-                question=question.question,
-                choices=question.choices,
-                partial_cot=partial_cot,
-                tokenizer=tokenizer,
+        if answer:
+            return ResampleResult(
+                sentence_idx=sentence_idx,
+                resample_idx=resample_idx,
+                forced_prefix=partial_cot,
+                continuation=continued_cot,
+                full_response=partial_cot + full_text,
+                answer=answer,
+                raw_tokens=list(sample_tokens),
             )
-            retry_result = sampling_client.sample(
-                prompt=prompt,
-                num_samples=needed,
-                sampling_params=params,
-            ).result()
+        return None
 
-            for i in range(len(retry_result.sequences)):
-                sample_tokens = retry_result.sequences[i].tokens
-                answer, continued_cot, full_text = extract_resample_answer(sample_tokens, tokenizer)
+    # Build all (sentence_idx, resample_idx) tasks
+    all_tasks = [
+        (sent_idx, resample_idx, cot_segments[sent_idx])
+        for sent_idx in selected_indices
+        for resample_idx in range(num_resamples)
+    ]
+    total_tasks = len(all_tasks)
 
-                if answer:
-                    resample_result = ResampleResult(
-                        sentence_idx=sentence_idx,
-                        resample_idx=len(valid_results),
-                        forced_prefix=partial_cot,
-                        continuation=continued_cot,
-                        full_response=partial_cot + full_text,
-                        answer=answer,
-                        raw_tokens=list(sample_tokens),
-                    )
-                    valid_results.append(resample_result)
+    if verbose:
+        print(f"Submitting {total_tasks} parallel jobs ({len(selected_indices)} prefixes × {num_resamples} resamples)")
+
+    # Run ALL resamples in parallel with ThreadPoolExecutor
+    all_results: List[ResampleResult] = []
+    num_workers = min(300, total_tasks)
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(resample_single, sent_idx, resample_idx, partial_cot): (sent_idx, resample_idx)
+            for sent_idx, resample_idx, partial_cot in all_tasks
+        }
+
+        with tqdm(total=total_tasks, desc="Resampling", unit="sample", disable=not verbose) as pbar:
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    all_results.append(result)
+                pbar.update(1)
+
+    # Group results by sentence
+    results_by_sentence: Dict[int, List[ResampleResult]] = {}
+    for r in all_results:
+        if r.sentence_idx not in results_by_sentence:
+            results_by_sentence[r.sentence_idx] = []
+        results_by_sentence[r.sentence_idx].append(r)
+
+    # Build summaries and save
+    all_sentence_summaries = []
+    for sent_idx in selected_indices:
+        sent_results = results_by_sentence.get(sent_idx, [])
+        partial_cot = cot_segments[sent_idx]
 
         # Save per-prefix results
         task.save_resampling_result(
             question=question,
-            sentence_idx=sentence_idx,
+            sentence_idx=sent_idx,
             forced_prefix=partial_cot,
-            resample_results=[r.to_dict() for r in valid_results],
+            resample_results=[r.to_dict() for r in sent_results],
             rollout_idx=rollout_idx,
             run_dir=run_dir,
         )
 
         # Compute summary for this prefix point
         answer_counts: Dict[str, int] = {}
-        for r in valid_results:
+        for r in sent_results:
             answer_counts[r.answer] = answer_counts.get(r.answer, 0) + 1
 
-        total_valid = len(valid_results)
+        total_valid = len(sent_results)
         most_common = max(answer_counts.items(), key=lambda x: x[1]) if answer_counts else ("", 0)
 
         sentence_summary = {
-            "sentence_idx": sentence_idx,
+            "sentence_idx": sent_idx,
             "forced_prefix_length": len(partial_cot),
             "total_resamples": total_valid,
             "valid_answers": total_valid,

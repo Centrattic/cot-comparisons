@@ -17,8 +17,12 @@ from .task import ForcedResponseTask
 from .prompts import get_question_prompt, get_force_prompt
 from .verification import run_verification
 from .forcing import run_forcing, run_forcing_from_verification
-from .monitor_forcing import run_monitor_forcing, run_monitor_forcing_from_verification
-from .monitor_resampling import run_monitor_resampling, run_monitor_resampling_from_verification
+from .monitors import (
+    run_monitor_forcing,
+    run_monitor_forcing_from_verification,
+    run_monitor_resampling,
+    run_monitor_resampling_from_verification,
+)
 from .resampling import run_resampling_from_verification
 
 __all__ = [

@@ -30,28 +30,22 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).parent.parent.parent.parent / ".env")
 
 from src.tasks.forced_response.data_loader import (
     GPQAQuestion,
-    load_gpqa_questions,
-    load_gpqa_from_huggingface,
     load_custom_questions,
-)
-from src.tasks.forced_response.verification import (
-    run_verification,
-    find_high_agreement_question,
-    find_low_agreement_question,
+    load_gpqa_from_huggingface,
+    load_gpqa_questions,
 )
 from src.tasks.forced_response.forcing import (
     run_forcing,
     run_forcing_from_verification,
 )
-from src.tasks.forced_response.monitor_forcing import (
+from src.tasks.forced_response.monitors import (
     run_monitor_forcing,
     run_monitor_forcing_from_verification,
-)
-from src.tasks.forced_response.monitor_resampling import (
     run_monitor_resampling,
     run_monitor_resampling_from_verification,
 )
@@ -59,7 +53,11 @@ from src.tasks.forced_response.resampling import (
     run_resampling_from_verification,
 )
 from src.tasks.forced_response.task import ForcedResponseTask
-
+from src.tasks.forced_response.verification import (
+    find_high_agreement_question,
+    find_low_agreement_question,
+    run_verification,
+)
 
 DEFAULT_MODEL = "moonshotai/Kimi-K2-Thinking"
 
@@ -69,7 +67,7 @@ def cmd_verify(args):
     print(f"Running verification with {args.num_rollouts} rollouts")
     print(f"Model: {args.model}")
     print(f"Max workers: {args.max_workers}")
-    if getattr(args, 'max_agreement', None) is not None:
+    if getattr(args, "max_agreement", None) is not None:
         print(f"Looking for LOW agreement (max: {args.max_agreement})")
     else:
         print(f"Agreement threshold: {args.threshold}")
@@ -109,7 +107,7 @@ def cmd_verify(args):
         )
         return 0 if summary["meets_threshold"] else 1
 
-    elif getattr(args, 'max_agreement', None) is not None:
+    elif getattr(args, "max_agreement", None) is not None:
         # Find a low-agreement question
         question = find_low_agreement_question(
             questions=questions,
@@ -149,7 +147,7 @@ def cmd_verify(args):
 
 
 def cmd_force(args):
-    """Run true forcing (Tinker prefill) on a verified question."""
+    """Run true forcing on a verified question."""
     if not args.question_id:
         # Find verified questions
         task = ForcedResponseTask(model=args.model)
@@ -162,38 +160,56 @@ def cmd_force(args):
         args.question_id = verified[0]
         print(f"Using verified question: {args.question_id}")
 
-    print(f"Running true forcing (Tinker) with {args.num_forces} samples per sentence")
-    if args.max_sentences:
-        print(f"Limiting to first {args.max_sentences} sentences")
-    print(f"Model: {args.model}")
-    print()
+    if args.openrouter:
+        # Use OpenRouter with DeepInfra fp4
+        import asyncio
 
-    summary = run_forcing_from_verification(
-        question_id=args.question_id,
-        rollout_idx=args.rollout_idx,
-        num_forces=args.num_forces,
-        max_sentences=args.max_sentences,
-        model=args.model,
-        verbose=True,
-    )
+        summary = asyncio.run(
+            run_forcing_openrouter(
+                question_id=args.question_id,
+                rollout_idx=args.rollout_idx,
+                num_forces=args.num_forces,
+                max_sentences=args.max_sentences,
+                max_workers=args.max_workers,
+                verbose=True,
+            )
+        )
+    else:
+        # Use Tinker
+        print(
+            f"Running true forcing (Tinker) with {args.num_forces} samples per sentence"
+        )
+        if args.max_sentences:
+            print(f"Limiting to first {args.max_sentences} sentences")
+        print(f"Model: {args.model}")
+        print()
+
+        summary = run_forcing_from_verification(
+            question_id=args.question_id,
+            rollout_idx=args.rollout_idx,
+            num_forces=args.num_forces,
+            max_sentences=args.max_sentences,
+            model=args.model,
+            verbose=True,
+        )
 
     if summary:
         print("\n" + "=" * 60)
-        print("FORCING COMPLETE (Tinker)")
+        method = "OpenRouter" if args.openrouter else "Tinker"
+        print(f"FORCING COMPLETE ({method})")
         print("=" * 60)
         print(f"Question: {summary['question_id']}")
-        print(f"Correct answer: {summary['correct_answer']}")
+        if "correct_answer" in summary:
+            print(f"Correct answer: {summary['correct_answer']}")
         print(f"Sentences processed: {summary['num_sentences']}")
 
         # Show answer progression
         print("\nAnswer progression by sentence:")
         for result in summary["sentence_results"]:
             idx = result["sentence_idx"]
-            counts = result["answer_counts"]
-            valid = result.get("valid_answers", result.get("valid_single_token", 0))
-            total = result["total_forces"]
+            counts = result.get("answer_counts", {})
             most_common = result.get("most_common", "?")
-            print(f"  Sentence {idx + 1}: {counts} (valid: {valid}/{total}, most common: {most_common})")
+            print(f"  Sentence {idx + 1}: {counts} (most common: {most_common})")
 
         return 0
     else:
@@ -236,14 +252,16 @@ def cmd_monitor_forcing(args):
         print(f"Correct answer: {summary['correct_answer']}")
         print(f"Sentences processed: {summary['num_sentences']}")
 
-        print("\nAnswer progression by sentence:")
+        print("\nPredicted distributions by sentence:")
         for result in summary["sentence_results"]:
             idx = result["sentence_idx"]
-            counts = result["answer_counts"]
-            valid = result["valid_single_token"]
-            total = result["total_forces"]
-            most_common = result.get("most_common", "?")
-            print(f"  Sentence {idx + 1}: {counts} (valid: {valid}/{total}, most common: {most_common})")
+            dist = result.get("distribution", {})
+            most_likely = result.get("most_likely", "?")
+            is_valid = result.get("is_valid", False)
+            # Format distribution nicely
+            dist_str = " ".join(f"{k}:{v:.0%}" for k, v in sorted(dist.items()) if v > 0)
+            status = "✓" if is_valid else "✗"
+            print(f"  Sentence {idx + 1}: [{dist_str}] → {most_likely} {status}")
 
         return 0
     else:
@@ -263,7 +281,9 @@ def cmd_monitor_resampling(args):
         args.question_id = verified[0]
         print(f"Using verified question: {args.question_id}")
 
-    print(f"Running monitor-resampling with {args.num_forces} attempts at ~{args.num_prefix_points} prefix points")
+    print(
+        f"Running monitor-resampling with {args.num_forces} attempts at ~{args.num_prefix_points} prefix points"
+    )
     print(f"Model: {args.model}")
     print(f"Max workers: {args.max_workers}")
     print()
@@ -285,7 +305,9 @@ def cmd_monitor_resampling(args):
         print("=" * 60)
         print(f"Question: {summary['question_id']}")
         print(f"Correct answer: {summary['correct_answer']}")
-        print(f"Prefix points: {summary['num_prefix_points']} (stride {summary['stride']}, {summary['num_sentences']} total sentences)")
+        print(
+            f"Prefix points: {summary['num_prefix_points']} (stride {summary['stride']}, {summary['num_sentences']} total sentences)"
+        )
 
         print("\nAnswer progression by prefix point:")
         for result in summary["sentence_results"]:
@@ -294,7 +316,9 @@ def cmd_monitor_resampling(args):
             valid = result["valid_single_token"]
             total = result["total_forces"]
             most_common = result.get("most_common", "?")
-            print(f"  Sentence {idx + 1}: {counts} (valid: {valid}/{total}, most common: {most_common})")
+            print(
+                f"  Sentence {idx + 1}: {counts} (valid: {valid}/{total}, most common: {most_common})"
+            )
 
         return 0
     else:
@@ -311,7 +335,7 @@ def cmd_full(args):
     print("\nStep 1: Finding high-agreement question...")
     print()
 
-    if getattr(args, 'use_custom', False):
+    if getattr(args, "use_custom", False):
         questions = load_custom_questions()
         if not questions:
             print("No custom questions found in questions.json")
@@ -330,7 +354,7 @@ def cmd_full(args):
         threshold=args.threshold,
         model=args.model,
         api_key=args.api_key,
-        max_workers=getattr(args, 'max_workers', 250),
+        max_workers=getattr(args, "max_workers", 250),
         verbose=True,
     )
 
@@ -376,7 +400,9 @@ def cmd_resample(args):
         args.question_id = verified[0]
         print(f"Using verified question: {args.question_id}")
 
-    print(f"Running resampling (Tinker) with {args.num_resamples} samples at ~{args.num_prefix_points} prefix points")
+    print(
+        f"Running resampling (Tinker) with {args.num_resamples} samples at ~{args.num_prefix_points} prefix points"
+    )
     print(f"Model: {args.model}")
     print()
 
@@ -395,7 +421,9 @@ def cmd_resample(args):
         print("=" * 60)
         print(f"Question: {summary['question_id']}")
         print(f"Correct answer: {summary['correct_answer']}")
-        print(f"Prefix points: {summary['num_prefix_points']} (stride {summary['stride']}, {summary['num_sentences']} total sentences)")
+        print(
+            f"Prefix points: {summary['num_prefix_points']} (stride {summary['stride']}, {summary['num_sentences']} total sentences)"
+        )
         print(f"Resamples per point: {summary['num_resamples']}")
 
         print("\nAnswer distribution by prefix point:")
@@ -406,7 +434,9 @@ def cmd_resample(args):
             total = result["total_resamples"]
             most_common = result.get("most_common", "?")
             rate = result.get("agreement_rate", 0)
-            print(f"  Sentence {idx + 1}: {counts} (valid: {valid}/{total}, most common: {most_common} @ {rate:.0%})")
+            print(
+                f"  Sentence {idx + 1}: {counts} (valid: {valid}/{total}, most common: {most_common} @ {rate:.0%})"
+            )
 
         return 0
     else:
@@ -455,7 +485,11 @@ def cmd_list(args):
         for question_dir in sorted(data_dir.iterdir()):
             if question_dir.is_dir():
                 rollout_dirs = sorted(
-                    [d for d in question_dir.iterdir() if d.is_dir() and d.name.startswith("rollout_")]
+                    [
+                        d
+                        for d in question_dir.iterdir()
+                        if d.is_dir() and d.name.startswith("rollout_")
+                    ]
                 )
                 if rollout_dirs:
                     print(f"  {question_dir.name}:")
@@ -466,8 +500,12 @@ def cmd_list(args):
                             with open(latest / "summary.json") as f:
                                 summary = json.load(f)
                             num_sentences = summary.get("num_sentences", 0)
-                            run_label = latest.name if latest != rollout_dir else "(legacy)"
-                            print(f"    {rollout_dir.name} [{run_label}]: {num_sentences} sentences")
+                            run_label = (
+                                latest.name if latest != rollout_dir else "(legacy)"
+                            )
+                            print(
+                                f"    {rollout_dir.name} [{run_label}]: {num_sentences} sentences"
+                            )
 
     return 0
 
@@ -495,19 +533,22 @@ def main():
         help="Run verification rollouts to find high-agreement questions",
     )
     verify_parser.add_argument(
-        "--num-rollouts", "-n",
+        "--num-rollouts",
+        "-n",
         type=int,
         default=50,
         help="Number of rollouts per question (default: 50)",
     )
     verify_parser.add_argument(
-        "--threshold", "-t",
+        "--threshold",
+        "-t",
         type=float,
         default=0.8,
         help="Agreement threshold (default: 0.8)",
     )
     verify_parser.add_argument(
-        "--question-id", "-q",
+        "--question-id",
+        "-q",
         help="Verify a specific question ID",
     )
     verify_parser.add_argument(
@@ -536,7 +577,8 @@ def main():
         help="Find a LOW-agreement question (no answer exceeds this rate, e.g. 0.5)",
     )
     verify_parser.add_argument(
-        "--max-workers", "-w",
+        "--max-workers",
+        "-w",
         type=int,
         default=250,
         help="Maximum concurrent API calls (default: 250)",
@@ -549,32 +591,49 @@ def main():
         help="Run true forcing (Tinker prefill) on a verified question",
     )
     force_parser.add_argument(
-        "--question-id", "-q",
+        "--question-id",
+        "-q",
         help="Question ID to force (default: first verified question)",
     )
     force_parser.add_argument(
-        "--rollout-idx", "-r",
+        "--rollout-idx",
+        "-r",
         type=int,
         default=0,
         help="Which verification rollout to use as source (default: 0)",
     )
     force_parser.add_argument(
-        "--num-forces", "-n",
+        "--num-forces",
+        "-n",
         type=int,
         default=5,
         help="Number of force samples per sentence (default: 5)",
     )
     force_parser.add_argument(
-        "--threshold", "-t",
+        "--threshold",
+        "-t",
         type=float,
         default=0.8,
         help="Agreement threshold for selecting questions (default: 0.8)",
     )
     force_parser.add_argument(
-        "--max-sentences", "-m",
+        "--max-sentences",
+        "-m",
         type=int,
         default=None,
         help="Only force the first M sentences (default: all)",
+    )
+    force_parser.add_argument(
+        "--openrouter",
+        action="store_true",
+        help="Use OpenRouter (DeepInfra fp4) instead of Tinker",
+    )
+    force_parser.add_argument(
+        "--max-workers",
+        "-w",
+        type=int,
+        default=300,
+        help="Max concurrent requests for OpenRouter mode (default: 300)",
     )
     force_parser.set_defaults(func=cmd_force)
 
@@ -584,29 +643,34 @@ def main():
         help="Run forcing monitor (predicts answer from prefill context)",
     )
     mf_parser.add_argument(
-        "--question-id", "-q",
+        "--question-id",
+        "-q",
         help="Question ID to monitor (default: first verified question)",
     )
     mf_parser.add_argument(
-        "--rollout-idx", "-r",
+        "--rollout-idx",
+        "-r",
         type=int,
         default=0,
         help="Which verification rollout to use as source (default: 0)",
     )
     mf_parser.add_argument(
-        "--num-forces", "-n",
+        "--num-forces",
+        "-n",
         type=int,
-        default=5,
-        help="Number of monitor attempts per sentence (default: 5)",
+        default=20,
+        help="Number of forces to predict distribution over (default: 20)",
     )
     mf_parser.add_argument(
-        "--threshold", "-t",
+        "--threshold",
+        "-t",
         type=float,
         default=0.8,
         help="Agreement threshold for selecting questions (default: 0.8)",
     )
     mf_parser.add_argument(
-        "--max-workers", "-w",
+        "--max-workers",
+        "-w",
         type=int,
         default=300,
         help="Maximum concurrent API calls (default: 300)",
@@ -619,17 +683,20 @@ def main():
         help="Run resampling monitor (predicts majority answer from prefix)",
     )
     mr_parser.add_argument(
-        "--question-id", "-q",
+        "--question-id",
+        "-q",
         help="Question ID to monitor (default: first verified question)",
     )
     mr_parser.add_argument(
-        "--rollout-idx", "-r",
+        "--rollout-idx",
+        "-r",
         type=int,
         default=0,
         help="Which verification rollout to use as source (default: 0)",
     )
     mr_parser.add_argument(
-        "--num-forces", "-n",
+        "--num-forces",
+        "-n",
         type=int,
         default=5,
         help="Number of monitor attempts per prefix point (default: 5)",
@@ -641,13 +708,15 @@ def main():
         help="Target number of evenly-spaced prefix points (default: 20)",
     )
     mr_parser.add_argument(
-        "--threshold", "-t",
+        "--threshold",
+        "-t",
         type=float,
         default=0.8,
         help="Agreement threshold for selecting questions (default: 0.8)",
     )
     mr_parser.add_argument(
-        "--max-workers", "-w",
+        "--max-workers",
+        "-w",
         type=int,
         default=300,
         help="Maximum concurrent API calls (default: 300)",
@@ -672,7 +741,8 @@ def main():
         help="Number of force attempts per sentence (default: 5)",
     )
     full_parser.add_argument(
-        "--threshold", "-t",
+        "--threshold",
+        "-t",
         type=float,
         default=0.8,
         help="Agreement threshold (default: 0.8)",
@@ -698,7 +768,8 @@ def main():
         help="Maximum questions to try",
     )
     full_parser.add_argument(
-        "--rollout-idx", "-r",
+        "--rollout-idx",
+        "-r",
         type=int,
         default=0,
         help="Which verification rollout to use as source (default: 0)",
@@ -711,17 +782,20 @@ def main():
         help="Run resampling (Tinker prefix continuation) on a verified question",
     )
     resample_parser.add_argument(
-        "--question-id", "-q",
+        "--question-id",
+        "-q",
         help="Question ID to resample (default: first verified question)",
     )
     resample_parser.add_argument(
-        "--rollout-idx", "-r",
+        "--rollout-idx",
+        "-r",
         type=int,
         default=0,
         help="Which verification rollout to use as source (default: 0)",
     )
     resample_parser.add_argument(
-        "--num-resamples", "-n",
+        "--num-resamples",
+        "-n",
         type=int,
         default=20,
         help="Number of continuations per prefix point (default: 20)",
@@ -733,7 +807,8 @@ def main():
         help="Target number of evenly-spaced prefix points (default: 20)",
     )
     resample_parser.add_argument(
-        "--threshold", "-t",
+        "--threshold",
+        "-t",
         type=float,
         default=0.8,
         help="Agreement threshold for selecting questions (default: 0.8)",
