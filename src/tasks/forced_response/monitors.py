@@ -32,6 +32,8 @@ from .task import ForcedResponseTask
 
 MAX_RETRIES = 10
 MAX_REQUEUE_ROUNDS = 5  # Maximum number of times to re-queue failed jobs
+INITIAL_TIMEOUT = 30 * 60  # 30 minutes for initial run
+RETRY_TIMEOUT = 10 * 60    # 10 minutes for retry rounds
 
 # Default monitor model
 DEFAULT_MONITOR_MODEL = "openai/gpt-5.2-thinking"
@@ -235,7 +237,7 @@ The values should sum to 1.0. No explanation needed, just the JSON."""
     return [{"role": "user", "content": user_prompt}]
 
 
-async def _run_single_forcing_monitor_job(
+async def _run_single_forcing_monitor_job_inner(
     async_client: openai.AsyncOpenAI,
     question: Question,
     partial_cot: str,
@@ -247,7 +249,7 @@ async def _run_single_forcing_monitor_job(
     max_tokens: int = 2000,
     max_retries: int = MAX_RETRIES,
 ) -> MonitorForcingResult:
-    """A single forcing monitor job: retries until a valid distribution JSON."""
+    """Inner forcing monitor job: retries until a valid distribution JSON."""
     is_binary_judge = isinstance(question, BinaryJudgeQuestion)
     messages = get_monitor_forcing_messages(
         question_obj=question,
@@ -304,6 +306,67 @@ async def _run_single_forcing_monitor_job(
         is_valid=False,
         num_attempts=max_retries,
     )
+
+
+async def _run_single_forcing_monitor_job(
+    async_client: openai.AsyncOpenAI,
+    question: Question,
+    partial_cot: str,
+    sentence_idx: int,
+    num_forces: int,
+    semaphore: asyncio.Semaphore,
+    model: str = DEFAULT_MONITOR_MODEL,
+    temperature: float = 0.7,
+    max_tokens: int = 2000,
+    max_retries: int = MAX_RETRIES,
+    timeout: Optional[float] = None,
+) -> MonitorForcingResult:
+    """A single forcing monitor job with optional timeout."""
+    try:
+        if timeout is not None:
+            return await asyncio.wait_for(
+                _run_single_forcing_monitor_job_inner(
+                    async_client=async_client,
+                    question=question,
+                    partial_cot=partial_cot,
+                    sentence_idx=sentence_idx,
+                    num_forces=num_forces,
+                    semaphore=semaphore,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    max_retries=max_retries,
+                ),
+                timeout=timeout,
+            )
+        else:
+            return await _run_single_forcing_monitor_job_inner(
+                async_client=async_client,
+                question=question,
+                partial_cot=partial_cot,
+                sentence_idx=sentence_idx,
+                num_forces=num_forces,
+                semaphore=semaphore,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_retries=max_retries,
+            )
+    except asyncio.TimeoutError:
+        messages = get_monitor_forcing_messages(
+            question_obj=question,
+            partial_cot=partial_cot,
+            num_forces=num_forces,
+        )
+        return MonitorForcingResult(
+            sentence_idx=sentence_idx,
+            partial_cot=partial_cot,
+            prompt=messages[0]["content"],
+            raw_response="ERROR: Timeout",
+            distribution={},
+            is_valid=False,
+            num_attempts=0,
+        )
 
 
 async def run_monitor_forcing_async(
@@ -374,7 +437,7 @@ async def run_monitor_forcing_async(
             print(f"Run dir: {run_dir}")
             print()
 
-    # Create monitor jobs (num_samples per sentence)
+    # Create monitor jobs (num_samples per sentence) with initial timeout
     jobs = []
     job_keys = []  # Track (sentence_idx, sample_idx) for each job
     for sentence_idx, partial_cot in enumerate(cot_segments):
@@ -390,6 +453,7 @@ async def run_monitor_forcing_async(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 max_retries=max_retries,
+                timeout=INITIAL_TIMEOUT,
             )
             jobs.append(job)
             job_keys.append((sentence_idx, sample_idx))
@@ -436,6 +500,7 @@ async def run_monitor_forcing_async(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 max_retries=max_retries,
+                timeout=RETRY_TIMEOUT,
             )
             retry_jobs.append(job)
 
@@ -705,7 +770,7 @@ The values should sum to 1.0. No explanation needed, just the JSON."""
     return [{"role": "user", "content": user_prompt}]
 
 
-async def _run_single_resampling_monitor_job(
+async def _run_single_resampling_monitor_job_inner(
     async_client: openai.AsyncOpenAI,
     question: Question,
     partial_cot: str,
@@ -717,7 +782,7 @@ async def _run_single_resampling_monitor_job(
     max_tokens: int = 2000,
     max_retries: int = MAX_RETRIES,
 ) -> MonitorResamplingResult:
-    """A single resampling monitor job: retries until a valid distribution JSON."""
+    """Inner resampling monitor job: retries until a valid distribution JSON."""
     is_binary_judge = isinstance(question, BinaryJudgeQuestion)
     messages = get_monitor_resampling_messages(
         question_obj=question,
@@ -776,6 +841,67 @@ async def _run_single_resampling_monitor_job(
     )
 
 
+async def _run_single_resampling_monitor_job(
+    async_client: openai.AsyncOpenAI,
+    question: Question,
+    partial_cot: str,
+    sentence_idx: int,
+    num_resamples: int,
+    semaphore: asyncio.Semaphore,
+    model: str = DEFAULT_MONITOR_MODEL,
+    temperature: float = 0.7,
+    max_tokens: int = 2000,
+    max_retries: int = MAX_RETRIES,
+    timeout: Optional[float] = None,
+) -> MonitorResamplingResult:
+    """A single resampling monitor job with optional timeout."""
+    try:
+        if timeout is not None:
+            return await asyncio.wait_for(
+                _run_single_resampling_monitor_job_inner(
+                    async_client=async_client,
+                    question=question,
+                    partial_cot=partial_cot,
+                    sentence_idx=sentence_idx,
+                    num_resamples=num_resamples,
+                    semaphore=semaphore,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    max_retries=max_retries,
+                ),
+                timeout=timeout,
+            )
+        else:
+            return await _run_single_resampling_monitor_job_inner(
+                async_client=async_client,
+                question=question,
+                partial_cot=partial_cot,
+                sentence_idx=sentence_idx,
+                num_resamples=num_resamples,
+                semaphore=semaphore,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_retries=max_retries,
+            )
+    except asyncio.TimeoutError:
+        messages = get_monitor_resampling_messages(
+            question_obj=question,
+            partial_cot=partial_cot,
+            num_resamples=num_resamples,
+        )
+        return MonitorResamplingResult(
+            sentence_idx=sentence_idx,
+            partial_cot=partial_cot,
+            prompt=messages[0]["content"],
+            raw_response="ERROR: Timeout",
+            distribution={},
+            is_valid=False,
+            num_attempts=0,
+        )
+
+
 async def run_monitor_resampling_async(
     question: Question,
     source_cot: str,
@@ -790,12 +916,18 @@ async def run_monitor_resampling_async(
     save_results: bool = True,
     verbose: bool = True,
     rollout_idx: int = 0,
+    max_sentences: Optional[int] = None,
+    num_samples: int = 1,
 ) -> Dict[str, Any]:
     """
     Run resampling monitor at evenly-spaced sentence indices.
 
     Predicts distribution over answers if num_resamples independent continuations
     were run from each prefix point.
+
+    Args:
+        num_samples: Number of times to run monitor per prefix point (default: 1)
+        max_sentences: Maximum number of sentences to process (default: all)
     """
     async_client = openai.AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -806,12 +938,15 @@ async def run_monitor_resampling_async(
     semaphore = asyncio.Semaphore(max_workers)
 
     cot_segments = get_cumulative_cot_segments(source_cot)
+    if max_sentences is not None:
+        cot_segments = cot_segments[:max_sentences]
     num_sentences = len(cot_segments)
 
     # Use same stride as resampling
     stride = max(num_sentences // num_prefix_points, 1)
     selected_indices = list(range(0, num_sentences, stride))
-    total_jobs = len(selected_indices)
+    num_prefix_points_actual = len(selected_indices)
+    total_jobs = num_prefix_points_actual * num_samples
 
     if verbose:
         print(f"Found {num_sentences} sentences in CoT")
@@ -819,8 +954,11 @@ async def run_monitor_resampling_async(
             print(f"Bad outcome: {question.bad_outcome}")
         else:
             print(f"Correct answer: {question.correct_answer}")
-        print(f"Stride: {stride}, prefix points: {len(selected_indices)}")
-        print(f"Launching {total_jobs} monitor jobs (predicting distribution over {num_resamples} resamples)")
+        print(f"Stride: {stride}, prefix points: {num_prefix_points_actual}")
+        if num_samples > 1:
+            print(f"Launching {total_jobs} monitor jobs ({num_prefix_points_actual} points × {num_samples} samples, predicting over {num_resamples} resamples)")
+        else:
+            print(f"Launching {total_jobs} monitor jobs (predicting distribution over {num_resamples} resamples)")
         print()
 
     # Create timestamped run directory
@@ -833,6 +971,7 @@ async def run_monitor_resampling_async(
             "rollout_idx": rollout_idx,
             "num_resamples": num_resamples,
             "num_prefix_points": num_prefix_points,
+            "num_samples": num_samples,
             "stride": stride,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -843,45 +982,58 @@ async def run_monitor_resampling_async(
             print(f"Run dir: {run_dir}")
             print()
 
-    # Create one monitor job per prefix point
+    # Create monitor jobs (num_samples per prefix point) with initial timeout
     jobs = []
+    job_keys = []  # Track (sentence_idx, sample_idx) for each job
     for sentence_idx in selected_indices:
         partial_cot = cot_segments[sentence_idx]
-        job = _run_single_resampling_monitor_job(
-            async_client=async_client,
-            question=question,
-            partial_cot=partial_cot,
-            sentence_idx=sentence_idx,
-            num_resamples=num_resamples,
-            semaphore=semaphore,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            max_retries=max_retries,
-        )
-        jobs.append(job)
+        for sample_idx in range(num_samples):
+            job = _run_single_resampling_monitor_job(
+                async_client=async_client,
+                question=question,
+                partial_cot=partial_cot,
+                sentence_idx=sentence_idx,
+                num_resamples=num_resamples,
+                semaphore=semaphore,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_retries=max_retries,
+                timeout=INITIAL_TIMEOUT,
+            )
+            jobs.append(job)
+            job_keys.append((sentence_idx, sample_idx))
 
     # Run all jobs concurrently with progress bar
-    results = await atqdm.gather(
+    raw_results = await atqdm.gather(
         *jobs,
         desc="Monitor (resampling)",
         total=total_jobs,
     )
 
-    # Build results dict keyed by sentence_idx
-    results_by_idx: Dict[int, MonitorResamplingResult] = {r.sentence_idx: r for r in results}
+    # Group results by sentence_idx
+    results_by_sentence: Dict[int, List[MonitorResamplingResult]] = {i: [] for i in selected_indices}
+    for result in raw_results:
+        results_by_sentence[result.sentence_idx].append(result)
 
     # Re-queue failed jobs until all valid or max rounds reached
     for requeue_round in range(MAX_REQUEUE_ROUNDS):
-        failed_indices = [idx for idx, r in results_by_idx.items() if not r.is_valid]
-        if not failed_indices:
+        # Find (sentence_idx, sample_idx) pairs that need retrying
+        failed_keys = []
+        for sentence_idx in selected_indices:
+            valid_count = sum(1 for r in results_by_sentence[sentence_idx] if r.is_valid)
+            needed = num_samples - valid_count
+            if needed > 0:
+                failed_keys.extend([(sentence_idx, i) for i in range(needed)])
+
+        if not failed_keys:
             break
 
         if verbose:
-            print(f"\nRe-queuing {len(failed_indices)} failed jobs (round {requeue_round + 1}/{MAX_REQUEUE_ROUNDS})...")
+            print(f"\nRe-queuing {len(failed_keys)} failed jobs (round {requeue_round + 1}/{MAX_REQUEUE_ROUNDS})...")
 
         retry_jobs = []
-        for sentence_idx in failed_indices:
+        for sentence_idx, _ in failed_keys:
             partial_cot = cot_segments[sentence_idx]
             job = _run_single_resampling_monitor_job(
                 async_client=async_client,
@@ -894,6 +1046,7 @@ async def run_monitor_resampling_async(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 max_retries=max_retries,
+                timeout=RETRY_TIMEOUT,
             )
             retry_jobs.append(job)
 
@@ -903,13 +1056,47 @@ async def run_monitor_resampling_async(
             total=len(retry_jobs),
         )
 
-        # Update results with successful retries
+        # Add successful retries to results
         for r in retry_results:
-            if r.is_valid or not results_by_idx[r.sentence_idx].is_valid:
-                results_by_idx[r.sentence_idx] = r
+            if r.is_valid:
+                results_by_sentence[r.sentence_idx].append(r)
 
-    # Convert back to list ordered by sentence_idx
-    results = [results_by_idx[idx] for idx in selected_indices]
+    # Aggregate results per sentence (average distributions if num_samples > 1)
+    results: List[MonitorResamplingResult] = []
+    for sentence_idx in selected_indices:
+        sentence_results = results_by_sentence[sentence_idx]
+        valid_results = [r for r in sentence_results if r.is_valid]
+
+        if not valid_results:
+            # Use first invalid result if no valid ones
+            results.append(sentence_results[0] if sentence_results else MonitorResamplingResult(
+                sentence_idx=sentence_idx,
+                partial_cot=cot_segments[sentence_idx],
+                prompt="",
+                raw_response="",
+                distribution={},
+                is_valid=False,
+                num_attempts=0,
+            ))
+        elif len(valid_results) == 1:
+            results.append(valid_results[0])
+        else:
+            # Average distributions across samples
+            avg_dist: Dict[str, float] = {}
+            for r in valid_results:
+                for key, val in r.distribution.items():
+                    avg_dist[key] = avg_dist.get(key, 0.0) + val / len(valid_results)
+
+            # Create aggregated result
+            results.append(MonitorResamplingResult(
+                sentence_idx=sentence_idx,
+                partial_cot=valid_results[0].partial_cot,
+                prompt=valid_results[0].prompt,
+                raw_response=f"[Aggregated from {len(valid_results)} samples]",
+                distribution=avg_dist,
+                is_valid=True,
+                num_attempts=sum(r.num_attempts for r in valid_results),
+            ))
 
     valid_count = sum(1 for r in results if r.is_valid)
     if verbose:
@@ -983,6 +1170,8 @@ def run_monitor_resampling(
     save_results: bool = True,
     verbose: bool = True,
     rollout_idx: int = 0,
+    max_sentences: Optional[int] = None,
+    num_samples: int = 1,
 ) -> Dict[str, Any]:
     """Run resampling monitor (sync wrapper)."""
     return asyncio.run(run_monitor_resampling_async(
@@ -999,6 +1188,8 @@ def run_monitor_resampling(
         save_results=save_results,
         verbose=verbose,
         rollout_idx=rollout_idx,
+        max_sentences=max_sentences,
+        num_samples=num_samples,
     ))
 
 
@@ -1014,6 +1205,8 @@ def run_monitor_resampling_from_verification(
     max_tokens: int = 2000,
     max_retries: int = MAX_RETRIES,
     verbose: bool = True,
+    max_sentences: Optional[int] = None,
+    num_samples: int = 1,
 ) -> Optional[Dict[str, Any]]:
     """Run resampling monitor using a CoT from verification rollouts."""
     task = ForcedResponseTask(model=model)
@@ -1033,6 +1226,8 @@ def run_monitor_resampling_from_verification(
         num_resamples=num_resamples,
         num_prefix_points=num_prefix_points,
         max_workers=max_workers,
+        max_sentences=max_sentences,
+        num_samples=num_samples,
         model=model,
         api_key=api_key,
         temperature=temperature,

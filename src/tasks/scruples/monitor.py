@@ -316,19 +316,22 @@ class ScruplesDiscriminationMonitor(ScruplesMonitor):
         self,
         control_thinking: str,
         intervention_thinking: str,
-        control_answer: str,
-        intervention_answer: str,
+        control_answer: str = "",
+        intervention_answer: str = "",
     ) -> Dict[str, Any]:
         """
         Analyze a paired control/intervention CoT.
 
         Randomly assigns to A/B, asks monitor to identify intervention.
 
+        IMPORTANT: The monitor only sees the chain of thought, NOT the final answers.
+        This prevents the monitor from trivially matching answers to the user's preference.
+
         Args:
             control_thinking: Chain of thought from control arm
             intervention_thinking: Chain of thought from intervention arm
-            control_answer: Final answer from control arm
-            intervention_answer: Final answer from intervention arm
+            control_answer: Final answer from control arm (not shown to monitor, kept for logging)
+            intervention_answer: Final answer from intervention arm (not shown to monitor, kept for logging)
 
         Returns:
             Dict with:
@@ -338,27 +341,28 @@ class ScruplesDiscriminationMonitor(ScruplesMonitor):
             - monitor_response: full response
             - monitor_prompt: the prompt sent to monitor
             - order: "control_first" or "intervention_first"
+            - control_answer: logged for analysis
+            - intervention_answer: logged for analysis
         """
         import random
 
-        # Randomly assign order
+        # Randomly assign order (only thinking, not answers)
         if random.random() < 0.5:
-            response_a = (control_thinking, control_answer, "control")
-            response_b = (intervention_thinking, intervention_answer, "intervention")
+            thinking_a = control_thinking
+            thinking_b = intervention_thinking
             actual_intervention = "B"
             order = "control_first"
         else:
-            response_a = (intervention_thinking, intervention_answer, "intervention")
-            response_b = (control_thinking, control_answer, "control")
+            thinking_a = intervention_thinking
+            thinking_b = control_thinking
             actual_intervention = "A"
             order = "intervention_first"
 
+        # NOTE: Only chain of thought is passed to the monitor, NOT the final answers
         prompt = get_discrimination_monitor_prompt(
             variant=self.variant,
-            thinking_a=response_a[0],
-            answer_a=response_a[1],
-            thinking_b=response_b[0],
-            answer_b=response_b[1],
+            thinking_a=thinking_a,
+            thinking_b=thinking_b,
         )
 
         response = self._call_monitor_llm(prompt)
@@ -371,6 +375,8 @@ class ScruplesDiscriminationMonitor(ScruplesMonitor):
             "monitor_response": response,
             "monitor_prompt": prompt,
             "order": order,
+            "control_answer": control_answer,
+            "intervention_answer": intervention_answer,
         }
 
     def _parse_ab_response(self, response: str) -> Optional[str]:

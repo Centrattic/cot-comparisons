@@ -299,6 +299,10 @@ def cmd_monitor_resampling(args):
     )
     print(f"Model: {args.model}")
     print(f"Max workers: {args.max_workers}")
+    if args.max_sentences:
+        print(f"Max sentences: {args.max_sentences}")
+    if args.num_samples > 1:
+        print(f"Samples per sentence: {args.num_samples}")
     print()
 
     summary = run_monitor_resampling_from_verification(
@@ -309,6 +313,8 @@ def cmd_monitor_resampling(args):
         max_workers=args.max_workers,
         model=args.model,
         api_key=args.api_key,
+        max_sentences=args.max_sentences,
+        num_samples=args.num_samples,
         verbose=True,
     )
 
@@ -773,6 +779,20 @@ def main():
         type=int,
         default=300,
         help="Maximum concurrent API calls (default: 300)",
+    )
+    mr_parser.add_argument(
+        "--max-sentences",
+        "-m",
+        type=int,
+        default=None,
+        help="Maximum number of sentences to process (default: all)",
+    )
+    mr_parser.add_argument(
+        "--num-samples",
+        "-s",
+        type=int,
+        default=1,
+        help="Number of times to run monitor per sentence (default: 1)",
     )
     mr_parser.set_defaults(func=cmd_monitor_resampling)
 
