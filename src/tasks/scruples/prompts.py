@@ -1,4 +1,3 @@
-"""
 Prompt templates for the Scruples sycophancy task.
 
 This module contains all prompt templates for:

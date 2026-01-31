@@ -150,27 +150,37 @@ Analyzes chain-of-thought reasoning by forcing the model to give a final answer 
 3. **Resampling (Tinker)** - Force a CoT prefix and sample 20 independent continuations to get the answer distribution at ~20 evenly-spaced points
 4. **Monitor-Forcing** - A black-box monitor predicts the answer given a forcing prefix (told the prefix was prefilled into the model's thinking)
 5. **Monitor-Resampling** - A black-box monitor predicts the majority answer given a resampling prefix (told 20 continuations were sampled)
+6. **Probes (White-box)** - Train linear/MLP probes on model activations to predict answer distributions from partial CoT prefixes
 
 ### Running
 
 ```bash
 # 1. Verification
-python3 src/tasks/forced_response/run_forced_response.py verify -q custom_bagel_001 --use-custom
+python3 -m src.tasks.forced_response.run_forced_response verify -q custom_bagel_001 --use-custom
 
 # 2. True forcing (Tinker prefill) — runs at every sentence
-python3 src/tasks/forced_response/run_forced_response.py force -q custom_bagel_001 -n 5 -r 0
+python3 -m src.tasks.forced_response.run_forced_response force -q custom_bagel_001 -n 5 -r 0
 
 # 3. Resampling (Tinker) — runs at ~20 evenly-spaced prefix points
-python3 src/tasks/forced_response/run_forced_response.py resample -q custom_bagel_001 -r 0
+python3 -m src.tasks.forced_response.run_forced_response resample -q custom_bagel_001 -r 0
 
 # 4. Forcing monitor — runs at every sentence
-python3 src/tasks/forced_response/run_forced_response.py monitor-forcing -q custom_bagel_001 -n 5 -r 0 -w 300
+python3 -m src.tasks.forced_response.run_forced_response monitor-forcing -q custom_bagel_001 -n 5 -r 0 -w 300
 
 # 5. Resampling monitor — runs at ~20 prefix points (matching resampling stride)
-python3 src/tasks/forced_response/run_forced_response.py monitor-resampling -q custom_bagel_001 -n 5 -r 0 -w 300
+python3 -m src.tasks.forced_response.run_forced_response monitor-resampling -q custom_bagel_001 -n 5 -r 0 -w 300
+
+# 6. Batch forcing for probe training — force multiple verification rollouts
+python3 -m src.tasks.forced_response.run_forced_response force-for-probes -q custom_bagel_001 --num-rollouts 10 --num-forces 10
+
+# 7. Train probe — from multi-rollout forcing, single-rollout forcing, or verification data
+python3 -m src.tasks.forced_response.run_forced_response train-probe -q custom_bagel_001 --use-forcing-multi-rollout
+
+# 8. Probe inference — predict answer distribution at each prefix point
+python3 -m src.tasks.forced_response.run_forced_response probe-inference -q custom_bagel_001 -r 0
 
 # Check status
-python3 src/tasks/forced_response/run_forced_response.py list
+python3 -m src.tasks.forced_response.run_forced_response list
 ```
 
 ### Models
@@ -227,33 +237,54 @@ Train linear probes on model activations to predict the answer from the last tok
 
 #### Training
 
+Three data sources are available, from least to most data:
+
+1. **Verification rollouts** — 1 sample per rollout (end-of-CoT activation + one-hot label). Fast but few samples (~10-50).
+2. **Single-rollout forcing** — 1 sample per sentence in one rollout (activation + forcing distribution). More samples (~100) with soft labels.
+3. **Multi-rollout forcing** — samples from every sentence across multiple rollouts. Richest signal (N_rollouts × N_sentences, e.g. 10 × 100 = 1000 samples).
+
 ```bash
 # Train from verification rollouts (each rollout = one sample at end of CoT)
-python3 -m src.tasks.forced_response.probes train -q custom_bagel_001 --use-verification-data
+python3 -m src.tasks.forced_response.run_forced_response train-probe -q custom_bagel_001 --use-verification-data
 
-# Train from forcing data (each sentence = one sample with soft labels from answer distribution)
-python3 -m src.tasks.forced_response.probes train -q custom_bagel_001 -r 0
+# Train from single-rollout forcing data (each sentence = one sample with soft labels)
+python3 -m src.tasks.forced_response.run_forced_response train-probe -q custom_bagel_001 -r 0
 
-# Train for blackmail question
-python3 -m src.tasks.forced_response.probes train -q blackmail_001 --use-verification-data
-```
-
-Options:
-- `--use-verification-data` — use verification rollouts instead of forcing data
+- `--use-forcing-multi-rollout` — use forcing data from all available rollouts
 - `--max-rollouts N` — limit number of rollouts (for verification data)
 - `--use-mlp` — use 2-layer MLP instead of linear probe
 - `--epochs N` — training epochs (default: 100)
 - `--layer N` — model layer to extract activations from (default: 32)
-- `--model-name` — model for activation extraction (default: `Qwen/Qwen2.5-32B-Instruct`)
+- `--probe-model` — model for activation extraction (default: `Qwen/Qwen3-32B`)
+
+#### Multi-rollout forcing (for probe training)
+
+To generate rich training data for probes, run forcing across multiple verification rollouts:
+
+```bash
+# Run forcing on 10 verification rollouts (10 forces per sentence each)
+python3 -m src.tasks.forced_response.run_forced_response force-for-probes \
+  -q custom_bagel_001 --num-rollouts 10 --num-forces 10
+
+# Then train the probe on all that data
+python3 -m src.tasks.forced_response.run_forced_response train-probe \
+  -q custom_bagel_001 --use-forcing-multi-rollout
+```
+
+Options:
+- `--num-rollouts N` — number of verification rollouts to force (default: 10)
+- `--num-forces N` — force samples per sentence per rollout (default: 10)
+- `--max-sentences M` — only force the first M sentences per rollout
 
 #### Inference
 
 ```bash
 # Run probe on all prefix points in a CoT
-python3 -m src.tasks.forced_response.probes infer -q custom_bagel_001 -r 0
+python3 -m src.tasks.forced_response.run_forced_response probe-inference -q custom_bagel_001 -r 0
 
 # Specify probe path explicitly
-python3 -m src.tasks.forced_response.probes infer -q blackmail_001 -r 0 --probe-path data/forced_response/probes/blackmail_001/verification/2025-01-27_12-00-00
+python3 -m src.tasks.forced_response.run_forced_response probe-inference -q blackmail_001 -r 0 \
+  --probe-path data/forced_response/probes/blackmail_001/verification/2025-01-27_12-00-00
 ```
 
 #### Output
@@ -272,7 +303,9 @@ data/forced_response/
 │   │   ├── probe.pt
 │   │   ├── scaler.npz
 │   │   └── training_result.json
-│   └── rollout_000/{timestamp}/       # Trained from forcing data
+│   ├── rollout_000/{timestamp}/       # Trained from single-rollout forcing data
+│   │   └── ...
+│   └── forcing_multi/{timestamp}/     # Trained from multi-rollout forcing data
 │       └── ...
 └── probe_inference/{question_id}/rollout_000/{timestamp}/
     └── results.json                   # Per-sentence predictions

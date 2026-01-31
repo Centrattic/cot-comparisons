@@ -42,7 +42,9 @@ from src.tasks.forced_response.data_loader import (
 from src.tasks.forced_response.forcing import (
     run_forcing,
     run_forcing_from_verification,
+    run_forcing_for_probe_training,
 )
+from src.tasks.forced_response.probes import run_probe_training, run_probe_inference
 from src.tasks.forced_response.monitors import (
     run_monitor_forcing,
     run_monitor_forcing_from_verification,
@@ -471,6 +473,116 @@ def cmd_resample(args):
         return 1
 
 
+def cmd_force_for_probes(args):
+    """Run forcing on multiple verification rollouts for probe training."""
+    if not args.question_id:
+        task = ForcedResponseTask(model=args.model)
+        verified = task.get_verified_questions(threshold=args.threshold)
+        if not verified:
+            print("No verified questions found. Run 'verify' first.")
+            return 1
+        args.question_id = verified[0]
+        print(f"Using verified question: {args.question_id}")
+
+    print(f"Running forcing for probe training on {args.question_id}")
+    print(f"Rollouts: {args.num_rollouts}, Forces per sentence: {args.num_forces}")
+    print(f"Model: {args.model}")
+    if args.max_sentences:
+        print(f"Max sentences per rollout: {args.max_sentences}")
+    print()
+
+    results = run_forcing_for_probe_training(
+        question_id=args.question_id,
+        model=args.model,
+        num_rollouts=args.num_rollouts,
+        num_forces=args.num_forces,
+        max_sentences=args.max_sentences,
+        verbose=True,
+    )
+
+    if results:
+        print(f"\nForcing complete: {len(results)} rollouts processed")
+        total_sentences = sum(r["num_sentences"] for r in results)
+        print(f"Total training samples available: {total_sentences}")
+        return 0
+    else:
+        print("No forcing results produced.")
+        return 1
+
+
+def cmd_train_probe(args):
+    """Train a probe on forcing or verification data."""
+    if not args.question_id:
+        task = ForcedResponseTask(model=args.model)
+        verified = task.get_verified_questions(threshold=args.threshold)
+        if not verified:
+            print("No verified questions found. Run 'verify' first.")
+            return 1
+        args.question_id = verified[0]
+        print(f"Using verified question: {args.question_id}")
+
+    use_forcing_multi = getattr(args, "use_forcing_multi_rollout", False)
+    use_verification = getattr(args, "use_verification_data", False)
+
+    if use_forcing_multi:
+        print(f"Training probe on multi-rollout forcing data for {args.question_id}")
+    elif use_verification:
+        print(f"Training probe on verification data for {args.question_id}")
+    else:
+        print(f"Training probe on forcing data (rollout {args.rollout_idx}) for {args.question_id}")
+
+    probe_path = run_probe_training(
+        question_id=args.question_id,
+        rollout_idx=args.rollout_idx,
+        model_name=args.probe_model,
+        layer=args.layer,
+        use_mlp=args.use_mlp,
+        epochs=args.epochs,
+        load_in_4bit=not args.no_4bit,
+        device=args.device,
+        verbose=True,
+        use_verification_data=use_verification,
+        use_forcing_multi_rollout=use_forcing_multi,
+        max_rollouts=args.max_rollouts,
+    )
+    print(f"\nProbe saved to: {probe_path}")
+    return 0
+
+
+def cmd_probe_inference(args):
+    """Run probe inference on a question."""
+    if not args.question_id:
+        task = ForcedResponseTask(model=args.model)
+        verified = task.get_verified_questions(threshold=args.threshold)
+        if not verified:
+            print("No verified questions found. Run 'verify' first.")
+            return 1
+        args.question_id = verified[0]
+        print(f"Using verified question: {args.question_id}")
+
+    print(f"Running probe inference on {args.question_id}, rollout {args.rollout_idx}")
+
+    probe_path = Path(args.probe_path) if args.probe_path else None
+    results = run_probe_inference(
+        question_id=args.question_id,
+        rollout_idx=args.rollout_idx,
+        probe_path=probe_path,
+        model_name=args.probe_model,
+        layer=args.layer,
+        load_in_4bit=not args.no_4bit,
+        device=args.device,
+        verbose=True,
+    )
+
+    print(f"\nPredictions for {len(results['sentence_results'])} sentences")
+    for r in results["sentence_results"]:
+        dist = r["predicted_distribution"]
+        dist_str = " ".join(f"{k}:{v:.2f}" for k, v in sorted(dist.items()))
+        print(f"  Sentence {r['sentence_idx'] + 1}: {dist_str}")
+
+    return 0
+
+
 def cmd_list(args):
     """List verified questions and their status."""
     task = ForcedResponseTask(model=args.model)
@@ -888,6 +1000,161 @@ def main():
     )
     resample_parser.set_defaults(func=cmd_resample)
 
+    # Force-for-probes command
+    ffp_parser = subparsers.add_parser(
+        "force-for-probes",
+        help="Run forcing on multiple verification rollouts for probe training",
+    )
+    ffp_parser.add_argument(
+        "--question-id", "-q",
+        help="Question ID (default: first verified question)",
+    )
+    ffp_parser.add_argument(
+        "--num-rollouts",
+        type=int,
+        default=10,
+        help="Number of verification rollouts to force (default: 10)",
+    )
+    ffp_parser.add_argument(
+        "--num-forces", "-n",
+        type=int,
+        default=10,
+        help="Number of force samples per sentence (default: 10)",
+    )
+    ffp_parser.add_argument(
+        "--max-sentences", "-m",
+        type=int,
+        default=None,
+        help="Only force the first M sentences per rollout (default: all)",
+    )
+    ffp_parser.add_argument(
+        "--threshold", "-t",
+        type=float,
+        default=0.8,
+        help="Agreement threshold for selecting questions (default: 0.8)",
+    )
+    ffp_parser.set_defaults(func=cmd_force_for_probes)
+
+    # Train-probe command
+    tp_parser = subparsers.add_parser(
+        "train-probe",
+        help="Train a white-box probe on forcing or verification data",
+    )
+    tp_parser.add_argument(
+        "--question-id", "-q",
+        help="Question ID (default: first verified question)",
+    )
+    tp_parser.add_argument(
+        "--rollout-idx", "-r",
+        type=int,
+        default=0,
+        help="Rollout index for single-rollout forcing data (default: 0)",
+    )
+    tp_parser.add_argument(
+        "--use-forcing-multi-rollout",
+        action="store_true",
+        help="Use forcing data from multiple rollouts",
+    )
+    tp_parser.add_argument(
+        "--use-verification-data",
+        action="store_true",
+        help="Use verification rollouts instead of forcing data",
+    )
+    tp_parser.add_argument(
+        "--max-rollouts",
+        type=int,
+        default=None,
+        help="Max rollouts to use (for verification data)",
+    )
+    tp_parser.add_argument(
+        "--probe-model",
+        default="Qwen/Qwen3-32B",
+        help="Model for activation extraction (default: Qwen/Qwen3-32B)",
+    )
+    tp_parser.add_argument(
+        "--layer",
+        type=int,
+        default=32,
+        help="Layer to extract activations from (default: 32)",
+    )
+    tp_parser.add_argument(
+        "--use-mlp",
+        action="store_true",
+        help="Use MLP probe instead of linear",
+    )
+    tp_parser.add_argument(
+        "--epochs",
+        type=int,
+        default=100,
+        help="Training epochs (default: 100)",
+    )
+    tp_parser.add_argument(
+        "--no-4bit",
+        action="store_true",
+        help="Disable 4-bit quantization for activation model",
+    )
+    tp_parser.add_argument(
+        "--device",
+        default="cuda",
+        help="Device for training (default: cuda)",
+    )
+    tp_parser.add_argument(
+        "--threshold", "-t",
+        type=float,
+        default=0.8,
+        help="Agreement threshold for selecting questions (default: 0.8)",
+    )
+    tp_parser.set_defaults(func=cmd_train_probe)
+
+    # Probe-inference command
+    pi_parser = subparsers.add_parser(
+        "probe-inference",
+        help="Run probe inference on a question",
+    )
+    pi_parser.add_argument(
+        "--question-id", "-q",
+        help="Question ID (default: first verified question)",
+    )
+    pi_parser.add_argument(
+        "--rollout-idx", "-r",
+        type=int,
+        default=0,
+        help="Rollout index to run inference on (default: 0)",
+    )
+    pi_parser.add_argument(
+        "--probe-path",
+        default=None,
+        help="Path to saved probe (auto-detected if not provided)",
+    )
+    pi_parser.add_argument(
+        "--probe-model",
+        default="Qwen/Qwen3-32B",
+        help="Model for activation extraction (default: Qwen/Qwen3-32B)",
+    )
+    pi_parser.add_argument(
+        "--layer",
+        type=int,
+        default=32,
+        help="Layer to extract activations from (default: 32)",
+    )
+    pi_parser.add_argument(
+        "--no-4bit",
+        action="store_true",
+        help="Disable 4-bit quantization for activation model",
+    )
+    pi_parser.add_argument(
+        "--device",
+        default="cuda",
+        help="Device for inference (default: cuda)",
+    )
+    pi_parser.add_argument(
+        "--threshold", "-t",
+        type=float,
+        default=0.8,
+        help="Agreement threshold for selecting questions (default: 0.8)",
+    )
+    pi_parser.set_defaults(func=cmd_probe_inference)
+
     # List command
     list_parser = subparsers.add_parser(
         "list",
@@ -898,7 +1165,7 @@ def main():
     args = parser.parse_args()
 
     # Check for API key (not needed for Tinker-based commands or 'list')
-    if args.command not in ("force", "resample", "list"):
+    if args.command not in ("force", "resample", "list", "force-for-probes", "train-probe", "probe-inference"):
         if not args.api_key and not os.environ.get("OPENROUTER_API_KEY"):
             print("Error: No API key provided. Set OPENROUTER_API_KEY or use --api-key")
             return 1

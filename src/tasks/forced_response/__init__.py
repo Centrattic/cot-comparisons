@@ -16,7 +16,7 @@ Five modes:
 from .task import ForcedResponseTask
 from .prompts import get_question_prompt, get_force_prompt
 from .verification import run_verification
-from .forcing import run_forcing, run_forcing_from_verification
+from .forcing import run_forcing, run_forcing_from_verification, run_forcing_for_probe_training
 from .monitors import (
     run_monitor_forcing,
     run_monitor_forcing_from_verification,
@@ -32,6 +32,7 @@ __all__ = [
     "run_verification",
     "run_forcing",
     "run_forcing_from_verification",
+    "run_forcing_for_probe_training",
     "run_monitor_forcing",
     "run_monitor_forcing_from_verification",
     "run_monitor_resampling",

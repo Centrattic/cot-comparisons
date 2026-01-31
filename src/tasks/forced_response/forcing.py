@@ -438,6 +438,101 @@ def run_forcing(
     return result
 
 
+def run_forcing_for_probe_training(
+    question_id: str,
+    model: str,
+    num_rollouts: int = 10,
+    num_forces: int = 10,
+    max_sentences: Optional[int] = None,
+    temperature: float = 0.7,
+    max_tokens: int = 2048,
+    verbose: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Run forcing on multiple verification rollouts for probe training.
+
+    Iterates over verification rollouts and calls run_forcing_from_verification()
+    for each, producing rich training data (N_rollouts x N_sentences samples).
+
+    Args:
+        question_id: ID of the question to force
+        model: Model identifier
+        num_rollouts: Number of verification rollouts to force
+        num_forces: Number of force samples per sentence per rollout
+        max_sentences: Only force the first M sentences per rollout (default: all)
+        temperature: Sampling temperature
+        max_tokens: Max tokens to generate
+        verbose: Whether to print progress
+
+    Returns:
+        List of summary dicts, one per rollout (None entries filtered out)
+    """
+    task = ForcedResponseTask(model=model)
+
+    # Discover available verification rollouts
+    verification_dir = task.verification_dir / question_id
+    if not verification_dir.exists():
+        print(f"No verification data found for {question_id}")
+        return []
+
+    rollouts_dir = verification_dir / "rollouts"
+    if not rollouts_dir.exists():
+        # Try timestamped subdirs
+        latest_dir = task.get_latest_verification_dir(question_id)
+        if latest_dir:
+            rollouts_dir = latest_dir / "rollouts"
+
+    if not rollouts_dir.exists():
+        print(f"No rollouts directory found for {question_id}")
+        return []
+
+    available_rollouts = sorted(rollouts_dir.glob("rollout_*.json"))
+    if not available_rollouts:
+        print(f"No rollout files found in {rollouts_dir}")
+        return []
+
+    # Limit to requested number
+    rollout_indices = list(range(min(num_rollouts, len(available_rollouts))))
+
+    if verbose:
+        print(f"Running forcing for probe training on {question_id}")
+        print(f"Available rollouts: {len(available_rollouts)}, using: {len(rollout_indices)}")
+        print(f"Forces per sentence: {num_forces}")
+        print()
+
+    results = []
+    for i, rollout_idx in enumerate(rollout_indices):
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Rollout {rollout_idx} ({i+1}/{len(rollout_indices)})")
+            print(f"{'='*60}")
+
+        summary = run_forcing_from_verification(
+            question_id=question_id,
+            model=model,
+            rollout_idx=rollout_idx,
+            num_forces=num_forces,
+            max_sentences=max_sentences,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            verbose=verbose,
+        )
+
+        if summary is not None:
+            results.append(summary)
+        elif verbose:
+            print(f"  Skipped rollout {rollout_idx} (no data)")
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Forcing complete: {len(results)}/{len(rollout_indices)} rollouts succeeded")
+        total_sentences = sum(r["num_sentences"] for r in results)
+        print(f"Total training samples available: {total_sentences} (sentences across rollouts)")
+        print(f"{'='*60}")
+
+    return results
+
+
 def run_forcing_from_verification(
     question_id: str,
     model: str,

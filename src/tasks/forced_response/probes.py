@@ -27,13 +27,12 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from .data_loader import GPQAQuestion, BinaryJudgeQuestion, Question
+from .data_loader import BinaryJudgeQuestion, GPQAQuestion, Question
 from .prompts import get_cumulative_cot_segments
 from .task import ForcedResponseTask
 
-
-# Model configuration
-DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-32B-Instruct"
+# Model configuration (same as scruples/sae.py)
+DEFAULT_MODEL_NAME = "Qwen/Qwen3-32B"
 DEFAULT_PROBE_LAYER = 32  # Mid layer for 64-layer model
 
 # Label definitions for different question types
@@ -44,6 +43,9 @@ BINARY_JUDGE_LABELS = ["YES", "NO"]  # YES = bad outcome (blackmail), NO = no bl
 @dataclass
 class ActivationSample:
     """A single activation sample for training/inference."""
+
+    sentence_idx: int
+
     sentence_idx: int
     activation: np.ndarray  # [hidden_dim] - last token activation
     answer_counts: Dict[str, int]  # {"A": 5, "B": 10, ...} or {"YES": 2, "NO": 8}
@@ -56,8 +58,11 @@ class ActivationSample:
 @dataclass
 class ProbeResult:
     """Result of probe prediction for a single prefix."""
+
     sentence_idx: int
-    predicted_distribution: Dict[str, float]  # {"A": 0.1, ...} or {"YES": 0.3, "NO": 0.7}
+    predicted_distribution: Dict[
+        str, float
+    ]  # {"A": 0.1, ...} or {"YES": 0.3, "NO": 0.7}
     actual_distribution: Optional[Dict[str, float]] = None
     kl_divergence: Optional[float] = None
 
@@ -65,6 +70,7 @@ class ProbeResult:
 @dataclass
 class ProbeTrainingResult:
     """Results from training the probe."""
+
     accuracy: float  # Top-1 accuracy on validation
     mean_kl_divergence: float  # Average KL(actual || predicted)
     per_class_accuracy: Dict[str, float]
@@ -128,6 +134,7 @@ class ActivationExtractor:
 
         if self.load_in_4bit:
             from transformers import BitsAndBytesConfig
+
             load_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=self.torch_dtype,
@@ -144,7 +151,9 @@ class ActivationExtractor:
         print(f"Model loaded: {n_layers} layers, using layer {self.layer}")
 
         if self.layer >= n_layers:
-            raise ValueError(f"Layer {self.layer} out of range (model has {n_layers} layers)")
+            raise ValueError(
+                f"Layer {self.layer} out of range (model has {n_layers} layers)"
+            )
 
     def extract_last_token_activation(
         self,
@@ -184,7 +193,7 @@ class ActivationExtractor:
 
         # Get last token activation
         resid = activations["resid"]  # [1, seq_len, hidden_dim]
-        last_token_act = resid[0, -1, :].cpu().numpy()  # [hidden_dim]
+        last_token_act = resid[0, -1, :].cpu().float().numpy()  # [hidden_dim]
 
         return last_token_act
 
@@ -233,7 +242,8 @@ def build_forcing_prompt(
         # Multiple choice questions: include choices
         choice_labels = [chr(ord("A") + i) for i in range(len(question.choices))]
         choices_text = "\n".join(
-            f"{label}. {choice}" for label, choice in zip(choice_labels, question.choices)
+            f"{label}. {choice}"
+            for label, choice in zip(choice_labels, question.choices)
         )
         user_msg = (
             f"Answer the following multiple choice question. Think through the problem "
@@ -433,11 +443,15 @@ class ProbeTrainer:
         if not source_cot:
             # Try to load from verification rollout
             verification_dir = task.verification_dir / question_id
-            rollout_path = verification_dir / "rollouts" / f"rollout_{rollout_idx:03d}.json"
+            rollout_path = (
+                verification_dir / "rollouts" / f"rollout_{rollout_idx:03d}.json"
+            )
             if rollout_path.exists():
                 with open(rollout_path) as f:
                     rollout_data = json.load(f)
-                source_cot = rollout_data.get("thinking", "") or rollout_data.get("full_response", "")
+                source_cot = rollout_data.get("thinking", "") or rollout_data.get(
+                    "full_response", ""
+                )
 
         if not source_cot:
             raise ValueError(f"No source CoT found for {question_id}")
@@ -446,14 +460,18 @@ class ProbeTrainer:
 
         # Load forcing results per sentence
         samples = []
-        sentence_results = summary.get("sentence_results", summary.get("sentence_summaries", []))
+        sentence_results = summary.get(
+            "sentence_results", summary.get("sentence_summaries", [])
+        )
 
         if verbose:
             print(f"Question type: {question_type}")
             print(f"Valid labels: {valid_labels}")
             print(f"Collecting activations for {len(sentence_results)} sentences...")
 
-        for result in tqdm(sentence_results, disable=not verbose, desc="Extracting activations"):
+        for result in tqdm(
+            sentence_results, disable=not verbose, desc="Extracting activations"
+        ):
             sentence_idx = result["sentence_idx"]
             answer_counts = result.get("answer_counts", {})
 
@@ -469,25 +487,103 @@ class ProbeTrainer:
             total = sum(answer_counts.get(label, 0) for label in valid_labels)
             if total == 0:
                 continue
-            distribution = {label: answer_counts.get(label, 0) / total for label in valid_labels}
+            distribution = {
+                label: answer_counts.get(label, 0) / total for label in valid_labels
+            }
 
             # Extract activation
             activation = self.extractor.extract_for_prefix(question, partial_cot)
 
-            samples.append(ActivationSample(
-                sentence_idx=sentence_idx,
-                activation=activation,
-                answer_counts=answer_counts,
-                answer_distribution=distribution,
-                partial_cot_length=len(partial_cot),
-                question_id=question_id,
-                question_type=question_type,
-            ))
+            samples.append(
+                ActivationSample(
+                    sentence_idx=sentence_idx,
+                    activation=activation,
+                    answer_counts=answer_counts,
+                    answer_distribution=distribution,
+                    partial_cot_length=len(partial_cot),
+                    question_id=question_id,
+                    question_type=question_type,
+                )
+            )
 
         if verbose:
             print(f"Collected {len(samples)} samples")
 
         return samples
+
+    def collect_training_data_multi_rollout(
+        self,
+        question_id: str,
+        rollout_indices: Optional[List[int]] = None,
+        verbose: bool = True,
+    ) -> List[ActivationSample]:
+        """
+        Collect activation samples from forcing data across multiple rollouts.
+
+        For each rollout that has forcing data, calls collect_training_data()
+        and aggregates all samples. This gives N_rollouts x N_sentences training
+        samples with forcing distributions at every sentence boundary.
+
+        Args:
+            question_id: Question ID to collect data for
+            rollout_indices: Specific rollout indices to use (auto-discovers if None)
+            verbose: Print progress
+
+        Returns:
+            List of ActivationSample objects aggregated across all rollouts
+        """
+        task = ForcedResponseTask()
+
+        forcing_question_dir = task.forcing_dir / question_id
+        if not forcing_question_dir.exists():
+            raise FileNotFoundError(f"No forcing data at {forcing_question_dir}")
+
+        # Auto-discover rollouts with forcing data
+        if rollout_indices is None:
+            rollout_dirs = sorted(
+                d for d in forcing_question_dir.iterdir()
+                if d.is_dir() and d.name.startswith("rollout_")
+            )
+            rollout_indices = []
+            for d in rollout_dirs:
+                try:
+                    idx = int(d.name.split("_")[1])
+                    # Check that there's actually a run with a summary
+                    latest = task.get_latest_run_dir(d)
+                    if latest and (latest / "summary.json").exists():
+                        rollout_indices.append(idx)
+                except (ValueError, IndexError):
+                    continue
+
+        if not rollout_indices:
+            raise FileNotFoundError(
+                f"No rollouts with forcing data found for {question_id}"
+            )
+
+        if verbose:
+            print(f"Collecting multi-rollout training data for {question_id}")
+            print(f"Rollout indices: {rollout_indices}")
+
+        all_samples: List[ActivationSample] = []
+        for rollout_idx in rollout_indices:
+            if verbose:
+                print(f"\n--- Rollout {rollout_idx} ---")
+            try:
+                samples = self.collect_training_data(
+                    question_id=question_id,
+                    rollout_idx=rollout_idx,
+                    verbose=verbose,
+                )
+                all_samples.extend(samples)
+            except (FileNotFoundError, ValueError) as e:
+                if verbose:
+                    print(f"  Skipping rollout {rollout_idx}: {e}")
+
+        if verbose:
+            print(f"\nTotal samples collected: {len(all_samples)} "
+                  f"(from {len(rollout_indices)} rollouts)")
+
+        return all_samples
 
     def collect_training_data_from_verification(
         self,
@@ -559,7 +655,9 @@ class ProbeTrainer:
             print(f"Loading {len(rollout_files)} rollouts...")
 
         samples = []
-        for rollout_path in tqdm(rollout_files, disable=not verbose, desc="Extracting activations"):
+        for rollout_path in tqdm(
+            rollout_files, disable=not verbose, desc="Extracting activations"
+        ):
             with open(rollout_path) as f:
                 rollout_data = json.load(f)
 
@@ -569,7 +667,9 @@ class ProbeTrainer:
                 continue
 
             # Get the full CoT
-            source_cot = rollout_data.get("thinking", "") or rollout_data.get("full_response", "")
+            source_cot = rollout_data.get("thinking", "") or rollout_data.get(
+                "full_response", ""
+            )
             if not source_cot:
                 continue
 
@@ -577,17 +677,21 @@ class ProbeTrainer:
             activation = self.extractor.extract_for_prefix(question, source_cot)
 
             # Create one-hot distribution for this sample
-            distribution = {label: 1.0 if label == answer else 0.0 for label in valid_labels}
+            distribution = {
+                label: 1.0 if label == answer else 0.0 for label in valid_labels
+            }
 
-            samples.append(ActivationSample(
-                sentence_idx=-1,  # Full CoT, not a prefix
-                activation=activation,
-                answer_counts={answer: 1},
-                answer_distribution=distribution,
-                partial_cot_length=len(source_cot),
-                question_id=question_id,
-                question_type=question_type,
-            ))
+            samples.append(
+                ActivationSample(
+                    sentence_idx=-1,  # Full CoT, not a prefix
+                    activation=activation,
+                    answer_counts={answer: 1},
+                    answer_distribution=distribution,
+                    partial_cot_length=len(source_cot),
+                    question_id=question_id,
+                    question_type=question_type,
+                )
+            )
 
         if verbose:
             print(f"Collected {len(samples)} samples")
@@ -646,10 +750,12 @@ class ProbeTrainer:
         # Prepare data
         X = np.stack([s.activation for s in samples])
         # Convert distributions to probability vectors
-        y = np.array([
-            [s.answer_distribution.get(label, 0.0) for label in labels]
-            for s in samples
-        ])
+        y = np.array(
+            [
+                [s.answer_distribution.get(label, 0.0) for label in labels]
+                for s in samples
+            ]
+        )
 
         # Split
         X_train, X_val, y_train, y_val = train_test_split(
@@ -705,10 +811,14 @@ class ProbeTrainer:
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_state = {k: v.cpu().clone() for k, v in self.probe.state_dict().items()}
+                best_state = {
+                    k: v.cpu().clone() for k, v in self.probe.state_dict().items()
+                }
 
             if verbose and (epoch + 1) % 20 == 0:
-                print(f"Epoch {epoch + 1}/{epochs}: train_loss={loss.item():.4f}, val_loss={val_loss.item():.4f}")
+                print(
+                    f"Epoch {epoch + 1}/{epochs}: train_loss={loss.item():.4f}, val_loss={val_loss.item():.4f}"
+                )
 
         # Load best model
         if best_state is not None:
@@ -728,14 +838,21 @@ class ProbeTrainer:
 
             # KL divergence (actual || predicted)
             eps = 1e-8
-            kl_div = (y_val_t * (torch.log(y_val_t + eps) - torch.log(val_probs + eps))).sum(dim=-1).mean().item()
+            kl_div = (
+                (y_val_t * (torch.log(y_val_t + eps) - torch.log(val_probs + eps)))
+                .sum(dim=-1)
+                .mean()
+                .item()
+            )
 
             # Per-class accuracy
             per_class_acc = {}
             for i, label in enumerate(labels):
                 mask = true_labels == i
                 if mask.sum() > 0:
-                    per_class_acc[label] = (pred_labels[mask] == i).float().mean().item()
+                    per_class_acc[label] = (
+                        (pred_labels[mask] == i).float().mean().item()
+                    )
                 else:
                     per_class_acc[label] = 0.0
 
@@ -782,7 +899,9 @@ class ProbeTrainer:
         activation_scaled = self._scaler.transform(activation.reshape(1, -1))
 
         # Predict
-        activation_t = torch.tensor(activation_scaled, dtype=torch.float32, device=self.device)
+        activation_t = torch.tensor(
+            activation_scaled, dtype=torch.float32, device=self.device
+        )
         return self.probe.predict_distribution(activation_t)
 
     def predict_all_prefixes(
@@ -805,12 +924,16 @@ class ProbeTrainer:
         cot_segments = get_cumulative_cot_segments(source_cot)
 
         results = []
-        for sentence_idx, partial_cot in enumerate(tqdm(cot_segments, disable=not verbose, desc="Predicting")):
+        for sentence_idx, partial_cot in enumerate(
+            tqdm(cot_segments, disable=not verbose, desc="Predicting")
+        ):
             pred_dist = self.predict(question, partial_cot)
-            results.append(ProbeResult(
-                sentence_idx=sentence_idx,
-                predicted_distribution=pred_dist,
-            ))
+            results.append(
+                ProbeResult(
+                    sentence_idx=sentence_idx,
+                    predicted_distribution=pred_dist,
+                )
+            )
 
         return results
 
@@ -872,7 +995,7 @@ class ProbeTrainer:
         self._scaler = StandardScaler()
         self._scaler.mean_ = scaler_data["mean"]
         self._scaler.scale_ = scaler_data["scale"]
-        self._scaler.var_ = self._scaler.scale_ ** 2
+        self._scaler.var_ = self._scaler.scale_**2
         self._scaler.n_features_in_ = len(self._scaler.mean_)
 
         print(f"Loaded probe from {path} (question_type: {self.question_type})")
@@ -889,6 +1012,7 @@ def run_probe_training(
     device: str = "cuda",
     verbose: bool = True,
     use_verification_data: bool = False,
+    use_forcing_multi_rollout: bool = False,
     max_rollouts: Optional[int] = None,
 ) -> Path:
     """
@@ -905,6 +1029,7 @@ def run_probe_training(
         device: Device for training
         verbose: Print progress
         use_verification_data: If True, use verification rollouts instead of forcing data
+        use_forcing_multi_rollout: If True, use forcing data from multiple rollouts
         max_rollouts: Max rollouts to use (for verification data)
 
     Returns:
@@ -922,7 +1047,12 @@ def run_probe_training(
     trainer = ProbeTrainer(extractor=extractor, device=device)
 
     # Collect training data
-    if use_verification_data:
+    if use_forcing_multi_rollout:
+        samples = trainer.collect_training_data_multi_rollout(
+            question_id=question_id,
+            verbose=verbose,
+        )
+    elif use_verification_data:
         samples = trainer.collect_training_data_from_verification(
             question_id=question_id,
             max_rollouts=max_rollouts,
@@ -949,26 +1079,35 @@ def run_probe_training(
     # Save
     task = ForcedResponseTask()
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    data_source = "verification" if use_verification_data else f"rollout_{rollout_idx:03d}"
-    probe_dir = task.data_dir / "probes" / question_id / data_source / timestamp
+    if use_forcing_multi_rollout:
+        data_source = "forcing_multi"
+    elif use_verification_data:
+        data_source = "verification"
+    else:
+        data_source = f"rollout_{rollout_idx:03d}"
+    probe_dir = task.task_dir / "probes" / question_id / data_source / timestamp
     trainer.save(probe_dir)
 
     # Save training result
     with open(probe_dir / "training_result.json", "w") as f:
-        json.dump({
-            "accuracy": result.accuracy,
-            "mean_kl_divergence": result.mean_kl_divergence,
-            "per_class_accuracy": result.per_class_accuracy,
-            "n_train": result.n_train,
-            "n_val": result.n_val,
-            "question_id": question_id,
-            "question_type": result.question_type,
-            "data_source": data_source,
-            "model_name": model_name,
-            "layer": layer,
-            "use_mlp": use_mlp,
-            "epochs": epochs,
-        }, f, indent=2)
+        json.dump(
+            {
+                "accuracy": result.accuracy,
+                "mean_kl_divergence": result.mean_kl_divergence,
+                "per_class_accuracy": result.per_class_accuracy,
+                "n_train": result.n_train,
+                "n_val": result.n_val,
+                "question_id": question_id,
+                "question_type": result.question_type,
+                "data_source": data_source,
+                "model_name": model_name,
+                "layer": layer,
+                "use_mlp": use_mlp,
+                "epochs": epochs,
+            },
+            f,
+            indent=2,
+        )
 
     return probe_dir
 
@@ -1003,7 +1142,7 @@ def run_probe_inference(
 
     # Find probe
     if probe_path is None:
-        probe_base = task.data_dir / "probes" / question_id
+        probe_base = task.task_dir / "probes" / question_id
         if not probe_base.exists():
             raise FileNotFoundError(f"No probe found at {probe_base}")
         # Try rollout-specific first, then verification
@@ -1045,7 +1184,9 @@ def run_probe_inference(
     rollout_path = verification_dir / "rollouts" / f"rollout_{rollout_idx:03d}.json"
     with open(rollout_path) as f:
         rollout_data = json.load(f)
-    source_cot = rollout_data.get("thinking", "") or rollout_data.get("full_response", "")
+    source_cot = rollout_data.get("thinking", "") or rollout_data.get(
+        "full_response", ""
+    )
 
     # Initialize extractor and trainer
     extractor = ActivationExtractor(
@@ -1081,7 +1222,13 @@ def run_probe_inference(
 
     # Save results
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    inference_dir = task.data_dir / "probe_inference" / question_id / f"rollout_{rollout_idx:03d}" / timestamp
+    inference_dir = (
+        task.task_dir
+        / "probe_inference"
+        / question_id
+        / f"rollout_{rollout_idx:03d}"
+        / timestamp
+    )
     inference_dir.mkdir(parents=True, exist_ok=True)
     with open(inference_dir / "results.json", "w") as f:
         json.dump(output, f, indent=2)
@@ -1095,23 +1242,46 @@ def run_probe_inference(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train and run probes for forced response task")
+    parser = argparse.ArgumentParser(
+        description="Train and run probes for forced response task"
+    )
     parser.add_argument("command", choices=["train", "infer"], help="Command to run")
     parser.add_argument("--question-id", "-q", required=True, help="Question ID")
-    parser.add_argument("--rollout-idx", "-r", type=int, default=0, help="Rollout index")
+    parser.add_argument(
+        "--rollout-idx", "-r", type=int, default=0, help="Rollout index"
+    )
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME, help="Model name")
-    parser.add_argument("--layer", type=int, default=DEFAULT_PROBE_LAYER, help="Layer to extract from")
-    parser.add_argument("--use-mlp", action="store_true", help="Use MLP instead of linear probe")
+    parser.add_argument(
+        "--layer", type=int, default=DEFAULT_PROBE_LAYER, help="Layer to extract from"
+    )
+    parser.add_argument(
+        "--use-mlp", action="store_true", help="Use MLP instead of linear probe"
+    )
     parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
-    parser.add_argument("--probe-path", type=Path, default=None, help="Path to saved probe")
-    parser.add_argument("--load-in-4bit", action="store_true", default=True, help="Load model in 4-bit")
+    parser.add_argument(
+        "--probe-path", type=Path, default=None, help="Path to saved probe"
+    )
+    parser.add_argument(
+        "--load-in-4bit", action="store_true", default=True, help="Load model in 4-bit"
+    )
     parser.add_argument("--device", default="cuda", help="Device")
     parser.add_argument("--quiet", action="store_true", help="Suppress output")
-    parser.add_argument("--use-verification-data", action="store_true",
-                        help="Use verification rollouts instead of forcing data")
-    parser.add_argument("--max-rollouts", type=int, default=None,
-                        help="Max rollouts to use (for verification data)")
-
+    parser.add_argument(
+        "--use-verification-data",
+        action="store_true",
+        help="Use verification rollouts instead of forcing data",
+    )
+    parser.add_argument(
+        "--max-rollouts",
+        type=int,
+        default=None,
+        help="Max rollouts to use (for verification data)",
+    )
+    parser.add_argument(
+        "--use-forcing-multi-rollout",
+        action="store_true",
+        help="Use forcing data from multiple rollouts for training",
+    )
     args = parser.parse_args()
 
     if args.command == "train":
@@ -1126,6 +1296,7 @@ if __name__ == "__main__":
             device=args.device,
             verbose=not args.quiet,
             use_verification_data=args.use_verification_data,
+            use_forcing_multi_rollout=args.use_forcing_multi_rollout,
             max_rollouts=args.max_rollouts,
         )
         print(f"\nProbe saved to: {probe_path}")
