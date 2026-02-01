@@ -6,9 +6,9 @@ Moved from src2/tasks/forced_response/data_loader.py to be shared across tasks.
 
 import json
 import re
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
-from dataclasses import dataclass, asdict
 
 import pandas as pd
 
@@ -16,11 +16,12 @@ import pandas as pd
 @dataclass
 class GPQAQuestion:
     """A single GPQA question (multiple choice)."""
+
     id: str
     question: str
     choices: List[str]
     correct_answer: str  # The letter (A, B, C, D)
-    correct_index: int   # 0-indexed
+    correct_index: int  # 0-indexed
     subject: Optional[str] = None
     difficulty: Optional[str] = None
     question_type: str = "multiple_choice"
@@ -36,10 +37,11 @@ class GPQAQuestion:
 @dataclass
 class BinaryJudgeQuestion:
     """A question that requires an LLM judge to classify the response."""
+
     id: str
     question: str
     judge_prompt: str  # Prompt template for the judge, with {response} placeholder
-    bad_outcome: str   # What the judge returns if the model misbehaves (e.g., "YES")
+    bad_outcome: str  # What the judge returns if the model misbehaves (e.g., "YES")
     subject: Optional[str] = None
     question_type: str = "binary_judge"
 
@@ -56,12 +58,7 @@ SAMPLE_GPQA_QUESTIONS = [
     GPQAQuestion(
         id="gpqa_sample_001",
         question="A spin-1/2 particle is in a state |ψ⟩ = (1/√2)|↑⟩ + (1/√2)|↓⟩. If we measure the spin along the z-axis, what is the probability of finding the particle in the spin-up state?",
-        choices=[
-            "0",
-            "1/4",
-            "1/2",
-            "1"
-        ],
+        choices=["0", "1/4", "1/2", "1"],
         correct_answer="C",
         correct_index=2,
         subject="physics",
@@ -70,12 +67,7 @@ SAMPLE_GPQA_QUESTIONS = [
     GPQAQuestion(
         id="gpqa_sample_002",
         question="In organic chemistry, what is the major product when 2-butene undergoes hydroboration-oxidation?",
-        choices=[
-            "1-butanol",
-            "2-butanol",
-            "2-butanone",
-            "butanal"
-        ],
+        choices=["1-butanol", "2-butanol", "2-butanone", "butanal"],
         correct_answer="B",
         correct_index=1,
         subject="chemistry",
@@ -84,12 +76,7 @@ SAMPLE_GPQA_QUESTIONS = [
     GPQAQuestion(
         id="gpqa_sample_003",
         question="Consider a continuous function f: [0,1] → [0,1]. By Brouwer's fixed point theorem, f must have at least one fixed point. If f(0) = 1 and f(1) = 0, and f is strictly decreasing, how many fixed points does f have?",
-        choices=[
-            "Exactly 0",
-            "Exactly 1",
-            "Exactly 2",
-            "Infinitely many"
-        ],
+        choices=["Exactly 0", "Exactly 1", "Exactly 2", "Infinitely many"],
         correct_answer="B",
         correct_index=1,
         subject="mathematics",
@@ -102,7 +89,7 @@ SAMPLE_GPQA_QUESTIONS = [
             "BPP is known to be strictly contained in NP",
             "BPP is known to equal P",
             "BPP is contained in the polynomial hierarchy (specifically, in Σ₂ ∩ Π₂)",
-            "BPP is known to contain NP"
+            "BPP is known to contain NP",
         ],
         correct_answer="C",
         correct_index=2,
@@ -116,7 +103,7 @@ SAMPLE_GPQA_QUESTIONS = [
             "Benzyl alcohol",
             "4-phenyl-3-buten-2-one (benzylideneacetone)",
             "Diphenylmethane",
-            "Benzophenone"
+            "Benzophenone",
         ],
         correct_answer="B",
         correct_index=1,
@@ -139,7 +126,7 @@ def load_custom_questions(
     Supports both multiple_choice and binary_judge question types.
     """
     if questions_file is None:
-        questions_file = Path(__file__).parent.parent / "tasks" / "forced_response" / "questions.json"
+        questions_file = Path("questions.json")
 
     if not questions_file.exists():
         return []
@@ -152,25 +139,29 @@ def load_custom_questions(
         question_type = item.get("type", "multiple_choice")
 
         if question_type == "binary_judge":
-            questions.append(BinaryJudgeQuestion(
-                id=item["id"],
-                question=item["question"],
-                judge_prompt=item["judge_prompt"],
-                bad_outcome=item["bad_outcome"],
-                subject=item.get("subject"),
-            ))
+            questions.append(
+                BinaryJudgeQuestion(
+                    id=item["id"],
+                    question=item["question"],
+                    judge_prompt=item["judge_prompt"],
+                    bad_outcome=item["bad_outcome"],
+                    subject=item.get("subject"),
+                )
+            )
         else:
             correct_answer = item["correct_answer"]
-            correct_index = ord(correct_answer) - ord('A')
-            questions.append(GPQAQuestion(
-                id=item["id"],
-                question=item["question"],
-                choices=item["choices"],
-                correct_answer=correct_answer,
-                correct_index=correct_index,
-                subject=item.get("subject"),
-                difficulty=item.get("difficulty"),
-            ))
+            correct_index = ord(correct_answer) - ord("A")
+            questions.append(
+                GPQAQuestion(
+                    id=item["id"],
+                    question=item["question"],
+                    choices=item["choices"],
+                    correct_answer=correct_answer,
+                    correct_index=correct_index,
+                    subject=item.get("subject"),
+                    difficulty=item.get("difficulty"),
+                )
+            )
 
     return questions
 
@@ -192,7 +183,12 @@ def load_gpqa_questions(
         questions = SAMPLE_GPQA_QUESTIONS.copy()
     else:
         if data_dir is None:
-            data_dir = Path(__file__).parent.parent.parent / "data" / "forced_response" / "gpqa"
+            data_dir = (
+                Path(__file__).parent.parent.parent
+                / "data"
+                / "forced_response"
+                / "gpqa"
+            )
 
         questions_file = data_dir / "questions.json"
         if questions_file.exists():
@@ -217,7 +213,9 @@ def save_gpqa_questions(
 ) -> Path:
     """Save GPQA questions to JSON file."""
     if data_dir is None:
-        data_dir = Path(__file__).parent.parent.parent / "data" / "forced_response" / "gpqa"
+        data_dir = (
+            Path(__file__).parent.parent.parent / "data" / "forced_response" / "gpqa"
+        )
 
     data_dir.mkdir(parents=True, exist_ok=True)
     questions_file = data_dir / "questions.json"
@@ -259,25 +257,31 @@ def load_gpqa_from_huggingface(
         ]
 
         import hashlib
+
         seed = int(hashlib.md5(item["Question"].encode()).hexdigest()[:8], 16)
         import random
+
         rng = random.Random(seed)
 
         choice_pairs = [(c, i == 3) for i, c in enumerate(choices)]
         rng.shuffle(choice_pairs)
 
         shuffled_choices = [c for c, _ in choice_pairs]
-        correct_idx = next(i for i, (_, is_correct) in enumerate(choice_pairs) if is_correct)
-        correct_letter = chr(ord('A') + correct_idx)
+        correct_idx = next(
+            i for i, (_, is_correct) in enumerate(choice_pairs) if is_correct
+        )
+        correct_letter = chr(ord("A") + correct_idx)
 
-        questions.append(GPQAQuestion(
-            id=f"gpqa_{subset}_{i:04d}",
-            question=item["Question"],
-            choices=shuffled_choices,
-            correct_answer=correct_letter,
-            correct_index=correct_idx,
-            subject=item.get("Subdomain", None),
-            difficulty=subset,
-        ))
+        questions.append(
+            GPQAQuestion(
+                id=f"gpqa_{subset}_{i:04d}",
+                question=item["Question"],
+                choices=shuffled_choices,
+                correct_answer=correct_letter,
+                correct_index=correct_idx,
+                subject=item.get("Subdomain", None),
+                difficulty=subset,
+            )
+        )
 
     return questions

@@ -41,13 +41,14 @@ class ResampleResult:
     full_response: str
     answer: str
     raw_tokens: List[int]
+    full_prompt: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "sentence_idx": self.sentence_idx, "resample_idx": self.resample_idx,
             "forced_prefix": self.forced_prefix, "continuation": self.continuation,
             "full_response": self.full_response, "answer": self.answer,
-            "raw_tokens": self.raw_tokens,
+            "raw_tokens": self.raw_tokens, "full_prompt": self.full_prompt,
         }
 
 
@@ -142,7 +143,7 @@ class ResamplingTask(BaseTask):
                     sentence_idx=sent_idx, resample_idx=resample_idx,
                     forced_prefix=partial_cot, continuation=continued_cot,
                     full_response=partial_cot + full_text, answer=answer,
-                    raw_tokens=list(sample_tokens),
+                    raw_tokens=list(sample_tokens), full_prompt=prompt_str,
                 )
             return None
 
@@ -322,20 +323,31 @@ class ResamplingTask(BaseTask):
             if not full_response:
                 continue
 
+            full_prompt = run_data.get("full_prompt", "")
+            if not full_prompt:
+                import logging
+                logging.warning(
+                    "No full_prompt in %s — skipping (old data without full context)",
+                    run_path,
+                )
+                continue
+
+            full_text = full_prompt + full_response
+
             try:
                 if token_position == "last_thinking" and "</think>" in full_response:
-                    think_part = full_response.split("</think>")[0]
+                    think_prefix = full_prompt + full_response.split("</think>")[0]
                     think_tokens = extractor.tokenizer.encode(
-                        think_part, add_special_tokens=False,
+                        think_prefix, add_special_tokens=False,
                     )
                     token_idx = len(think_tokens) - 1
                 else:
                     all_tokens = extractor.tokenizer.encode(
-                        full_response, add_special_tokens=False,
+                        full_text, add_special_tokens=False,
                     )
                     token_idx = len(all_tokens) - 1
 
-                act = extractor.extract_activation(full_response, layer, token_idx)
+                act = extractor.extract_activation(full_text, layer, token_idx)
                 arrays = {}
                 if act_path.exists():
                     with np.load(act_path) as f:
@@ -362,6 +374,11 @@ class ResamplingTask(BaseTask):
                 "answer_distribution": {"A": 0.3, "B": 0.5, ...},
                 "question_id": str,
                 "sentence_idx": int,
+                "forced_prefix": str,
+                "continuation": str,
+                "full_response": str,
+                "full_prompt": str,
+                "answer": str,
             }
         """
         act_key = f"layer{layer}_{token_position}"
@@ -392,11 +409,23 @@ class ResamplingTask(BaseTask):
                         continue
                     activation = f[act_key]
 
+                # Load companion JSON for text data
+                json_path = act_path.with_suffix(".json")
+                text_data = {}
+                if json_path.exists():
+                    with open(json_path) as f:
+                        text_data = json.load(f)
+
                 samples.append({
                     "activation": activation,
                     "answer_distribution": answer_distribution,
                     "question_id": question_id,
                     "sentence_idx": sentence_idx,
+                    "forced_prefix": text_data.get("forced_prefix", ""),
+                    "continuation": text_data.get("continuation", ""),
+                    "full_response": text_data.get("full_response", ""),
+                    "full_prompt": text_data.get("full_prompt", ""),
+                    "answer": text_data.get("answer", ""),
                 })
 
         return samples
