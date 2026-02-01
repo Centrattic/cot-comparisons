@@ -11,6 +11,8 @@ from pathlib import Path
 from src2.tasks import ForcingTask
 from src2.methods import LlmMonitor, LinearProbe
 from src2.tasks.forced_response.prompts import ForcingMonitorPrompt
+from src2.utils.questions import load_gpqa_questions
+from src2.utils.verification import ensure_verification
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -36,6 +38,16 @@ RUN_PROBE = True
 
 def main():
     forcing = ForcingTask(model=SUBJECT_MODEL, data_dir=DATA_DIR)
+
+    # Ensure verification data exists before forcing
+    questions = load_gpqa_questions(use_samples=True)
+    question = next((q for q in questions if q.id == QUESTION_ID), None)
+    if question:
+        ensure_verification(
+            question=question,
+            verification_dir=DATA_DIR / "verification",
+            model=SUBJECT_MODEL,
+        )
 
     if GENERATE_DATA:
         forcing.run_data(
