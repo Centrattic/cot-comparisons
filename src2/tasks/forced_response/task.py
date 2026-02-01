@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 from ..base import BaseTask
 from ...utils.questions import GPQAQuestion, BinaryJudgeQuestion, Question
-from ...prompts.forced_response import get_cumulative_cot_segments
+from .prompts import get_cumulative_cot_segments
 
 # Kimi K2 chat template tokens
 IM_SYSTEM = "<|im_system|>"

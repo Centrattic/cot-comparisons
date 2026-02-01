@@ -10,7 +10,7 @@ from pathlib import Path
 
 from src2.tasks import ForcingTask
 from src2.methods import LlmMonitor, LinearProbe
-from src2.prompts import ForcingMonitorPrompt
+from src2.tasks.forced_response.prompts import ForcingMonitorPrompt
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent

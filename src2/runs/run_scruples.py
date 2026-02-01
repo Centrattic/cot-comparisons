@@ -10,7 +10,7 @@ from pathlib import Path
 
 from src2.tasks import ScruplesTask
 from src2.methods import LlmMonitor, LinearProbe, AttentionProbe, ContrastiveSAE
-from src2.prompts import ScruplesBaseMonitorPrompt, ScruplesDiscriminationPrompt, ScruplesBaselinePrompt
+from src2.tasks.scruples.prompts import ScruplesBaseMonitorPrompt, ScruplesDiscriminationPrompt, ScruplesBaselinePrompt
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent

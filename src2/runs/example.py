@@ -16,7 +16,7 @@ import subprocess
 from pathlib import Path
 
 from src2.methods import AttentionProbe, ContrastiveSAE, LinearProbe, LlmMonitor
-from src2.prompts import ScruplesBaseMonitorPrompt
+from src2.tasks.scruples.prompts import ScruplesBaseMonitorPrompt
 from src2.tasks import ScruplesTask
 
 # ── Configuration (edit these per-run) ────────────────────────────────

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from src2.tasks import ResamplingTask
 from src2.methods import LlmMonitor, LinearProbe
-from src2.prompts import ResamplingMonitorPrompt
+from src2.tasks.resampled_response.prompts import ResamplingMonitorPrompt
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
