@@ -2,8 +2,10 @@
 Contrastive SAE analysis method.
 
 Uses Sparse Autoencoders (SAEs) trained on Qwen3-32B to find features that
-correlate with sycophantic behavior. Trains a ridge regression probe on
-SAE feature deltas (intervention - control) to predict switch_rate.
+correlate with sycophantic behavior. Encodes each run's full activation
+sequence through the SAE, max-pools across tokens per feature, then computes
+contrastive deltas in feature space. Trains a ridge regression probe on
+these SAE feature deltas to predict switch_rate.
 
 SAE source: https://huggingface.co/adamkarvonen/qwen3-32b-saes
 Architecture: BatchTopK SAEs (JumpReLU inference mode)
@@ -20,6 +22,7 @@ import torch.nn as nn
 from .base import BaseMethod
 
 HIGH_NORM_MULTIPLIER = 10.0
+ENCODE_BATCH_SIZE = 128
 
 
 class BatchTopKSAE(nn.Module):
@@ -82,12 +85,9 @@ class ContrastiveSAE(BaseMethod):
     """
     SAE-based contrastive analysis method.
 
-    Takes pre-computed contrastive activation deltas (same format as LinearProbe),
-    encodes them through the SAE, finds correlated features, and trains ridge regression.
-
-    Expected data formats:
-      train: {"X": ndarray [n, hidden_dim], "y": ndarray [n]}
-      infer: {"X": ndarray [n, hidden_dim], "anecdote_ids": list}
+    Encodes each run's full activation sequence through the SAE, max-pools
+    across tokens per feature, computes contrastive deltas in feature space,
+    and trains ridge regression on the resulting [n_anecdotes, dict_size] matrix.
     """
 
     def __init__(
@@ -126,34 +126,49 @@ class ContrastiveSAE(BaseMethod):
             )
         return self._sae
 
-    def _encode_through_sae(self, X: np.ndarray) -> np.ndarray:
-        """Encode activation deltas through SAE. Returns [n, dict_size]."""
+    def _encode_and_pool(self, full_seq: np.ndarray) -> np.ndarray:
+        """
+        Encode full sequence through SAE, max-pool across tokens.
+
+        Args:
+            full_seq: [seq_len, hidden_dim] activation matrix for one run.
+
+        Returns:
+            [dict_size] max-pooled feature activations.
+        """
         sae = self._get_sae()
         device = next(sae.parameters()).device
-        X_tensor = torch.from_numpy(X).float().to(device)
-        with torch.no_grad():
-            features = sae.encode(X_tensor)
-        return features.cpu().numpy()
+        seq_len = full_seq.shape[0]
+        all_features = []
+
+        for start in range(0, seq_len, ENCODE_BATCH_SIZE):
+            end = min(start + ENCODE_BATCH_SIZE, seq_len)
+            batch = torch.from_numpy(full_seq[start:end]).float().to(device)
+            with torch.no_grad():
+                features = sae.encode(batch)  # [batch, dict_size]
+            all_features.append(features.cpu().numpy())
+
+        # Concatenate and max-pool across tokens
+        all_features = np.concatenate(all_features, axis=0)  # [seq_len, dict_size]
+        return np.max(all_features, axis=0)  # [dict_size]
 
     def train(self, data: Any) -> None:
         """
         Find correlated SAE features and train ridge regression.
 
-        data: {"X": ndarray [n, hidden_dim], "y": ndarray [n]}
+        data: {"X": ndarray [n, dict_size], "y": ndarray [n]}
+              (pre-encoded feature deltas from get_sae_probe_data)
         """
         from sklearn.linear_model import Ridge
         from sklearn.model_selection import cross_val_predict, LeaveOneOut
         from sklearn.preprocessing import StandardScaler
         from scipy.stats import pearsonr
 
-        X_raw = data["X"]
+        X_full = data["X"]
         y = data["y"]
 
-        if len(X_raw) < 3:
-            raise ValueError(f"Need >= 3 samples, got {len(X_raw)}")
-
-        # Encode through SAE
-        X_full = self._encode_through_sae(X_raw)
+        if len(X_full) < 3:
+            raise ValueError(f"Need >= 3 samples, got {len(X_full)}")
 
         # Find top-K correlated features
         correlations = []
@@ -213,20 +228,18 @@ class ContrastiveSAE(BaseMethod):
         """
         Run inference with trained SAE probe.
 
-        data: {"X": ndarray [n, hidden_dim], "anecdote_ids": list}
+        data: {"X": ndarray [n, dict_size], "anecdote_ids": list}
+              (pre-encoded feature deltas from get_sae_probe_data)
         Returns list of dicts with predicted_switch_rate per anecdote.
         """
         if self._weights is None:
             raise RuntimeError("Not trained. Call train() first.")
 
-        X_raw = data["X"]
-        anecdote_ids = data.get("anecdote_ids", list(range(len(X_raw))))
-
-        # Encode through SAE
-        X_full = self._encode_through_sae(X_raw)
+        X_full = data["X"]
+        anecdote_ids = data.get("anecdote_ids", list(range(len(X_full))))
 
         results = []
-        for i in range(len(X_raw)):
+        for i in range(len(X_full)):
             selected = X_full[i, self._feature_indices]
             x_scaled = (selected - self._scaler_mean) / self._scaler_scale
             pred = float(np.dot(x_scaled, self._weights) + self._intercept)

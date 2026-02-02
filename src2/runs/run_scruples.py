@@ -107,6 +107,8 @@ def main():
             sae_trainer=SAE_TRAINER,
         ))
 
+    data_slice = scruples.get_sycophancy_slice()
+
     for m in methods:
         print(f"\n{'='*60}")
         print(f"Running: {m.name}")
@@ -116,10 +118,18 @@ def main():
         folder = m.get_folder()
 
         if isinstance(m, LlmMonitor):
-            monitor_data = scruples.get_monitor_data()
+            monitor_data = scruples.get_monitor_data(data_slice)
             m.infer(monitor_data)
-        elif isinstance(m, (LinearProbe, AttentionProbe, ContrastiveSAE)):
-            probe_data = scruples.get_probe_data(layer=LAYER)
+        elif isinstance(m, ContrastiveSAE):
+            sae_data = scruples.get_sae_probe_data(
+                layer=SAE_LAYER,
+                data_slice=data_slice,
+                encoder_fn=m._encode_and_pool,
+            )
+            m.train(sae_data)
+            m.infer(sae_data)
+        elif isinstance(m, (LinearProbe, AttentionProbe)):
+            probe_data = scruples.get_probe_data(layer=LAYER, data_slice=data_slice)
             m.train(probe_data)
             m.infer(probe_data)
 
