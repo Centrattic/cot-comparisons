@@ -13,7 +13,7 @@ from typing import List, Optional, Set
 
 @dataclass
 class DataSlice:
-    # Primary key filters
+    # instance attributes if type annotations, class atts otherwise
     ids: Optional[Set[str]] = None
     sentence_indices: Optional[Set[int]] = None
 
@@ -30,7 +30,11 @@ class DataSlice:
     def matches_sentence(self, idx: int) -> bool:
         return self.sentence_indices is None or idx in self.sentence_indices
 
-    def filter_paths(self, paths: List[Path], timestamp_pattern: str = r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}|\d{8}_\d{6}") -> List[Path]:
+    def filter_paths(
+        self,
+        paths: List[Path],
+        timestamp_pattern: str = r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}|\d{8}_\d{6}",
+    ) -> List[Path]:
         """Filter a list of file paths by timestamp directory names.
 
         If run_paths is set, intersects with those paths.
@@ -39,11 +43,17 @@ class DataSlice:
         """
         if self.run_paths is not None:
             run_path_strs = {str(p) for p in self.run_paths}
-            paths = [p for p in paths if any(str(p).startswith(rp) for rp in run_path_strs)]
+            paths = [
+                p for p in paths if any(str(p).startswith(rp) for rp in run_path_strs)
+            ]
 
         if self.timestamps is not None:
             ts_set = set(self.timestamps)
-            paths = [p for p in paths if self._path_has_timestamp(p, ts_set, timestamp_pattern)]
+            paths = [
+                p
+                for p in paths
+                if self._path_has_timestamp(p, ts_set, timestamp_pattern)
+            ]
 
         if self.latest_n is not None:
             all_timestamps = set()
@@ -53,9 +63,13 @@ class DataSlice:
                     if compiled.fullmatch(part):
                         all_timestamps.add(part)
             if all_timestamps:
-                latest = sorted(all_timestamps, reverse=True)[:self.latest_n]
+                latest = sorted(all_timestamps, reverse=True)[: self.latest_n]
                 latest_set = set(latest)
-                paths = [p for p in paths if self._path_has_timestamp(p, latest_set, timestamp_pattern)]
+                paths = [
+                    p
+                    for p in paths
+                    if self._path_has_timestamp(p, latest_set, timestamp_pattern)
+                ]
 
         return paths
 

@@ -234,8 +234,8 @@ class ResamplingTask(BaseTask):
 
     def prepare_for_probe(
         self, extractor, layer: int,
+        data_slice: DataSlice,
         token_position: str = "last_thinking",
-        data_slice: Optional[DataSlice] = None,
     ) -> Dict[str, Any]:
         """Prepare activation data for LinearProbe (soft_ce mode)."""
         data = self.get_data(load=True)
@@ -245,11 +245,11 @@ class ResamplingTask(BaseTask):
         samples = []
         for summary in data:
             question_id = summary["question_id"]
-            if data_slice is not None and not data_slice.matches_id(question_id):
+            if not data_slice.matches_id(question_id):
                 continue
             for sent in summary.get("sentence_summaries", []):
                 sentence_idx = sent["sentence_idx"]
-                if data_slice is not None and not data_slice.matches_sentence(sentence_idx):
+                if not data_slice.matches_sentence(sentence_idx):
                     continue
                 counts = sent.get("answer_counts", {})
                 total = sum(counts.values())
@@ -264,7 +264,7 @@ class ResamplingTask(BaseTask):
                 })
         return samples
 
-    def prepare_for_monitor(self, data_slice: Optional[DataSlice] = None) -> List[Dict]:
+    def prepare_for_monitor(self, data_slice: DataSlice) -> List[Dict]:
         """Prepare row dicts for LlmMonitor."""
         data = self.get_data(load=True)
         if data is None:
@@ -273,11 +273,11 @@ class ResamplingTask(BaseTask):
         rows = []
         for summary in data:
             question_id = summary["question_id"]
-            if data_slice is not None and not data_slice.matches_id(question_id):
+            if not data_slice.matches_id(question_id):
                 continue
             for sent in summary.get("sentence_summaries", []):
                 sentence_idx = sent["sentence_idx"]
-                if data_slice is not None and not data_slice.matches_sentence(sentence_idx):
+                if not data_slice.matches_sentence(sentence_idx):
                     continue
                 row = {
                     "question_id": question_id,
@@ -300,17 +300,17 @@ class ResamplingTask(BaseTask):
         self,
         model_name: str,
         layer: int,
-        token_position: str = "last_thinking",
+        data_slice: DataSlice,
         load_in_4bit: bool = False,
-        data_slice: Optional[DataSlice] = None,
     ) -> None:
         """
-        Extract and save activations for resampling runs.
+        Extract and save full-sequence activations for resampling runs.
 
-        Walks all resample_*.json files, extracts activations, and saves
-        them as companion .npz files.
+        Walks all resample_*.json files, extracts full [seq_len, hidden_dim]
+        activations plus token boundary indices, and saves them as
+        companion .npz files.
         """
-        from ...utils.activations import ActivationExtractor
+        from ...utils.activations import ActivationExtractor, compute_token_boundaries
 
         if not self.resampling_dir.exists():
             raise RuntimeError(f"No resampling data found at {self.resampling_dir}")
@@ -319,42 +319,42 @@ class ResamplingTask(BaseTask):
         if not run_files:
             raise RuntimeError(f"No resample run files found in {self.resampling_dir}")
 
-        if data_slice is not None:
-            run_files = data_slice.filter_paths(run_files)
-            filtered_files = []
-            for rp in run_files:
-                parts = rp.parts
-                question_id = None
-                sentence_idx = None
-                for part in parts:
-                    if part.startswith("sentence_"):
-                        try:
-                            sentence_idx = int(part.split("_", 1)[1])
-                        except ValueError:
-                            pass
-                try:
-                    resamp_idx = parts.index("resampling")
-                    if resamp_idx + 1 < len(parts):
-                        question_id = parts[resamp_idx + 1]
-                except ValueError:
-                    pass
-                if question_id is not None and not data_slice.matches_id(question_id):
-                    continue
-                if sentence_idx is not None and not data_slice.matches_sentence(sentence_idx):
-                    continue
-                filtered_files.append(rp)
-            run_files = filtered_files
+        run_files = data_slice.filter_paths(run_files)
+        filtered_files = []
+        for rp in run_files:
+            parts = rp.parts
+            question_id = None
+            sentence_idx = None
+            for part in parts:
+                if part.startswith("sentence_"):
+                    try:
+                        sentence_idx = int(part.split("_", 1)[1])
+                    except ValueError:
+                        pass
+            try:
+                resamp_idx = parts.index("resampling")
+                if resamp_idx + 1 < len(parts):
+                    question_id = parts[resamp_idx + 1]
+            except ValueError:
+                pass
+            if question_id is not None and not data_slice.matches_id(question_id):
+                continue
+            if sentence_idx is not None and not data_slice.matches_sentence(sentence_idx):
+                continue
+            filtered_files.append(rp)
+        run_files = filtered_files
 
         extractor = ActivationExtractor(
             model_name=model_name, load_in_4bit=load_in_4bit,
         )
-        act_key = f"layer{layer}_{token_position}"
+        seq_key = f"layer{layer}_full_sequence"
+        bnd_key = f"layer{layer}_boundaries"
 
         for run_path in tqdm(run_files, desc="Extracting activations (resampling)"):
             act_path = run_path.with_suffix(".npz")
             if act_path.exists():
                 with np.load(act_path) as f:
-                    if act_key in f.files:
+                    if seq_key in f.files:
                         continue
 
             with open(run_path) as f:
@@ -376,25 +376,23 @@ class ResamplingTask(BaseTask):
             full_text = full_prompt + full_response
 
             try:
-                if token_position == "last_thinking" and "</think>" in full_response:
-                    think_prefix = full_prompt + full_response.split("</think>")[0]
-                    think_tokens = extractor.tokenizer.encode(
-                        think_prefix, add_special_tokens=False,
-                    )
-                    token_idx = len(think_tokens) - 1
-                else:
-                    all_tokens = extractor.tokenizer.encode(
-                        full_text, add_special_tokens=False,
-                    )
-                    token_idx = len(all_tokens) - 1
+                act = extractor.extract_full_sequence(full_text, layer)
+                boundaries = compute_token_boundaries(
+                    extractor.tokenizer, full_prompt, full_response,
+                )
+                bnd_array = np.array([
+                    boundaries["last_input"],
+                    boundaries["last_thinking"],
+                    boundaries["last_response"],
+                ], dtype=np.int64)
 
-                act = extractor.extract_activation(full_text, layer, token_idx)
                 arrays = {}
                 if act_path.exists():
                     with np.load(act_path) as f:
                         for k in f.files:
                             arrays[k] = f[k]
-                arrays[act_key] = act
+                arrays[seq_key] = act
+                arrays[bnd_key] = bnd_array
                 np.savez(act_path, **arrays)
             except Exception:
                 continue
@@ -404,15 +402,22 @@ class ResamplingTask(BaseTask):
     def get_probe_data(
         self,
         layer: int,
+        data_slice: DataSlice,
         token_position: str = "last_thinking",
-        data_slice: Optional[DataSlice] = None,
     ) -> List[Dict]:
         """
         Load pre-extracted activations formatted for probes.
 
+        Args:
+            layer: Model layer to load activations from.
+            data_slice: Filter for question IDs and sentence indices.
+            token_position: One of "last_input", "last_thinking",
+                "last_response" (returns [hidden_dim] sliced from full
+                sequence), or "full_sequence" (returns [seq_len, hidden_dim]).
+
         Returns list of dicts:
             {
-                "activation": np.ndarray [hidden_dim],
+                "activation": np.ndarray [hidden_dim] or [seq_len, hidden_dim],
                 "answer_distribution": {"A": 0.3, "B": 0.5, ...},
                 "question_id": str,
                 "sentence_idx": int,
@@ -423,12 +428,14 @@ class ResamplingTask(BaseTask):
                 "answer": str,
             }
         """
-        act_key = f"layer{layer}_{token_position}"
+        seq_key = f"layer{layer}_full_sequence"
+        bnd_key = f"layer{layer}_boundaries"
+        legacy_key = f"layer{layer}_{token_position}"
+        boundary_names = ["last_input", "last_thinking", "last_response"]
 
         # Load sentence-level summaries to get answer distributions
         summary_files = sorted(self.resampling_dir.rglob("sentence_*/summary.json"))
-        if data_slice is not None:
-            summary_files = data_slice.filter_paths(summary_files)
+        summary_files = data_slice.filter_paths(summary_files)
 
         samples = []
         for summary_path in summary_files:
@@ -438,11 +445,10 @@ class ResamplingTask(BaseTask):
 
             question_id = summary.get("question_id", "")
             sentence_idx = summary.get("sentence_idx", -1)
-            if data_slice is not None:
-                if not data_slice.matches_id(question_id):
-                    continue
-                if not data_slice.matches_sentence(sentence_idx):
-                    continue
+            if not data_slice.matches_id(question_id):
+                continue
+            if not data_slice.matches_sentence(sentence_idx):
+                continue
             answer_counts = summary.get("answer_counts", {})
             total = sum(answer_counts.values())
             if total == 0:
@@ -454,9 +460,23 @@ class ResamplingTask(BaseTask):
             act_files = sorted(sentence_dir.glob("resample_*.npz"))
             for act_path in act_files:
                 with np.load(act_path) as f:
-                    if act_key not in f.files:
+                    if seq_key in f.files:
+                        full_seq = f[seq_key]
+                        boundaries = f[bnd_key]
+                        if token_position == "full_sequence":
+                            activation = full_seq
+                        elif token_position in boundary_names:
+                            idx = boundaries[boundary_names.index(token_position)]
+                            if idx < 0:
+                                continue
+                            activation = full_seq[idx]
+                        else:
+                            continue
+                    elif legacy_key in f.files:
+                        # Backwards compat: old single-token extractions
+                        activation = f[legacy_key]
+                    else:
                         continue
-                    activation = f[act_key]
 
                 # Load companion JSON for text data
                 json_path = act_path.with_suffix(".json")

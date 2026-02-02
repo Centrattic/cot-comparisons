@@ -10,6 +10,42 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 
+
+def compute_token_boundaries(tokenizer, full_prompt: str, raw_response: str) -> Dict[str, int]:
+    """Compute token boundary indices for prompt/thinking/response segments.
+
+    Args:
+        tokenizer: HuggingFace tokenizer instance.
+        full_prompt: The full prompt text (everything before the model's response).
+        raw_response: The model's raw response text.
+
+    Returns:
+        Dict with keys:
+            last_input: last token index of the prompt
+            last_thinking: last token index before </think> (-1 if no thinking block)
+            last_response: last token index of full text
+    """
+    full_text = full_prompt + raw_response
+
+    prompt_tokens = tokenizer.encode(full_prompt, add_special_tokens=False)
+    all_tokens = tokenizer.encode(full_text, add_special_tokens=False)
+
+    last_input = len(prompt_tokens) - 1
+    last_response = len(all_tokens) - 1
+
+    if "</think>" in raw_response:
+        think_prefix = full_prompt + raw_response.split("</think>")[0]
+        think_tokens = tokenizer.encode(think_prefix, add_special_tokens=False)
+        last_thinking = len(think_tokens) - 1
+    else:
+        last_thinking = -1
+
+    return {
+        "last_input": last_input,
+        "last_thinking": last_thinking,
+        "last_response": last_response,
+    }
+
 class ActivationExtractor:
     """
     Extracts residual stream activations from a causal LM at specific layers/positions.

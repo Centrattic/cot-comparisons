@@ -13,6 +13,7 @@ from src2.methods import LlmMonitor, LinearProbe
 from src2.tasks.resampled_response.prompts import ResamplingMonitorPrompt
 from src2.utils.questions import load_gpqa_questions
 from src2.utils.verification import ensure_verification
+from src2.data_slice import DataSlice
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -65,7 +66,7 @@ def main():
         resampling.extract_activations(
             model_name=ACTIVATION_MODEL,
             layer=LAYER,
-            token_position="last_thinking",
+            data_slice=DataSlice.all(),
         )
 
     methods = []

@@ -11,6 +11,7 @@ from pathlib import Path
 from src2.tasks import ScruplesTask
 from src2.methods import LlmMonitor, LinearProbe, AttentionProbe, ContrastiveSAE
 from src2.tasks.scruples.prompts import ScruplesBaseMonitorPrompt, ScruplesDiscriminationPrompt, ScruplesBaselinePrompt
+from src2.data_slice import DataSlice
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -66,8 +67,8 @@ def main():
         scruples.extract_activations(
             model_name=ACTIVATION_MODEL,
             layers=[LAYER],
-            token_positions=["last_thinking", "full_sequence"],
             load_in_4bit=LOAD_IN_4BIT,
+            data_slice=DataSlice.all(),
         )
 
     methods = []
