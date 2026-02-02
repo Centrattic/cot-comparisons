@@ -45,7 +45,7 @@ def main():
     if question:
         ensure_verification(
             question=question,
-            verification_dir=DATA_DIR / "verification",
+            verification_dir=PROJECT_ROOT / "data" / "verification_rollouts",
             model=SUBJECT_MODEL,
         )
 

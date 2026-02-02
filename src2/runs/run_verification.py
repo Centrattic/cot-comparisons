@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Run verification rollouts to generate source CoT data.
+Run initial rollouts to generate source CoT data.
 
-Produces the verification data that ForcingTask and ResamplingTask
+Produces the rollout data that ForcingTask and ResamplingTask
 consume via load_question_and_cot().
 
 Usage:
@@ -16,15 +16,13 @@ from src2.utils.verification import run_verification, ensure_verification
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = PROJECT_ROOT / "data" / "forced_response"
-VERIFICATION_DIR = DATA_DIR / "verification"
+VERIFICATION_DIR = PROJECT_ROOT / "data" / "verification_rollouts"
 
 MODEL = "moonshotai/kimi-k2-thinking"
 NUM_ROLLOUTS = 50
 TEMPERATURE = 0.7
 MAX_TOKENS = 8192
 MAX_WORKERS = 300
-THRESHOLD = 0.8
 
 # Question source: "sample_gpqa", "custom", or "gpqa_hf"
 QUESTION_SOURCE = "sample_gpqa"
@@ -43,31 +41,24 @@ def main():
     else:
         raise ValueError(f"Unknown QUESTION_SOURCE: {QUESTION_SOURCE}")
 
-    print(f"Verifying {len(questions)} questions (model={MODEL}, rollouts={NUM_ROLLOUTS})")
+    print(f"Running rollouts for {len(questions)} questions (model={MODEL}, rollouts={NUM_ROLLOUTS})")
     print(f"Data dir: {VERIFICATION_DIR}\n")
 
-    passed = 0
     for q in questions:
         summary = ensure_verification(
             question=q,
             verification_dir=VERIFICATION_DIR,
             num_rollouts=NUM_ROLLOUTS,
             model=MODEL,
-            threshold=THRESHOLD,
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
             max_workers=MAX_WORKERS,
         )
-        if summary:
-            rate = summary["agreement_rate"]
-            status = "PASS" if rate >= THRESHOLD else "FAIL"
-            print(f"  {q.id}: agreement={rate:.0%} {status}")
-            if rate >= THRESHOLD:
-                passed += 1
-        else:
-            print(f"  {q.id}: below threshold or failed")
+        rate = summary["agreement_rate"]
+        top = summary["most_common_answer"]
+        print(f"  {q.id}: agreement={rate:.0%} (most common: {top})")
 
-    print(f"\n{passed}/{len(questions)} questions passed verification (threshold={THRESHOLD:.0%})")
+    print(f"\nDone. Rollouts saved to {VERIFICATION_DIR}")
 
 
 if __name__ == "__main__":

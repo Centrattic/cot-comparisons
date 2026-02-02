@@ -20,6 +20,7 @@ import numpy as np
 from tqdm import tqdm
 
 from ..base import BaseTask
+from ...data_slice import DataSlice
 from ...utils.questions import GPQAQuestion, BinaryJudgeQuestion, Question
 from .prompts import get_cumulative_cot_segments
 
@@ -68,7 +69,7 @@ class ForcingTask(BaseTask):
         self.model = model
 
         # Sub-directories
-        self.verification_dir = self.data_dir / "verification"
+        self.verification_dir = self.data_dir.parent / "verification_rollouts"
         self.forcing_dir = self.data_dir / "forcing"
         self.monitor_forcing_dir = self.data_dir / "monitor_forcing"
 
@@ -234,6 +235,7 @@ class ForcingTask(BaseTask):
     def prepare_for_probe(
         self, extractor, layer: int,
         token_position: str = "last_thinking",
+        data_slice: Optional[DataSlice] = None,
     ) -> Dict[str, Any]:
         """Prepare activation data for LinearProbe (soft_ce mode)."""
         data = self.get_data(load=True)
@@ -242,7 +244,13 @@ class ForcingTask(BaseTask):
 
         samples = []
         for summary in data:
+            question_id = summary["question_id"]
+            if data_slice is not None and not data_slice.matches_id(question_id):
+                continue
             for sent in summary.get("sentence_summaries", []):
+                sentence_idx = sent["sentence_idx"]
+                if data_slice is not None and not data_slice.matches_sentence(sentence_idx):
+                    continue
                 # Each sentence result has answer distributions
                 counts = sent.get("answer_counts", {})
                 total = sum(counts.values())
@@ -250,14 +258,14 @@ class ForcingTask(BaseTask):
                     continue
                 dist = {k: v / total for k, v in counts.items()}
                 samples.append({
-                    "question_id": summary["question_id"],
-                    "sentence_idx": sent["sentence_idx"],
+                    "question_id": question_id,
+                    "sentence_idx": sentence_idx,
                     "answer_distribution": dist,
                     "question_type": summary.get("question_type", "multiple_choice"),
                 })
         return samples
 
-    def prepare_for_monitor(self) -> List[Dict]:
+    def prepare_for_monitor(self, data_slice: Optional[DataSlice] = None) -> List[Dict]:
         """Prepare row dicts for LlmMonitor."""
         data = self.get_data(load=True)
         if data is None:
@@ -265,12 +273,18 @@ class ForcingTask(BaseTask):
 
         rows = []
         for summary in data:
+            question_id = summary["question_id"]
+            if data_slice is not None and not data_slice.matches_id(question_id):
+                continue
             for sent in summary.get("sentence_summaries", []):
+                sentence_idx = sent["sentence_idx"]
+                if data_slice is not None and not data_slice.matches_sentence(sentence_idx):
+                    continue
                 row = {
-                    "question_id": summary["question_id"],
+                    "question_id": question_id,
                     "question_type": summary.get("question_type", "multiple_choice"),
                     "partial_cot": sent.get("partial_cot", ""),
-                    "sentence_idx": sent["sentence_idx"],
+                    "sentence_idx": sentence_idx,
                 }
                 if "correct_answer" in summary:
                     row["correct_answer"] = summary["correct_answer"]
@@ -289,6 +303,7 @@ class ForcingTask(BaseTask):
         layer: int,
         token_position: str = "last_thinking",
         load_in_4bit: bool = False,
+        data_slice: Optional[DataSlice] = None,
     ) -> None:
         """
         Extract and save activations for forcing runs.
@@ -305,10 +320,40 @@ class ForcingTask(BaseTask):
         if not run_files:
             raise RuntimeError(f"No force run files found in {self.forcing_dir}")
 
+        if data_slice is not None:
+            run_files = data_slice.filter_paths(run_files)
+
         extractor = ActivationExtractor(
             model_name=model_name, load_in_4bit=load_in_4bit,
         )
         act_key = f"layer{layer}_{token_position}"
+
+        if data_slice is not None:
+            filtered_files = []
+            for rp in run_files:
+                # Parse question_id and sentence_idx from path
+                parts = rp.parts
+                question_id = None
+                sentence_idx = None
+                for part in parts:
+                    if part.startswith("sentence_"):
+                        try:
+                            sentence_idx = int(part.split("_", 1)[1])
+                        except ValueError:
+                            pass
+                # question_id is the directory after "forcing"
+                try:
+                    forcing_idx = parts.index("forcing")
+                    if forcing_idx + 1 < len(parts):
+                        question_id = parts[forcing_idx + 1]
+                except ValueError:
+                    pass
+                if question_id is not None and not data_slice.matches_id(question_id):
+                    continue
+                if sentence_idx is not None and not data_slice.matches_sentence(sentence_idx):
+                    continue
+                filtered_files.append(rp)
+            run_files = filtered_files
 
         for run_path in tqdm(run_files, desc="Extracting activations (forcing)"):
             act_path = run_path.with_suffix(".npz")
@@ -365,6 +410,7 @@ class ForcingTask(BaseTask):
         self,
         layer: int,
         token_position: str = "last_thinking",
+        data_slice: Optional[DataSlice] = None,
     ) -> List[Dict]:
         """
         Load pre-extracted activations formatted for probes.
@@ -386,6 +432,8 @@ class ForcingTask(BaseTask):
 
         # Load sentence-level summaries to get answer distributions
         summary_files = sorted(self.forcing_dir.rglob("sentence_*/summary.json"))
+        if data_slice is not None:
+            summary_files = data_slice.filter_paths(summary_files)
 
         samples = []
         for summary_path in summary_files:
@@ -395,6 +443,11 @@ class ForcingTask(BaseTask):
 
             question_id = summary.get("question_id", "")
             sentence_idx = summary.get("sentence_idx", -1)
+            if data_slice is not None:
+                if not data_slice.matches_id(question_id):
+                    continue
+                if not data_slice.matches_sentence(sentence_idx):
+                    continue
             answer_counts = summary.get("answer_counts", {})
             total = sum(answer_counts.values())
             if total == 0:

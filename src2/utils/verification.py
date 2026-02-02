@@ -217,7 +217,6 @@ def compute_summary(question: Question, rollouts: List[Dict[str, Any]]) -> Dict[
         "most_common_answer": most_common[0],
         "most_common_count": most_common[1],
         "agreement_rate": agreement_rate,
-        "meets_threshold": agreement_rate >= 0.8,
     }
 
     if isinstance(question, GPQAQuestion):
@@ -307,7 +306,7 @@ def run_verification(
 
     if verification_dir is None:
         verification_dir = (
-            Path(__file__).parent.parent.parent / "data" / "forced_response" / "verification"
+            Path(__file__).parent.parent.parent / "data" / "verification_rollouts"
         )
 
     # Create timestamped run directory
@@ -401,38 +400,32 @@ def ensure_verification(
     verification_dir: Path,
     num_rollouts: int = 50,
     model: str = "moonshotai/kimi-k2-thinking",
-    threshold: float = 0.8,
     **kwargs,
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
-    Ensure verification data exists for a question.
+    Ensure verification (initial rollout) data exists for a question.
 
-    If a previous run exists and meets the agreement threshold, returns
-    its summary without re-running. Otherwise runs verification.
+    If a previous run already exists, returns its summary without
+    re-running. Otherwise runs rollouts and returns the new summary.
 
     Args:
-        question: The question to verify.
+        question: The question to run rollouts for.
         verification_dir: Root directory for verification data.
         num_rollouts: Number of rollouts (only used if running fresh).
         model: Tinker model identifier.
-        threshold: Minimum agreement rate to accept existing data.
         **kwargs: Passed through to run_verification().
 
     Returns:
-        Summary dict if verification succeeded, None if below threshold.
+        Summary dict with rollout statistics.
     """
     existing = _load_existing_summary(verification_dir, question.id)
-    if existing is not None and existing.get("agreement_rate", 0) >= threshold:
+    if existing is not None:
         return existing
 
-    summary = run_verification(
+    return run_verification(
         question=question,
         num_rollouts=num_rollouts,
         model=model,
         verification_dir=verification_dir,
         **kwargs,
     )
-
-    if summary.get("agreement_rate", 0) >= threshold:
-        return summary
-    return None
