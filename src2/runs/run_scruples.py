@@ -17,7 +17,7 @@ from src2.tasks import ScruplesTask
 from src2.tasks.scruples.prompts import (
     ScruplesBaseMonitorPrompt,
     ScruplesHighContextMonitorPrompt,
-    # ScruplesDiscriminationPrompt,
+    ScruplesDiscriminationPrompt,
     # ScruplesBaselinePrompt,
 )
 
@@ -48,10 +48,10 @@ GENERATE_DATA = False
 EXTRACT_ACTIVATIONS = False
 LOAD_IN_4BIT = False
 
-RUN_MONITOR = True
-RUN_HIGH_CONTEXT_MONITOR = True
+RUN_MONITOR = False
+RUN_HIGH_CONTEXT_MONITOR = False
 # RUN_BASELINE = True
-# RUN_DISCRIMINATION = True
+RUN_DISCRIMINATION = True
 # RUN_PROBE = True
 # RUN_ATTENTION_PROBE = True
 # RUN_SAE = True

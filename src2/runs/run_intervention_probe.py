@@ -21,10 +21,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src2.tasks import ScruplesTask
+from src2.data_slice import DataSlice
 from src2.methods import AttentionProbe
 from src2.methods.attention_probe import AttentionPoolingProbe
-from src2.data_slice import DataSlice
+from src2.tasks import ScruplesTask
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -46,9 +46,8 @@ EPOCHS = 100
 TEST_SPLIT = 0.2
 SEED = 42
 
-# Which steps to run
-EXTRACT_ACTIVATIONS = True
-# ──────────────────────────────────────────────────────────────────────
+# if false, training automatically uses whatever activations we have.
+EXTRACT_ACTIVATIONS = False
 
 
 def train_test_split_by_anecdote(
@@ -94,17 +93,20 @@ def train_and_evaluate(
     epochs: int = EPOCHS,
 ) -> dict:
     """Train probe on train set, evaluate on test set."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"  Using device: {device}")
+
     hidden_dim = train_X[0].shape[1]
 
     # Pad train set
     max_train_len = max(x.shape[0] for x in train_X)
-    X_train_pad = torch.zeros(len(train_X), max_train_len, hidden_dim)
-    mask_train = torch.zeros(len(train_X), max_train_len, dtype=torch.bool)
+    X_train_pad = torch.zeros(len(train_X), max_train_len, hidden_dim, device=device)
+    mask_train = torch.zeros(len(train_X), max_train_len, dtype=torch.bool, device=device)
     for i, x in enumerate(train_X):
         sl = x.shape[0]
-        X_train_pad[i, :sl, :] = torch.from_numpy(x)
+        X_train_pad[i, :sl, :] = torch.from_numpy(x).to(device)
         mask_train[i, :sl] = True
-    y_train_t = torch.tensor(train_y, dtype=torch.long)
+    y_train_t = torch.tensor(train_y, dtype=torch.long, device=device)
 
     # Train probe
     probe = AttentionPoolingProbe(
@@ -112,7 +114,7 @@ def train_and_evaluate(
         num_heads=num_heads,
         output_dim=NUM_CLASSES,
         max_seq_len=max_train_len,
-    )
+    ).to(device)
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
     loss_fn = nn.CrossEntropyLoss()
 
@@ -132,13 +134,13 @@ def train_and_evaluate(
     test_probs = []
     for x in test_X:
         seq_len = x.shape[0]
-        x_t = torch.from_numpy(x).float().unsqueeze(0)
-        m = torch.ones(1, seq_len, dtype=torch.bool)
+        x_t = torch.from_numpy(x).float().unsqueeze(0).to(device)
+        m = torch.ones(1, seq_len, dtype=torch.bool, device=device)
         with torch.no_grad():
             logits = probe(x_t, m)
             probs = torch.softmax(logits, dim=-1).squeeze(0)
         test_preds.append(int(probs.argmax().item()))
-        test_probs.append(probs.numpy())
+        test_probs.append(probs.cpu().numpy())
 
     return {
         "predictions": np.array(test_preds),
@@ -187,9 +189,9 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
 def print_results(metrics: dict, label: str = "Test Set"):
     """Pretty-print metrics."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  {label}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  Accuracy:        {metrics['accuracy']:.3f}")
     print(f"  Chance baseline: {metrics['chance_baseline']:.3f}")
     print(f"  N samples:       {metrics['n_samples']}")
@@ -260,11 +262,15 @@ def main():
         return
 
     # ── Step 4: Train/test split by anecdote ──────────────────────────
-    print(f"\nSplitting data ({1-TEST_SPLIT:.0%} train, {TEST_SPLIT:.0%} test)...")
+    print(f"\nSplitting data ({1 - TEST_SPLIT:.0%} train, {TEST_SPLIT:.0%} test)...")
     split = train_test_split_by_anecdote(X_list, y, anecdote_ids)
 
-    print(f"  Train: {len(split['train_X'])} samples from {split['n_train_anecdotes']} anecdotes")
-    print(f"  Test:  {len(split['test_X'])} samples from {split['n_test_anecdotes']} anecdotes")
+    print(
+        f"  Train: {len(split['train_X'])} samples from {split['n_train_anecdotes']} anecdotes"
+    )
+    print(
+        f"  Test:  {len(split['test_X'])} samples from {split['n_test_anecdotes']} anecdotes"
+    )
 
     # ── Step 5: Train and evaluate ────────────────────────────────────
     print("\nTraining attention probe...")
