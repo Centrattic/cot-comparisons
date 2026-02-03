@@ -1,10 +1,14 @@
 """
-CompressedCotTask — CoT compression via middle-50% sentence selection.
+CompressedCotTask — CoT compression via configurable region selection.
 
-Loads existing CoTs from verification rollouts, identifies the middle 50%
-of sentences, and prepares data for compression methods (LLM monitor,
-thought anchors). Evaluation forces the model with the compressed CoT
-and compares answer distributions to the full-CoT baseline.
+Loads existing CoTs from verification rollouts, identifies a configurable
+region (prefix or middle) of sentences, and prepares data for compression
+methods (LLM monitor, thought anchors). Evaluation forces the model with
+the compressed CoT and compares answer distributions to the full-CoT baseline.
+
+Supports two region types:
+  - "prefix": compress the first compress_pct of sentences
+  - "middle": compress the middle compress_pct of sentences
 """
 
 import contextlib
@@ -34,47 +38,50 @@ IM_END = "<|im_end|>"
 
 @dataclass
 class CompressionSpec:
-    """Specification for how to compress a CoT's middle section."""
+    """Specification for how to compress a CoT region."""
     question_id: str
     rollout_idx: int
     sentences: List[str]
-    middle_start: int
-    middle_end: int
+    region_start: int
+    region_end: int
+    region_type: str  # "prefix" or "middle"
     target_num_sentences: int
     char_budget: int
     compression_factor: int
+    original_token_count: int  # total token count of the original CoT
+    region_token_count: int  # token count of the original uncompressed region
 
     @property
-    def middle_sentences(self) -> List[str]:
-        return self.sentences[self.middle_start:self.middle_end]
+    def region_sentences(self) -> List[str]:
+        return self.sentences[self.region_start:self.region_end]
 
     @property
-    def first_quarter(self) -> str:
-        return " ".join(self.sentences[:self.middle_start])
+    def pre_region(self) -> str:
+        return " ".join(self.sentences[:self.region_start])
 
     @property
-    def last_quarter(self) -> str:
-        return " ".join(self.sentences[self.middle_end:])
+    def post_region(self) -> str:
+        return " ".join(self.sentences[self.region_end:])
 
     @property
     def full_cot(self) -> str:
         return " ".join(self.sentences)
 
-    def reconstruct(self, compressed_middle: str) -> str:
-        """Reconstruct full CoT with compressed middle section."""
+    def reconstruct(self, compressed_region: str) -> str:
+        """Reconstruct full CoT with compressed region."""
         parts = []
-        if self.first_quarter:
-            parts.append(self.first_quarter)
-        if compressed_middle:
-            parts.append(compressed_middle)
-        if self.last_quarter:
-            parts.append(self.last_quarter)
+        if self.pre_region:
+            parts.append(self.pre_region)
+        if compressed_region:
+            parts.append(compressed_region)
+        if self.post_region:
+            parts.append(self.post_region)
         return " ".join(parts)
 
     def reconstruct_from_indices(self, selected_indices: List[int]) -> str:
-        """Reconstruct full CoT keeping only selected middle sentences."""
-        middle = self.middle_sentences
-        kept = " ".join(middle[i] for i in sorted(selected_indices) if i < len(middle))
+        """Reconstruct full CoT keeping only selected region sentences."""
+        region = self.region_sentences
+        kept = " ".join(region[i] for i in sorted(selected_indices) if i < len(region))
         return self.reconstruct(kept)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -82,23 +89,27 @@ class CompressionSpec:
             "question_id": self.question_id,
             "rollout_idx": self.rollout_idx,
             "num_sentences": len(self.sentences),
-            "middle_start": self.middle_start,
-            "middle_end": self.middle_end,
-            "num_middle_sentences": len(self.middle_sentences),
+            "region_start": self.region_start,
+            "region_end": self.region_end,
+            "region_type": self.region_type,
+            "num_region_sentences": len(self.region_sentences),
             "target_num_sentences": self.target_num_sentences,
             "char_budget": self.char_budget,
             "compression_factor": self.compression_factor,
-            "middle_char_length": sum(len(s) for s in self.middle_sentences),
+            "original_token_count": self.original_token_count,
+            "region_token_count": self.region_token_count,
+            "region_char_length": sum(len(s) for s in self.region_sentences),
         }
 
 
 class CompressedCotTask(BaseTask):
     """
-    CoT compression task: compress the middle 50% of a CoT ~Nx.
+    CoT compression task: compress a configurable region of a CoT ~Nx.
 
-    Loads verified CoTs, splits into sentences, identifies the middle 50%,
-    and provides data for compression methods (LLM monitor sentence selection,
-    LLM summary rewrite, thought anchors adaptive resampling).
+    Loads verified CoTs, splits into sentences, identifies the region to
+    compress (prefix or middle), and provides data for compression methods
+    (LLM monitor sentence selection, LLM summary rewrite, thought anchors
+    adaptive resampling).
 
     Evaluation forces the model with the compressed CoT and compares
     answer distributions to the full-CoT baseline.
@@ -109,12 +120,16 @@ class CompressedCotTask(BaseTask):
         model: str,
         compression_factor: int = 10,
         char_limit_multiplier: float = 1.5,
+        compress_pct: float = 0.5,
+        region: str = "prefix",
         data_dir: Optional[Path] = None,
     ):
         super().__init__("compressed_cot", data_dir)
         self.model = model
         self.compression_factor = compression_factor
         self.char_limit_multiplier = char_limit_multiplier
+        self.compress_pct = compress_pct
+        self.region = region
 
         self.verification_dir = self.data_dir.parent / "verification_rollouts"
         self.compression_dir = self.data_dir / "compressions"
@@ -150,24 +165,50 @@ class CompressedCotTask(BaseTask):
             print(f"CoT too short ({n} sentences) to compress")
             return None
 
-        middle_start = n // 4
-        middle_end = (3 * n) // 4
-        middle_sentences = sentences[middle_start:middle_end]
-        num_middle = len(middle_sentences)
+        # Compute region boundaries based on region type
+        if self.region == "prefix":
+            region_start = 0
+            region_end = int(n * self.compress_pct)
+        elif self.region == "middle":
+            region_start = int(n * (1 - self.compress_pct) / 2)
+            region_end = int(n * (1 + self.compress_pct) / 2)
+        else:
+            raise ValueError(f"Unknown region type: {self.region!r}. Use 'prefix' or 'middle'.")
 
-        target_num_sentences = max(1, num_middle // self.compression_factor)
-        middle_char_length = sum(len(s) for s in middle_sentences)
-        char_budget = int(middle_char_length / self.compression_factor * self.char_limit_multiplier)
+        # Ensure at least 1 sentence in region
+        if region_end <= region_start:
+            region_end = region_start + 1
+
+        region_sentences = sentences[region_start:region_end]
+        num_region = len(region_sentences)
+
+        target_num_sentences = max(1, num_region // self.compression_factor)
+        region_char_length = sum(len(s) for s in region_sentences)
+        char_budget = int(region_char_length / self.compression_factor * self.char_limit_multiplier)
+
+        # Tokenize for token budget computation
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(self.model, trust_remote_code=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            original_tokens = tokenizer.encode(source_cot, add_special_tokens=False)
+            region_text = " ".join(region_sentences)
+            region_tokens = tokenizer.encode(region_text, add_special_tokens=False)
+
+        original_token_count = len(original_tokens)
+        region_token_count = len(region_tokens)
 
         spec = CompressionSpec(
             question_id=question_id,
             rollout_idx=rollout_idx,
             sentences=sentences,
-            middle_start=middle_start,
-            middle_end=middle_end,
+            region_start=region_start,
+            region_end=region_end,
+            region_type=self.region,
             target_num_sentences=target_num_sentences,
             char_budget=char_budget,
             compression_factor=self.compression_factor,
+            original_token_count=original_token_count,
+            region_token_count=region_token_count,
         )
 
         # Save spec and question data
@@ -187,9 +228,11 @@ class CompressedCotTask(BaseTask):
             json.dump(spec_data, f, indent=2)
 
         if verbose:
+            region_label = "Prefix" if self.region == "prefix" else "Middle"
             print(f"Compression spec for {question_id}:")
             print(f"  Total sentences: {n}")
-            print(f"  Middle 50%: sentences {middle_start}-{middle_end} ({num_middle} sentences)")
+            print(f"  {region_label} {self.compress_pct:.0%}: sentences {region_start}-{region_end} ({num_region} sentences)")
+            print(f"  Original tokens: {original_token_count}, Region tokens: {region_token_count}")
             print(f"  Target: {target_num_sentences} sentences, {char_budget} chars")
             print(f"  Saved to {run_dir}")
 
@@ -248,7 +291,7 @@ class CompressedCotTask(BaseTask):
         Prepare row dicts for LlmMonitor (sentence selection or summary).
 
         Returns one row per compression spec, containing all info the
-        prompt needs: question, full CoT, numbered middle sentences,
+        prompt needs: question, full CoT, numbered region sentences,
         compression targets, etc.
         """
         data = self.get_data(load=True)
@@ -258,9 +301,10 @@ class CompressedCotTask(BaseTask):
         rows = []
         for spec_data in data:
             sentences = spec_data["sentences"]
-            middle_start = spec_data["middle_start"]
-            middle_end = spec_data["middle_end"]
-            middle_sentences = sentences[middle_start:middle_end]
+            region_start = spec_data.get("region_start", spec_data.get("middle_start", 0))
+            region_end = spec_data.get("region_end", spec_data.get("middle_end", len(sentences)))
+            region_type = spec_data.get("region_type", "middle")
+            region_sentences = sentences[region_start:region_end]
 
             row = {
                 "question_id": spec_data["question_id"],
@@ -268,13 +312,16 @@ class CompressedCotTask(BaseTask):
                 "question": spec_data.get("question", ""),
                 "full_cot": " ".join(sentences),
                 "sentences": sentences,
-                "middle_sentences": middle_sentences,
-                "middle_start_idx": middle_start,
-                "middle_end_idx": middle_end,
+                "region_sentences": region_sentences,
+                "region_start_idx": region_start,
+                "region_end_idx": region_end,
+                "region_type": region_type,
                 "target_num_sentences": spec_data["target_num_sentences"],
                 "char_budget": spec_data["char_budget"],
                 "compression_factor": spec_data["compression_factor"],
                 "rollout_idx": spec_data.get("rollout_idx", 0),
+                "original_token_count": spec_data.get("original_token_count", 0),
+                "region_token_count": spec_data.get("region_token_count", 0),
             }
             if "choices" in spec_data:
                 row["choices"] = spec_data["choices"]
@@ -304,7 +351,7 @@ class CompressedCotTask(BaseTask):
         question_id: str,
         rollout_idx: int,
         compressed_cot: str,
-        num_resamples: int = 20,
+        num_resamples: int = 50,
         temperature: float = 0.7,
         max_tokens: int = 2048,
         verbose: bool = True,
@@ -312,8 +359,15 @@ class CompressedCotTask(BaseTask):
         """
         Force model with compressed CoT and return answer distribution.
 
-        Runs num_resamples continuations from the compressed CoT prefix
-        via Tinker, extracts answers, and returns the distribution.
+        For prefix region_type: two-step generation —
+          1. Force compressed prefix, generate exactly continuation_budget
+             thinking tokens (original_token_count - region_token_count).
+          2. Append </think> to the output, then generate the answer.
+
+        For middle region_type: forces with pre_region + compressed_middle +
+        post_region, uses the provided max_tokens (original behavior).
+
+        Runs num_resamples continuations, extracts answers, returns distribution.
         """
         from tinker import ServiceClient, types
         from transformers import AutoTokenizer
@@ -323,10 +377,21 @@ class CompressedCotTask(BaseTask):
             raise RuntimeError(f"Could not load question for {question_id}")
         question, _ = loaded
 
+        # Load the spec to get region_type and token counts
+        spec_data = self._load_latest_spec(question_id, rollout_idx)
+        region_type = spec_data.get("region_type", "middle") if spec_data else "middle"
+
         tokenizer = AutoTokenizer.from_pretrained(self.model, trust_remote_code=True)
         client = ServiceClient()
         sampling_client = client.create_sampling_client(base_model=self.model)
-        params = types.SamplingParams(max_tokens=max_tokens, temperature=temperature)
+
+        # Compute continuation budget for prefix mode
+        continuation_budget = None
+        if region_type == "prefix" and spec_data:
+            original_token_count = spec_data.get("original_token_count", 0)
+            region_token_count = spec_data.get("region_token_count", 0)
+            if original_token_count > 0 and region_token_count > 0:
+                continuation_budget = original_token_count - region_token_count
 
         prompt_str = (
             f"{IM_SYSTEM}system{IM_MIDDLE}You are Kimi, an AI assistant created by Moonshot AI.{IM_END}"
@@ -334,16 +399,54 @@ class CompressedCotTask(BaseTask):
             f"{IM_ASSISTANT}assistant{IM_MIDDLE}<think>{compressed_cot}"
         )
 
+        # Precompute </think> tokens for prefix two-step generation
+        with contextlib.redirect_stdout(io.StringIO()):
+            end_think_tokens = tokenizer.encode("</think>", add_special_tokens=False)
+
+        ANSWER_MAX_TOKENS = 256
+
         def run_single(idx: int) -> Optional[str]:
             with contextlib.redirect_stdout(io.StringIO()):
                 tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
-            model_input = types.ModelInput.from_ints(tokens)
-            result = sampling_client.sample(
-                prompt=model_input, num_samples=1, sampling_params=params,
-            ).result()
-            sample_tokens = result.sequences[0].tokens
-            answer, _, _ = self._extract_answer(sample_tokens, tokenizer, question)
-            return answer if answer else None
+
+            if region_type == "prefix" and continuation_budget is not None:
+                # Step 1: generate exactly continuation_budget thinking tokens
+                think_params = types.SamplingParams(
+                    max_tokens=continuation_budget, temperature=temperature,
+                )
+                model_input = types.ModelInput.from_ints(tokens)
+                think_result = sampling_client.sample(
+                    prompt=model_input, num_samples=1, sampling_params=think_params,
+                ).result()
+                think_tokens = list(think_result.sequences[0].tokens)
+
+                # Step 2: append </think> and generate the answer
+                full_prefix_tokens = tokens + think_tokens + end_think_tokens
+                answer_params = types.SamplingParams(
+                    max_tokens=ANSWER_MAX_TOKENS, temperature=temperature,
+                )
+                answer_input = types.ModelInput.from_ints(full_prefix_tokens)
+                answer_result = sampling_client.sample(
+                    prompt=answer_input, num_samples=1, sampling_params=answer_params,
+                ).result()
+                answer_tokens = answer_result.sequences[0].tokens
+
+                # Extract answer from the response-only tokens (after </think>)
+                answer_text = tokenizer.decode(answer_tokens, skip_special_tokens=True).strip()
+                answer = self._extract_answer_from_text(answer_text, question)
+                return answer if answer else None
+            else:
+                # Middle mode: single-step generation (original behavior)
+                params = types.SamplingParams(
+                    max_tokens=max_tokens, temperature=temperature,
+                )
+                model_input = types.ModelInput.from_ints(tokens)
+                result = sampling_client.sample(
+                    prompt=model_input, num_samples=1, sampling_params=params,
+                ).result()
+                sample_tokens = result.sequences[0].tokens
+                answer, _, _ = self._extract_answer(sample_tokens, tokenizer, question)
+                return answer if answer else None
 
         answers = []
         with ThreadPoolExecutor(max_workers=min(300, num_resamples)) as executor:
@@ -372,19 +475,24 @@ class CompressedCotTask(BaseTask):
             "distribution": distribution,
             "most_common": most_common[0],
             "agreement_rate": most_common[1] / total if total > 0 else 0,
+            "region_type": region_type,
+            "continuation_budget": continuation_budget,
         }
 
     def get_baseline_distribution(
         self,
         question_id: str,
         rollout_idx: int = 0,
-        num_resamples: int = 20,
+        num_resamples: int = 50,
         temperature: float = 0.7,
         max_tokens: int = 2048,
         verbose: bool = True,
     ) -> Dict[str, Any]:
         """
         Get baseline answer distribution by forcing with the full CoT.
+
+        For prefix mode, forces with the full original CoT at the same
+        token budget to get baseline distribution.
         """
         loaded = self.load_question_and_cot(question_id, rollout_idx)
         if loaded is None:
@@ -477,6 +585,17 @@ class CompressedCotTask(BaseTask):
                     return json.load(f)
         return None
 
+    def _load_latest_spec(self, question_id: str, rollout_idx: int) -> Optional[Dict]:
+        """Load the latest compression_spec.json for a question/rollout."""
+        base = self.compression_dir / question_id / f"rollout_{rollout_idx:03d}"
+        if not base.exists():
+            return None
+        specs = sorted(base.rglob("compression_spec.json"), reverse=True)
+        if not specs:
+            return None
+        with open(specs[0]) as f:
+            return json.load(f)
+
     # ------------------------------------------------------------------
     # Internal helpers (shared with ResamplingTask)
     # ------------------------------------------------------------------
@@ -503,6 +622,24 @@ class CompressedCotTask(BaseTask):
         labels = [chr(ord("A") + i) for i in range(len(question.choices))]
         choices = "\n".join(f"{l}. {c}" for l, c in zip(labels, question.choices))
         return f"{question.question}\n\n{choices}\n\nAnswer with just the letter (A, B, C, or D)."
+
+    @staticmethod
+    def _extract_answer_from_text(answer_text: str, question: Question) -> str:
+        """Extract answer from already-decoded text (after </think>)."""
+        if isinstance(question, BinaryJudgeQuestion):
+            upper = answer_text.upper()
+            if "YES" in upper:
+                return "YES"
+            if "NO" in upper:
+                return "NO"
+            return ""
+        clean = answer_text.upper().rstrip(".").strip()
+        if clean in ["A", "B", "C", "D"]:
+            return clean
+        match = re.search(r"\b([A-D])\b", answer_text)
+        if match:
+            return match.group(1).upper()
+        return ""
 
     @staticmethod
     def _extract_answer(tokens, tokenizer, question: Question):

@@ -20,14 +20,15 @@ CUSTOM_QUESTIONS_FILE = (
 questions = load_custom_questions(CUSTOM_QUESTIONS_FILE)
 
 for q in questions:
-    summary = ensure_verification(
-        question=q,
-        verification_dir=VERIFICATION_DIR,
-        num_rollouts=NUM_ROLLOUTS,
-        model=MODEL,
-        temperature=TEMPERATURE,
-        max_tokens=MAX_TOKENS,
-        max_workers=MAX_WORKERS,
-    )
+    if q.id == "starfish":
+        summary = ensure_verification(
+            question=q,
+            verification_dir=VERIFICATION_DIR,
+            num_rollouts=NUM_ROLLOUTS,
+            model=MODEL,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            max_workers=MAX_WORKERS,
+        )
 
-    print(summary)
+        print(summary)

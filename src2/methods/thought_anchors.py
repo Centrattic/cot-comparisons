@@ -117,8 +117,8 @@ class ThoughtAnchors(BaseMethod):
     ) -> Dict:
         """Process a single compression spec: baseline + per-sentence importance."""
         sentences = row["sentences"]
-        middle_start = row.get("middle_start_idx", row.get("middle_start", 0))
-        middle_end = row.get("middle_end_idx", row.get("middle_end", len(sentences)))
+        middle_start = row.get("region_start_idx", row.get("middle_start_idx", row.get("middle_start", 0)))
+        middle_end = row.get("region_end_idx", row.get("middle_end_idx", row.get("middle_end", len(sentences))))
         target_n = row.get("target_num_sentences", 5)
         char_budget = row.get("char_budget", 1000)
         question_text = row.get("question", "")

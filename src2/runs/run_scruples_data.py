@@ -15,18 +15,15 @@ MONITOR_MODEL = "openai/gpt-5.2"
 ACTIVATION_MODEL = "Qwen/Qwen3-32B"
 LAYER = 32
 
-VARIANTS: List[VariantType] = [
-    "suggest_wrong",
-    "suggest_right",
-    "first_person",
-]  # "first_person",
+VARIANTS: List[VariantType] = ["suggest_wrong", "suggest_right"]
+
 NUM_SAMPLES = 50
-ADD_PROMPTS = 150
+ADD_PROMPTS = 200
 MAX_WORKERS = 500
 LOAD_IN_4BIT = True
 
 v: VariantType
-for v in VARIANTS:
+for v in VARIANTS[1:]:
     print(v)
     scruples = ScruplesTask(
         subject_model=SUBJECT_MODEL,
@@ -37,16 +34,15 @@ for v in VARIANTS:
 
     assert scruples.get_data()
 
-    if not scruples.get_data():
-        for split in ["dev", "train"]:
-            scruples.run_data(
-                data_dir=SCRUPLES_DATA_DIR,
-                num_samples=NUM_SAMPLES,
-                max_prompts=ADD_PROMPTS,
-                add=True,
-                split=split,
-                consensus_threshold=0.0,
-            )
+    # if not scruples.get_data():
+    for split in ["dev", "train"]:
+        scruples.run_data(
+            data_dir=SCRUPLES_DATA_DIR,
+            num_samples=NUM_SAMPLES,
+            max_prompts=ADD_PROMPTS,
+            split=split,
+            consensus_threshold=0.0,
+        )
 
     data_slice = scruples.get_sycophancy_slice()
 
