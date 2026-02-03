@@ -43,6 +43,7 @@ NUM_CLASSES = 3
 NUM_HEADS = 4
 LR = 1e-3
 EPOCHS = 100
+BATCH_SIZE = 8  # Reduce if OOM, increase for faster training
 TEST_SPLIT = 0.2
 SEED = 42
 
@@ -91,22 +92,15 @@ def train_and_evaluate(
     num_heads: int = NUM_HEADS,
     lr: float = LR,
     epochs: int = EPOCHS,
+    batch_size: int = BATCH_SIZE,
 ) -> dict:
     """Train probe on train set, evaluate on test set."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  Using device: {device}")
+    print(f"  Using device: {device}, batch_size: {batch_size}")
 
     hidden_dim = train_X[0].shape[1]
-
-    # Pad train set
     max_train_len = max(x.shape[0] for x in train_X)
-    X_train_pad = torch.zeros(len(train_X), max_train_len, hidden_dim, device=device)
-    mask_train = torch.zeros(len(train_X), max_train_len, dtype=torch.bool, device=device)
-    for i, x in enumerate(train_X):
-        sl = x.shape[0]
-        X_train_pad[i, :sl, :] = torch.from_numpy(x).to(device)
-        mask_train[i, :sl] = True
-    y_train_t = torch.tensor(train_y, dtype=torch.long, device=device)
+    n_samples = len(train_X)
 
     # Train probe
     probe = AttentionPoolingProbe(
@@ -120,13 +114,39 @@ def train_and_evaluate(
 
     probe.train()
     for epoch in range(epochs):
-        optimizer.zero_grad()
-        pred = probe(X_train_pad, mask_train)
-        loss = loss_fn(pred, y_train_t)
-        loss.backward()
-        optimizer.step()
+        # Shuffle indices each epoch
+        perm = np.random.permutation(n_samples)
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for start in range(0, n_samples, batch_size):
+            end = min(start + batch_size, n_samples)
+            batch_idx = perm[start:end]
+
+            # Pad batch (only to max length in this batch)
+            batch_X = [train_X[i] for i in batch_idx]
+            batch_y = train_y[batch_idx]
+            batch_max_len = max(x.shape[0] for x in batch_X)
+
+            X_pad = torch.zeros(len(batch_X), batch_max_len, hidden_dim, device=device)
+            mask = torch.zeros(len(batch_X), batch_max_len, dtype=torch.bool, device=device)
+            for i, x in enumerate(batch_X):
+                sl = x.shape[0]
+                X_pad[i, :sl, :] = torch.from_numpy(x).to(device)
+                mask[i, :sl] = True
+            y_t = torch.tensor(batch_y, dtype=torch.long, device=device)
+
+            optimizer.zero_grad()
+            pred = probe(X_pad, mask)
+            loss = loss_fn(pred, y_t)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
         if (epoch + 1) % 20 == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}, loss: {loss.item():.4f}")
+            print(f"  Epoch {epoch + 1}/{epochs}, loss: {epoch_loss / n_batches:.4f}")
 
     # Evaluate on test set
     probe.eval()
@@ -146,7 +166,7 @@ def train_and_evaluate(
         "predictions": np.array(test_preds),
         "probabilities": np.array(test_probs),
         "true_labels": test_y,
-        "final_train_loss": float(loss.item()),
+        "final_train_loss": float(epoch_loss / n_batches),
     }
 
 
