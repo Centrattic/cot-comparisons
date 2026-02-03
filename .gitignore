@@ -1,3 +1,9 @@
 scruples/
 .env
-data/
+data_prev/
+*.npz
+scruples_download/
+.claude/
+.pytest_cache/
+src
+plots

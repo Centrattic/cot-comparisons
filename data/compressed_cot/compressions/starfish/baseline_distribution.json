@@ -1,0 +1,17 @@
+{
+  "question_id": "starfish",
+  "num_resamples": 50,
+  "valid_answers": 45,
+  "answer_counts": {
+    "B": 33,
+    "A": 12
+  },
+  "distribution": {
+    "B": 0.7333333333333333,
+    "A": 0.26666666666666666
+  },
+  "most_common": "B",
+  "agreement_rate": 0.7333333333333333,
+  "region_type": "prefix",
+  "continuation_budget": 859
+}

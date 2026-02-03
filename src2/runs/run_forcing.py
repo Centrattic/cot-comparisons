@@ -65,12 +65,11 @@ for qid in question_ids:
 assert forcing.get_data()
 
 # extract activations for white box methods
-# if EXTRACT_ACTIVATIONS:
-#     forcing.extract_activations(
-#         model_name=ACTIVATION_MODEL,
-#         layer=LAYER,
-#         data_slice=DataSlice.all(),
-#     )
+forcing.extract_activations(
+    model_name=ACTIVATION_MODEL,
+    layer=LAYER,
+    data_slice=DataSlice.all(),
+)
 
 methods = []
 methods.append(LlmMonitor(prompt=ForcingMonitorPrompt(), model=MONITOR_MODEL))

@@ -1,0 +1,52 @@
+{
+  "selected_indices": [
+    7,
+    11,
+    39,
+    40,
+    45
+  ],
+  "relative_indices": [
+    7,
+    11,
+    39,
+    40,
+    45
+  ],
+  "compressed_distribution": {
+    "question_id": "starfish",
+    "num_resamples": 50,
+    "valid_answers": 50,
+    "answer_counts": {
+      "B": 49,
+      "C": 1
+    },
+    "distribution": {
+      "B": 0.98,
+      "C": 0.02
+    },
+    "most_common": "B",
+    "agreement_rate": 0.98,
+    "region_type": "prefix",
+    "continuation_budget": 240
+  },
+  "baseline_distribution": {
+    "question_id": "starfish",
+    "num_resamples": 50,
+    "valid_answers": 45,
+    "answer_counts": {
+      "B": 33,
+      "A": 12
+    },
+    "distribution": {
+      "B": 0.7333333333333333,
+      "A": 0.26666666666666666
+    },
+    "most_common": "B",
+    "agreement_rate": 0.7333333333333333,
+    "region_type": "prefix",
+    "continuation_budget": 859
+  },
+  "js_divergence": 0.10826010281184037,
+  "agreement": 1.0
+}

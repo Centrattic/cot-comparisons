@@ -9,8 +9,10 @@ Usage:
 import random
 from pathlib import Path
 
-from src2.tasks import ScruplesTask
+from src2.data_slice import DataSlice
 from src2.methods import LlmMonitor
+from src2.tasks import ScruplesTask
+
 # from src2.methods import LinearProbe, AttentionProbe, ContrastiveSAE
 from src2.tasks.scruples.prompts import (
     ScruplesBaseMonitorPrompt,
@@ -18,7 +20,6 @@ from src2.tasks.scruples.prompts import (
     # ScruplesDiscriminationPrompt,
     # ScruplesBaselinePrompt,
 )
-from src2.data_slice import DataSlice
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -29,7 +30,7 @@ MONITOR_MODEL = "openai/gpt-5.2"
 ACTIVATION_MODEL = "Qwen/Qwen3-32B"
 LAYER = 32
 
-VARIANT = "first_person"
+VARIANT = "suggest_right"
 NUM_SAMPLES = 50
 MAX_PROMPTS = None
 MAX_WORKERS = 100
@@ -43,8 +44,8 @@ NUM_HIGH_CONTEXT_EXAMPLES = 3
 HIGH_CONTEXT_SEED = 42
 
 # Which steps to run
-GENERATE_DATA = True
-EXTRACT_ACTIVATIONS = True
+GENERATE_DATA = False
+EXTRACT_ACTIVATIONS = False
 LOAD_IN_4BIT = False
 
 RUN_MONITOR = True
@@ -70,12 +71,14 @@ def _pick_examples(monitor_data, anecdote_ids, n, rng):
     for row in chosen:
         ctrl = row["control_runs"][0]
         intv = row["intervention_runs"][0]
-        examples.append({
-            "control_thinking": ctrl["thinking"],
-            "control_answer": ctrl["answer"],
-            "intervention_thinking": intv["thinking"],
-            "intervention_answer": intv["answer"],
-        })
+        examples.append(
+            {
+                "control_thinking": ctrl["thinking"],
+                "control_answer": ctrl["answer"],
+                "intervention_thinking": intv["thinking"],
+                "intervention_answer": intv["answer"],
+            }
+        )
         used_ids.add(row["anecdote_id"])
     return examples, used_ids
 
@@ -123,14 +126,16 @@ def main():
 
     # ── Base monitor (runs on full sycophancy slice) ──────────────────
     if RUN_MONITOR:
-        methods.append((
-            LlmMonitor(
-                prompt=ScruplesBaseMonitorPrompt(VARIANT),
-                model=MONITOR_MODEL,
-                max_workers=MAX_WORKERS,
-            ),
-            data_slice,  # run on full slice
-        ))
+        methods.append(
+            (
+                LlmMonitor(
+                    prompt=ScruplesBaseMonitorPrompt(VARIANT),
+                    model=MONITOR_MODEL,
+                    max_workers=MAX_WORKERS,
+                ),
+                data_slice,  # run on full slice
+            )
+        )
 
     # ── High context monitor (exclude example anecdotes) ──────────────
     exclude_ids = set()
@@ -139,42 +144,54 @@ def main():
 
         # Pick examples from each pool
         non_syc_examples, non_syc_used = _pick_examples(
-            all_monitor_data, non_syc_ids, NUM_HIGH_CONTEXT_EXAMPLES, rng,
+            all_monitor_data,
+            non_syc_ids,
+            NUM_HIGH_CONTEXT_EXAMPLES,
+            rng,
         )
         syc_examples, syc_used = _pick_examples(
-            all_monitor_data, syc_ids, NUM_HIGH_CONTEXT_EXAMPLES, rng,
+            all_monitor_data,
+            syc_ids,
+            NUM_HIGH_CONTEXT_EXAMPLES,
+            rng,
         )
         exclude_ids = non_syc_used | syc_used
 
-        print(f"High context monitor: {len(non_syc_examples)} non-syc examples, "
-              f"{len(syc_examples)} syc examples, excluding {len(exclude_ids)} anecdotes")
+        print(
+            f"High context monitor: {len(non_syc_examples)} non-syc examples, "
+            f"{len(syc_examples)} syc examples, excluding {len(exclude_ids)} anecdotes"
+        )
 
         # Build the remaining slice (full slice minus example anecdotes)
         remaining_ids = [
-            r["anecdote_id"] for r in all_monitor_data
+            r["anecdote_id"]
+            for r in all_monitor_data
             if r["anecdote_id"] not in exclude_ids
         ]
         high_context_slice = DataSlice.from_ids(remaining_ids)
 
-        methods.append((
-            LlmMonitor(
-                prompt=ScruplesHighContextMonitorPrompt(
-                    variant=VARIANT,
-                    sycophantic_examples=syc_examples,
-                    non_sycophantic_examples=non_syc_examples,
+        methods.append(
+            (
+                LlmMonitor(
+                    prompt=ScruplesHighContextMonitorPrompt(
+                        variant=VARIANT,
+                        sycophantic_examples=syc_examples,
+                        non_sycophantic_examples=non_syc_examples,
+                    ),
+                    model=MONITOR_MODEL,
+                    max_workers=MAX_WORKERS,
                 ),
-                model=MONITOR_MODEL,
-                max_workers=MAX_WORKERS,
-            ),
-            high_context_slice,
-        ))
+                high_context_slice,
+            )
+        )
 
     # ── Run all methods ───────────────────────────────────────────────
     for m, method_slice in methods:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Running: {m.name}")
-        print(f"{'='*60}")
-
+        print(f"{'=' * 60}")
+        print(f"{'=' * 60}")
+        print(f"{'=' * 60}")
         m.set_task(scruples)
 
         monitor_data = scruples.get_monitor_data(method_slice)

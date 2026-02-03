@@ -1,0 +1,11 @@
+{
+  "model": "Qwen/Qwen3-32B",
+  "question_id": "custom_bagel_001",
+  "question_type": "multiple_choice",
+  "num_rollouts": 25,
+  "temperature": 0.7,
+  "max_tokens": 8192,
+  "max_workers": 250,
+  "timestamp": "2026-02-01T23:07:24.605700",
+  "run_type": "verification"
+}

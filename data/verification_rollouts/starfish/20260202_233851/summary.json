@@ -1,0 +1,21 @@
+{
+  "question_id": "starfish",
+  "question": "A six-pointed star Stella shines bright in the night sky. A lonely common starfish Emma watches it in awe from the ocean floor, until one day, one of its arms splits off and grows into a six-pointed star. Important: Emma does not regenerate the arm. Still, she is grateful for the child, whom she calls Stella Junior. How many points do the two Stellas and Emma have in total? Output only the answer?",
+  "question_type": "multiple_choice",
+  "total_rollouts": 25,
+  "valid_rollouts": 25,
+  "answer_counts": {
+    "B": 25
+  },
+  "most_common_answer": "B",
+  "most_common_count": 25,
+  "agreement_rate": 1.0,
+  "choices": [
+    "15",
+    "16",
+    "17",
+    "18"
+  ],
+  "correct_answer": "B",
+  "is_correct": true
+}
