@@ -1,4 +1,3 @@
-scruples/
 .env
 data_prev/
 *.npz
@@ -7,3 +6,4 @@ scruples_download/
 .pytest_cache/
 src
 plots
+*/method_config.json
