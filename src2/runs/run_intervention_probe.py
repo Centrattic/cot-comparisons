@@ -42,7 +42,7 @@ NUM_CLASSES = 3
 # Training hyperparameters
 NUM_HEADS = 4
 LR = 1e-3
-EPOCHS = 100
+EPOCHS = 20
 BATCH_SIZE = 8  # Reduce if OOM, increase for faster training
 TEST_SPLIT = 0.2
 SEED = 42
@@ -99,7 +99,10 @@ def train_and_evaluate(
     print(f"  Using device: {device}, batch_size: {batch_size}")
 
     hidden_dim = train_X[0].shape[1]
-    max_train_len = max(x.shape[0] for x in train_X)
+    max_seq_len = max(
+        max(x.shape[0] for x in train_X),
+        max(x.shape[0] for x in test_X),
+    )
     n_samples = len(train_X)
 
     # Train probe
@@ -107,7 +110,7 @@ def train_and_evaluate(
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         output_dim=NUM_CLASSES,
-        max_seq_len=max_train_len,
+        max_seq_len=max_seq_len,
     ).to(device)
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
     loss_fn = nn.CrossEntropyLoss()
@@ -145,7 +148,7 @@ def train_and_evaluate(
             epoch_loss += loss.item()
             n_batches += 1
 
-        if (epoch + 1) % 20 == 0:
+        if (epoch + 1) % 5 == 0:
             print(f"  Epoch {epoch + 1}/{epochs}, loss: {epoch_loss / n_batches:.4f}")
 
     # Evaluate on test set

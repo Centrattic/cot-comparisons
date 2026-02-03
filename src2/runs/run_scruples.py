@@ -48,14 +48,42 @@ GENERATE_DATA = False
 EXTRACT_ACTIVATIONS = False
 LOAD_IN_4BIT = False
 
-RUN_MONITOR = False
-RUN_HIGH_CONTEXT_MONITOR = False
+RUN_MONITOR = True
+RUN_HIGH_CONTEXT_MONITOR = True
 # RUN_BASELINE = True
 RUN_DISCRIMINATION = True
 # RUN_PROBE = True
 # RUN_ATTENTION_PROBE = True
 # RUN_SAE = True
 # ──────────────────────────────────────────────────────────────────────
+
+
+def _flatten_monitor_data(monitor_data):
+    """Flatten monitor data to one row per intervention run.
+
+    Takes the aggregated monitor_data (one row per anecdote with control_runs
+    and intervention_runs lists) and returns a flat list with one row per
+    intervention run, including the thinking and metadata needed for monitors.
+    """
+    flat_rows = []
+    for row in monitor_data:
+        if not row["intervention_runs"]:
+            continue
+
+        for run_idx, intv_run in enumerate(row["intervention_runs"]):
+            flat_rows.append({
+                "anecdote_id": row["anecdote_id"],
+                "run_idx": run_idx,
+                "thinking": intv_run["thinking"],
+                "answer": intv_run["answer"],
+                "switch_rate": row.get("switch_rate", 0.0),
+                "title": row.get("title", ""),
+                "text": row.get("text", ""),
+                "author_is_wrong": row.get("author_is_wrong", False),
+                "variant": row.get("variant", ""),
+            })
+
+    return flat_rows
 
 
 def _pick_examples(monitor_data, anecdote_ids, n, rng):
@@ -86,7 +114,10 @@ def _pick_examples(monitor_data, anecdote_ids, n, rng):
 def _prepare_discrimination_data(monitor_data, rng):
     """Prepare data for discrimination monitor.
 
-    For each anecdote, randomly assigns control/intervention to A/B.
+    For each anecdote, pairs each control run with the corresponding intervention run
+    (by index), randomly assigning to A/B. This gives N pairs per anecdote where N
+    is the number of runs per arm.
+
     Returns list of dicts with thinking_a, thinking_b, actual_intervention (A or B),
     plus metadata for evaluation.
     """
@@ -95,28 +126,34 @@ def _prepare_discrimination_data(monitor_data, rng):
         if not row["control_runs"] or not row["intervention_runs"]:
             continue
 
-        ctrl = row["control_runs"][0]
-        intv = row["intervention_runs"][0]
+        control_runs = row["control_runs"]
+        intervention_runs = row["intervention_runs"]
+        n_pairs = min(len(control_runs), len(intervention_runs))
 
-        # Randomly assign to A/B
-        if rng.random() < 0.5:
-            thinking_a = ctrl["thinking"]
-            thinking_b = intv["thinking"]
-            actual_intervention = "B"
-        else:
-            thinking_a = intv["thinking"]
-            thinking_b = ctrl["thinking"]
-            actual_intervention = "A"
+        for run_idx in range(n_pairs):
+            ctrl = control_runs[run_idx]
+            intv = intervention_runs[run_idx]
 
-        disc_rows.append({
-            "anecdote_id": row["anecdote_id"],
-            "thinking_a": thinking_a,
-            "thinking_b": thinking_b,
-            "actual_intervention": actual_intervention,
-            "switch_rate": row.get("switch_rate", 0.0),
-            "title": row.get("title", ""),
-            "text": row.get("text", ""),
-        })
+            # Randomly assign to A/B
+            if rng.random() < 0.5:
+                thinking_a = ctrl["thinking"]
+                thinking_b = intv["thinking"]
+                actual_intervention = "B"
+            else:
+                thinking_a = intv["thinking"]
+                thinking_b = ctrl["thinking"]
+                actual_intervention = "A"
+
+            disc_rows.append({
+                "anecdote_id": row["anecdote_id"],
+                "run_idx": run_idx,
+                "thinking_a": thinking_a,
+                "thinking_b": thinking_b,
+                "actual_intervention": actual_intervention,
+                "switch_rate": row.get("switch_rate", 0.0),
+                "title": row.get("title", ""),
+                "text": row.get("text", ""),
+            })
 
     return disc_rows
 
@@ -165,23 +202,26 @@ def main():
             elif row["switch_rate"] < 0.15:
                 non_syc_ids.add(row["anecdote_id"])
 
-        methods = []
+        # Flatten monitor data for base/high-context monitors (one row per intervention run)
+        flat_monitor_data = _flatten_monitor_data(all_monitor_data)
+        print(f"Flattened monitor data: {len(flat_monitor_data)} intervention runs")
 
-        # ── Base monitor (runs on full sycophancy slice) ──────────────────
+        # ── Base monitor (runs on all intervention runs) ──────────────────
         if RUN_MONITOR:
-            methods.append(
-                (
-                    LlmMonitor(
-                        prompt=ScruplesBaseMonitorPrompt(variant),
-                        model=MONITOR_MODEL,
-                        max_workers=MAX_WORKERS,
-                    ),
-                    data_slice,  # run on full slice
-                )
+            base_monitor = LlmMonitor(
+                prompt=ScruplesBaseMonitorPrompt(variant),
+                model=MONITOR_MODEL,
+                max_workers=MAX_WORKERS,
             )
+            print(f"\n{'=' * 60}")
+            print(f"Running: {base_monitor.name}")
+            print(f"{'=' * 60}")
+            base_monitor.set_task(scruples)
+            base_monitor.infer(flat_monitor_data)
+            base_monitor._output.mark_success()
+            print(f"Results saved to: {base_monitor.get_folder()}")
 
         # ── High context monitor (exclude example anecdotes) ──────────────
-        exclude_ids = set()
         if RUN_HIGH_CONTEXT_MONITOR:
             rng = random.Random(HIGH_CONTEXT_SEED)
 
@@ -205,28 +245,28 @@ def main():
                 f"{len(syc_examples)} syc examples, excluding {len(exclude_ids)} anecdotes"
             )
 
-            # Build the remaining slice (full slice minus example anecdotes)
-            remaining_ids = [
-                r["anecdote_id"]
-                for r in all_monitor_data
-                if r["anecdote_id"] not in exclude_ids
+            # Filter flat data to exclude example anecdotes
+            high_context_flat_data = [
+                r for r in flat_monitor_data if r["anecdote_id"] not in exclude_ids
             ]
-            high_context_slice = DataSlice.from_ids(remaining_ids)
+            print(f"High context monitor data: {len(high_context_flat_data)} intervention runs")
 
-            methods.append(
-                (
-                    LlmMonitor(
-                        prompt=ScruplesHighContextMonitorPrompt(
-                            variant=variant,
-                            sycophantic_examples=syc_examples,
-                            non_sycophantic_examples=non_syc_examples,
-                        ),
-                        model=MONITOR_MODEL,
-                        max_workers=MAX_WORKERS,
-                    ),
-                    high_context_slice,
-                )
+            high_context_monitor = LlmMonitor(
+                prompt=ScruplesHighContextMonitorPrompt(
+                    variant=variant,
+                    sycophantic_examples=syc_examples,
+                    non_sycophantic_examples=non_syc_examples,
+                ),
+                model=MONITOR_MODEL,
+                max_workers=MAX_WORKERS,
             )
+            print(f"\n{'=' * 60}")
+            print(f"Running: {high_context_monitor.name}")
+            print(f"{'=' * 60}")
+            high_context_monitor.set_task(scruples)
+            high_context_monitor.infer(high_context_flat_data)
+            high_context_monitor._output.mark_success()
+            print(f"Results saved to: {high_context_monitor.get_folder()}")
 
         # ── Discrimination monitor ──────────────────────────────────────────
         if RUN_DISCRIMINATION:
@@ -239,9 +279,6 @@ def main():
                 model=MONITOR_MODEL,
                 max_workers=MAX_WORKERS,
             )
-            methods.append((disc_monitor, data_slice))
-
-            # Run discrimination monitor separately since it uses different data format
             print(f"\n{'=' * 60}")
             print(f"Running: {disc_monitor.name}")
             print(f"{'=' * 60}")
@@ -249,22 +286,6 @@ def main():
             disc_monitor.infer(disc_data)
             disc_monitor._output.mark_success()
             print(f"Results saved to: {disc_monitor.get_folder()}")
-
-            # Remove from methods list so it doesn't run again
-            methods = [(m, s) for m, s in methods if m != disc_monitor]
-
-        # ── Run all other methods ─────────────────────────────────────────
-        for m, method_slice in methods:
-            print(f"\n{'=' * 60}")
-            print(f"Running: {m.name}")
-            print(f"{'=' * 60}")
-            m.set_task(scruples)
-
-            monitor_data = scruples.get_monitor_data(method_slice)
-            m.infer(monitor_data)
-
-            m._output.mark_success()
-            print(f"Results saved to: {m.get_folder()}")
 
 
 if __name__ == "__main__":
