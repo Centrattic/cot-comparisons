@@ -22,14 +22,8 @@ from tqdm import tqdm
 from ..base import BaseTask
 from ...data_slice import DataSlice
 from ...utils.questions import GPQAQuestion, BinaryJudgeQuestion, Question
+from ...utils.chat_template import build_thinking_prompt
 from .prompts import get_cumulative_cot_segments
-
-# Kimi K2 chat template tokens
-IM_SYSTEM = "<|im_system|>"
-IM_USER = "<|im_user|>"
-IM_ASSISTANT = "<|im_assistant|>"
-IM_MIDDLE = "<|im_middle|>"
-IM_END = "<|im_end|>"
 
 
 @dataclass
@@ -138,10 +132,8 @@ class ForcingTask(BaseTask):
             remaining_frac = 1.0 - len(partial_cot) / max(len(source_cot), 1)
             sent_max_tokens = min(max(int(source_token_count * remaining_frac) + 100, 100), 1024)
 
-            prompt_str = (
-                f"{IM_SYSTEM}system{IM_MIDDLE}You are Kimi, an AI assistant created by Moonshot AI.{IM_END}"
-                f"{IM_USER}user{IM_MIDDLE}{self._user_msg(question)}{IM_END}"
-                f"{IM_ASSISTANT}assistant{IM_MIDDLE}<think>{partial_cot}"
+            prompt_str = build_thinking_prompt(
+                tokenizer, self._user_msg(question), cot_prefix=partial_cot,
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 tokens = tokenizer.encode(prompt_str, add_special_tokens=False)

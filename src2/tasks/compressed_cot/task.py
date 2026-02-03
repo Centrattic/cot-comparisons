@@ -27,13 +27,7 @@ from tqdm import tqdm
 from ..base import BaseTask
 from ...utils.questions import GPQAQuestion, BinaryJudgeQuestion, Question
 from src2.tasks.forced_response.prompts import split_cot_into_sentences
-
-# Kimi K2 chat template tokens
-IM_SYSTEM = "<|im_system|>"
-IM_USER = "<|im_user|>"
-IM_ASSISTANT = "<|im_assistant|>"
-IM_MIDDLE = "<|im_middle|>"
-IM_END = "<|im_end|>"
+from src2.utils.chat_template import build_thinking_prompt
 
 
 @dataclass
@@ -393,10 +387,8 @@ class CompressedCotTask(BaseTask):
             if original_token_count > 0 and region_token_count > 0:
                 continuation_budget = original_token_count - region_token_count
 
-        prompt_str = (
-            f"{IM_SYSTEM}system{IM_MIDDLE}You are Kimi, an AI assistant created by Moonshot AI.{IM_END}"
-            f"{IM_USER}user{IM_MIDDLE}{self._user_msg(question)}{IM_END}"
-            f"{IM_ASSISTANT}assistant{IM_MIDDLE}<think>{compressed_cot}"
+        prompt_str = build_thinking_prompt(
+            tokenizer, self._user_msg(question), cot_prefix=compressed_cot,
         )
 
         # Precompute </think> tokens for prefix two-step generation

@@ -24,13 +24,7 @@ import numpy as np
 from tqdm import tqdm
 
 from .base import BaseMethod
-
-# Kimi K2 chat template tokens
-IM_SYSTEM = "<|im_system|>"
-IM_USER = "<|im_user|>"
-IM_ASSISTANT = "<|im_assistant|>"
-IM_MIDDLE = "<|im_middle|>"
-IM_END = "<|im_end|>"
+from ..utils.chat_template import build_thinking_prompt
 
 
 @dataclass
@@ -64,6 +58,7 @@ class ThoughtAnchors(BaseMethod):
         self,
         model: str,
         sampling_schedule: Optional[List[int]] = None,
+        baseline_samples: int = 50,
         sparse_step: int = 3,
         jump_threshold: float = 0.10,
         confidence_level: float = 0.95,
@@ -76,6 +71,7 @@ class ThoughtAnchors(BaseMethod):
         super().__init__(name or "thought_anchors")
         self.model = model
         self.sampling_schedule = sampling_schedule or [10, 20, 30, 50, 70, 100]
+        self.baseline_samples = baseline_samples
         self.sparse_step = sparse_step
         self.jump_threshold = jump_threshold
         self.confidence_level = confidence_level
@@ -144,11 +140,7 @@ class ThoughtAnchors(BaseMethod):
         region_indices = list(range(region_start, region_end))
 
         # Pre-tokenize the prompt template (shared across all continuations)
-        prompt_template = (
-            f"{IM_SYSTEM}system{IM_MIDDLE}You are Kimi, an AI assistant created by Moonshot AI.{IM_END}"
-            f"{IM_USER}user{IM_MIDDLE}{user_msg}{IM_END}"
-            f"{IM_ASSISTANT}assistant{IM_MIDDLE}<think>"
-        )
+        prompt_template = build_thinking_prompt(tokenizer, user_msg)
 
         # Build all modified CoTs upfront (sentence i removed)
         modified_cots = {}
@@ -157,7 +149,7 @@ class ThoughtAnchors(BaseMethod):
             modified_cots[idx] = " ".join(modified)
 
         # Step 1: Baseline — run continuations from full CoT
-        n_baseline = self.sampling_schedule[0]
+        n_baseline = self.baseline_samples
         if verbose:
             print(f"  Computing baseline ({n_baseline} samples)...")
         baseline_answers = self._run_continuations_batch(
@@ -528,6 +520,7 @@ class ThoughtAnchors(BaseMethod):
         config = {
             "model": self.model,
             "sampling_schedule": self.sampling_schedule,
+            "baseline_samples": self.baseline_samples,
             "sparse_step": self.sparse_step,
             "jump_threshold": self.jump_threshold,
             "confidence_level": self.confidence_level,

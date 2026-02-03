@@ -23,13 +23,7 @@ from ..base import BaseTask
 from ...data_slice import DataSlice
 from ...utils.questions import GPQAQuestion, BinaryJudgeQuestion, Question
 from src2.tasks.forced_response.prompts import get_cumulative_cot_segments
-
-# Kimi K2 chat template tokens
-IM_SYSTEM = "<|im_system|>"
-IM_USER = "<|im_user|>"
-IM_ASSISTANT = "<|im_assistant|>"
-IM_MIDDLE = "<|im_middle|>"
-IM_END = "<|im_end|>"
+from src2.utils.chat_template import build_thinking_prompt
 
 
 @dataclass
@@ -126,10 +120,8 @@ class ResamplingTask(BaseTask):
         params = types.SamplingParams(max_tokens=max_tokens, temperature=temperature)
 
         def resample_single(sent_idx: int, resample_idx: int, partial_cot: str) -> Optional[ResampleResult]:
-            prompt_str = (
-                f"{IM_SYSTEM}system{IM_MIDDLE}You are Kimi, an AI assistant created by Moonshot AI.{IM_END}"
-                f"{IM_USER}user{IM_MIDDLE}{self._user_msg(question)}{IM_END}"
-                f"{IM_ASSISTANT}assistant{IM_MIDDLE}<think>{partial_cot}"
+            prompt_str = build_thinking_prompt(
+                tokenizer, self._user_msg(question), cot_prefix=partial_cot,
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 tokens = tokenizer.encode(prompt_str, add_special_tokens=False)

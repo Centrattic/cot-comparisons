@@ -28,14 +28,7 @@ from typing import Any, Dict, List, Optional
 from tqdm import tqdm
 
 from .questions import GPQAQuestion, BinaryJudgeQuestion, Question
-
-
-# Kimi K2 chat template tokens
-IM_SYSTEM = "<|im_system|>"
-IM_USER = "<|im_user|>"
-IM_ASSISTANT = "<|im_assistant|>"
-IM_MIDDLE = "<|im_middle|>"
-IM_END = "<|im_end|>"
+from .chat_template import build_thinking_prompt
 
 
 @dataclass
@@ -71,7 +64,7 @@ def _format_user_message(question: Question) -> str:
     return f"{question.question}\n\n{choices}\n\nAnswer with just the letter (A, B, C, or D)."
 
 
-def build_verification_prompt(question: Question) -> str:
+def build_verification_prompt(question: Question, tokenizer) -> str:
     """
     Build the full Tinker prompt for a free verification rollout.
 
@@ -81,11 +74,7 @@ def build_verification_prompt(question: Question) -> str:
     so activations can later be extracted over the exact input.
     """
     user_msg = _format_user_message(question)
-    return (
-        f"{IM_SYSTEM}system{IM_MIDDLE}You are Kimi, an AI assistant created by Moonshot AI.{IM_END}"
-        f"{IM_USER}user{IM_MIDDLE}{user_msg}{IM_END}"
-        f"{IM_ASSISTANT}assistant{IM_MIDDLE}<think>"
-    )
+    return build_thinking_prompt(tokenizer, user_msg)
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +326,7 @@ def run_verification(
     client = ServiceClient()
     sampling_client = client.create_sampling_client(base_model=model)
 
-    full_prompt = build_verification_prompt(question)
+    full_prompt = build_verification_prompt(question, tokenizer)
 
     if verbose:
         print(f"Verifying {question.id}: {num_rollouts} rollouts (model={model})")
