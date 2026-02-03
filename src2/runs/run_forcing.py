@@ -12,7 +12,7 @@ from typing import List
 from src2.data_slice import DataSlice
 from src2.methods import AttentionProbe, LinearProbe, LlmMonitor
 from src2.tasks import ForcingTask
-from src2.tasks.forced_response.prompts import ForcingMonitorPrompt
+from src2.tasks.forced_response.prompts import ForcingMonitorPrompt, ForcingMonitorSingleAnswerPrompt
 from src2.utils.questions import load_custom_questions, load_gpqa_questions
 from src2.utils.verification import ensure_verification
 
@@ -72,7 +72,12 @@ forcing.extract_activations(
 )
 
 methods = []
-methods.append(LlmMonitor(prompt=ForcingMonitorPrompt(), model=MONITOR_MODEL))
+# Use single-answer prompt with temperature=0 for deterministic predictions
+methods.append(LlmMonitor(
+    prompt=ForcingMonitorSingleAnswerPrompt(),
+    model=MONITOR_MODEL,
+    temperature=0.0,
+))
 
 # methods.append(LinearProbe(layer=LAYER, mode="soft_ce"))
 

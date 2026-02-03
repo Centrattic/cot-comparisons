@@ -39,9 +39,10 @@ NUM_CLASSES = 2
 
 # Training hyperparameters
 NUM_HEADS = 4
-LR = 1e-3
-EPOCHS = 20
+LR = 1e-4  # Lower LR for stability
+EPOCHS = 80
 BATCH_SIZE = 8
+GRAD_CLIP = 1.0  # Gradient clipping
 TEST_SPLIT = 0.2
 SEED = 42
 
@@ -183,6 +184,7 @@ def train_and_evaluate(
             pred = probe(X_pad, mask)
             loss = loss_fn(pred, y_t)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(probe.parameters(), GRAD_CLIP)
             optimizer.step()
 
             epoch_loss += loss.item()
