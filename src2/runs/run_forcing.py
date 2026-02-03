@@ -7,42 +7,43 @@ Usage:
 """
 
 from pathlib import Path
+from typing import List
 
-from src2.tasks import ForcingTask
-from src2.methods import LlmMonitor, LinearProbe
-from src2.tasks.forced_response.prompts import ForcingMonitorPrompt
-from src2.utils.questions import load_gpqa_questions
-from src2.utils.verification import ensure_verification
 from src2.data_slice import DataSlice
+from src2.methods import AttentionProbe, LinearProbe, LlmMonitor
+from src2.tasks import ForcingTask
+from src2.tasks.forced_response.prompts import ForcingMonitorPrompt
+from src2.utils.questions import load_custom_questions, load_gpqa_questions
+from src2.utils.verification import ensure_verification
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "forced_response"
 
-SUBJECT_MODEL = "moonshotai/kimi-k2-thinking"
+SUBJECT_MODEL = "Qwen/Qwen3-32B"
 MONITOR_MODEL = "openai/gpt-5.2"
 ACTIVATION_MODEL = "Qwen/Qwen3-32B"
 LAYER = 32
 
-QUESTION_ID = "gpqa_sample_001"
 ROLLOUT_IDX = 0
-NUM_FORCES = 5
+NUM_FORCES = 1
+TEMPERATURE = 0.0
 MAX_SENTENCES = None
+SENTENCE_STRIDE = 5  # only force every Nth sentence (1 = every sentence)
 
-# Which steps to run
-GENERATE_DATA = True
-EXTRACT_ACTIVATIONS = True
-RUN_MONITOR = True
-RUN_PROBE = True
-# ──────────────────────────────────────────────────────────────────────
+CUSTOM_QUESTIONS_FILE = (
+    Path(__file__).resolve().parent.parent / "utils" / "questions.json"
+)
 
 
-def main():
-    forcing = ForcingTask(model=SUBJECT_MODEL, data_dir=DATA_DIR)
+forcing = ForcingTask(model=SUBJECT_MODEL, data_dir=DATA_DIR)
 
-    # Ensure verification data exists before forcing
-    questions = load_gpqa_questions(use_samples=True)
-    question = next((q for q in questions if q.id == QUESTION_ID), None)
+questions = load_custom_questions(CUSTOM_QUESTIONS_FILE)
+question_map = {q.id: q for q in questions if q.id != "blackmail_001"}
+question_ids = question_map.keys()
+
+for qid in question_map.keys():
+    question = question_map.get(qid)
     if question:
         ensure_verification(
             question=question,
@@ -50,47 +51,59 @@ def main():
             model=SUBJECT_MODEL,
         )
 
-    if GENERATE_DATA:
-        forcing.run_data(
-            question_id=QUESTION_ID,
-            rollout_idx=ROLLOUT_IDX,
-            num_forces=NUM_FORCES,
-            max_sentences=MAX_SENTENCES,
-        )
+# generate forcing data
+for qid in question_ids:
+    forcing.run_data(
+        question_id=qid,
+        rollout_idx=ROLLOUT_IDX,
+        num_forces=NUM_FORCES,
+        max_sentences=MAX_SENTENCES,
+        temperature=TEMPERATURE,
+        sentence_stride=SENTENCE_STRIDE,
+    )
 
-    if not forcing.get_data():
-        print("No forcing data found. Set GENERATE_DATA = True first.")
-        return
+assert forcing.get_data()
 
-    if EXTRACT_ACTIVATIONS:
-        forcing.extract_activations(
-            model_name=ACTIVATION_MODEL,
-            layer=LAYER,
-            data_slice=DataSlice.all(),
-        )
+# extract activations for white box methods
+# if EXTRACT_ACTIVATIONS:
+#     forcing.extract_activations(
+#         model_name=ACTIVATION_MODEL,
+#         layer=LAYER,
+#         data_slice=DataSlice.all(),
+#     )
 
-    methods = []
-    if RUN_MONITOR:
-        methods.append(LlmMonitor(prompt=ForcingMonitorPrompt(), model=MONITOR_MODEL))
+methods = []
+methods.append(LlmMonitor(prompt=ForcingMonitorPrompt(), model=MONITOR_MODEL))
 
-    if RUN_PROBE:
-        methods.append(LinearProbe(layer=LAYER, mode="soft_ce"))
+# methods.append(LinearProbe(layer=LAYER, mode="soft_ce"))
 
-    for m in methods:
-        m.set_task(forcing)
-        folder = m.get_folder()
+for m in methods:
+    m.set_task(forcing)
 
-        if isinstance(m, LlmMonitor):
-            monitor_data = forcing.prepare_for_monitor()
-            m.infer(monitor_data)
-        elif isinstance(m, LinearProbe):
-            probe_data = forcing.get_probe_data(layer=LAYER)
-            m.train(probe_data)
-            m.infer(probe_data)
+    if isinstance(m, LlmMonitor):
+        monitor_data = forcing.prepare_for_monitor(DataSlice.all())
+        m.infer(monitor_data)
+    elif isinstance(m, LinearProbe):
+        probe_data = forcing.get_probe_data(layer=LAYER, data_slice=DataSlice.all())
+        m.train(probe_data)
+        m.infer(probe_data)
 
-        m._output.mark_success()
-        print(f"{m.name} results saved to: {folder}")
+    assert m._output is not None
+    m._output.mark_success()
 
+# attention probe
+# probe_data = forcing.build_attention_probe_data(
+#     layer=LAYER, data_slice=DataSlice.all(), token_position="full_sequence"
+# )
+# n_samples = len(probe_data["X_list"])
+# print(f"\nAttention probe: {n_samples} samples")
 
-if __name__ == "__main__":
-    main()
+# if n_samples < 5:
+#     print(f"Skipping attention probe: need >= 5 samples, got {n_samples}")
+# else:
+#     att_probe = AttentionProbe(layer=LAYER, mode="classification")
+#     att_probe.set_task(forcing)
+#     att_probe.train(probe_data)
+#     att_probe.infer(probe_data)
+#     att_probe._output.mark_success()
+#     print(f"Attention probe results saved to: {att_probe.get_folder()}")

@@ -505,6 +505,79 @@ class CompressedCotTask(BaseTask):
         )
 
     # ------------------------------------------------------------------
+    # End-to-end evaluation from monitor results
+    # ------------------------------------------------------------------
+
+    def evaluate_monitor_results(
+        self,
+        monitor_results: List[Dict],
+        spec: CompressionSpec,
+        output_folder: Path,
+        num_resamples: int = 50,
+        temperature: float = 0.7,
+        verbose: bool = True,
+        baseline: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Evaluate compression from monitor sentence-selection results.
+
+        Takes the first monitor result, converts selected indices to
+        region-relative, reconstructs the compressed CoT, runs evaluation
+        resamples, and saves results to output_folder.
+
+        If baseline is provided, it's used directly instead of recomputing.
+        """
+        # Extract selected indices from monitor prediction
+        selected_indices = monitor_results[0].get("monitor_prediction", [])
+        if not isinstance(selected_indices, list):
+            selected_indices = []
+
+        # Convert absolute indices to region-relative
+        relative_indices = [i - spec.region_start for i in selected_indices]
+
+        # Reconstruct compressed CoT
+        compressed_cot = spec.reconstruct_from_indices(relative_indices)
+
+        # Evaluate compressed distribution
+        compressed_dist = self.evaluate_compression(
+            spec.question_id, spec.rollout_idx, compressed_cot,
+            num_resamples=num_resamples, temperature=temperature, verbose=verbose,
+        )
+
+        # Use provided baseline or compute it
+        baseline_dist = baseline if baseline is not None else self.get_baseline_distribution(
+            spec.question_id, spec.rollout_idx,
+            num_resamples=num_resamples, temperature=temperature, verbose=verbose,
+        )
+
+        # Compute metrics
+        metrics = self.evaluate(
+            [compressed_dist["distribution"]], [baseline_dist["distribution"]],
+        )
+
+        eval_results = {
+            "selected_indices": selected_indices,
+            "relative_indices": relative_indices,
+            "compressed_distribution": compressed_dist,
+            "baseline_distribution": baseline_dist,
+            **metrics,
+        }
+
+        # Save outputs
+        output_folder = Path(output_folder)
+        with open(output_folder / "compression_eval.json", "w") as f:
+            json.dump(eval_results, f, indent=2)
+        with open(output_folder / "compressed_cot.txt", "w") as f:
+            f.write(compressed_cot)
+
+        if verbose:
+            print(f"JS divergence: {metrics['js_divergence']:.4f}")
+            print(f"Agreement: {metrics['agreement']:.1%}")
+            print(f"Saved to {output_folder}")
+
+        return eval_results
+
+    # ------------------------------------------------------------------
     # Question/CoT loading helpers
     # ------------------------------------------------------------------
 

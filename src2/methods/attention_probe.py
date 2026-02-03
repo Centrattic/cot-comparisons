@@ -113,6 +113,10 @@ class AttentionProbe(BaseMethod):
     Receives pre-extracted full-sequence activations and uses
     learned attention to identify which positions are informative.
 
+    Supports two modes:
+      - "regression": MSELoss, continuous y values (default, backward compat)
+      - "classification": CrossEntropyLoss, integer class labels
+
     Expected data formats:
       train: {"X_list": List[ndarray], "y": ndarray}
       infer: {"X_list": List[ndarray], "anecdote_ids": list}
@@ -121,26 +125,34 @@ class AttentionProbe(BaseMethod):
     def __init__(
         self,
         layer: int,
+        mode: str = "regression",
         num_heads: int = 4,
         lr: float = 1e-3,
         epochs: int = 100,
         name: Optional[str] = None,
     ):
+        if mode not in ("regression", "classification"):
+            raise ValueError(f"mode must be 'regression' or 'classification', got '{mode}'")
         if name is None:
             name = f"attention_probe_L{layer}"
         super().__init__(name)
 
         self.layer = layer
+        self.mode = mode
         self.num_heads = num_heads
         self.lr = lr
         self.epochs = epochs
         self._probe: Optional[AttentionPoolingProbe] = None
+        self._num_classes: Optional[int] = None
 
     def train(self, data: Any) -> None:
         """
         Train the attention probe.
 
         data: {"X_list": List[ndarray [seq_len, hidden_dim]], "y": ndarray [n]}
+
+        In regression mode, y should be float values.
+        In classification mode, y should be integer class labels.
         """
         X_list = data["X_list"]
         y_list = data["y"]
@@ -160,18 +172,26 @@ class AttentionProbe(BaseMethod):
             X_padded[i, :sl, :] = torch.from_numpy(x)
             mask[i, :sl] = True
 
-        y = torch.tensor(y_list, dtype=torch.float32).unsqueeze(-1)
+        if self.mode == "classification":
+            y = torch.tensor(y_list, dtype=torch.long)
+            num_classes = int(y.max().item()) + 1
+            self._num_classes = num_classes
+            output_dim = num_classes
+            loss_fn = nn.CrossEntropyLoss()
+        else:
+            y = torch.tensor(y_list, dtype=torch.float32).unsqueeze(-1)
+            output_dim = 1
+            loss_fn = nn.MSELoss()
 
         # Train probe
         self._probe = AttentionPoolingProbe(
             hidden_dim=hidden_dim,
             num_heads=self.num_heads,
-            output_dim=1,
+            output_dim=output_dim,
             max_seq_len=max_len,
         )
 
         optimizer = torch.optim.Adam(self._probe.parameters(), lr=self.lr)
-        loss_fn = nn.MSELoss()
 
         self._probe.train()
         for epoch in range(self.epochs):
@@ -188,17 +208,21 @@ class AttentionProbe(BaseMethod):
         torch.save(self._probe.state_dict(), folder / "probe.pt")
         config = {
             "layer": self.layer,
+            "mode": self.mode,
             "num_heads": self.num_heads,
             "hidden_dim": hidden_dim,
             "max_seq_len": max_len,
             "n_samples": batch_size,
             "final_loss": float(loss.item()),
         }
+        if self.mode == "classification":
+            config["num_classes"] = self._num_classes
         with open(folder / "config.json", "w") as f:
             json.dump(config, f, indent=2)
 
         print(
-            f"AttentionProbe trained: {batch_size} samples, final loss={loss.item():.4f}"
+            f"AttentionProbe trained: {batch_size} samples, "
+            f"mode={self.mode}, final loss={loss.item():.4f}"
         )
 
     def infer(self, data: Any) -> Any:
@@ -206,7 +230,9 @@ class AttentionProbe(BaseMethod):
         Run inference with trained attention probe.
 
         data: {"X_list": List[ndarray], "anecdote_ids": list}
-        Returns list of dicts with predicted_switch_rate per anecdote.
+
+        In regression mode, returns predicted_switch_rate per sample.
+        In classification mode, returns predicted_class and class_probabilities.
         """
         if self._probe is None:
             raise RuntimeError("Probe not trained. Call train() first.")
@@ -224,14 +250,25 @@ class AttentionProbe(BaseMethod):
 
             with torch.no_grad():
                 pred = self._probe(x, mask)
-                predicted_switch_rate = float(pred.squeeze())
 
-            results.append(
-                {
-                    "anecdote_id": anecdote_ids[i],
-                    "predicted_switch_rate": predicted_switch_rate,
-                }
-            )
+                if self.mode == "classification":
+                    probs = torch.softmax(pred, dim=-1).squeeze(0)
+                    predicted_class = int(probs.argmax().item())
+                    results.append(
+                        {
+                            "anecdote_id": anecdote_ids[i],
+                            "predicted_class": predicted_class,
+                            "class_probabilities": probs.tolist(),
+                        }
+                    )
+                else:
+                    predicted_switch_rate = float(pred.squeeze())
+                    results.append(
+                        {
+                            "anecdote_id": anecdote_ids[i],
+                            "predicted_switch_rate": predicted_switch_rate,
+                        }
+                    )
 
         # Save results
         if results and self._output and self._output.run_folder:

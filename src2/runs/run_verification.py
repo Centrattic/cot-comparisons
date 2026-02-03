@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Run initial rollouts to generate source CoT data.
 
@@ -11,8 +10,8 @@ Usage:
 
 from pathlib import Path
 
-from src2.utils.questions import load_gpqa_questions, load_custom_questions
-from src2.utils.verification import run_verification, ensure_verification
+from src2.utils.questions import load_custom_questions, load_gpqa_questions
+from src2.utils.verification import ensure_verification, run_verification
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -21,7 +20,6 @@ VERIFICATION_DIR = PROJECT_ROOT / "data" / "verification_rollouts"
 MODEL = "moonshotai/kimi-k2-thinking"
 NUM_ROLLOUTS = 50
 TEMPERATURE = 0.7
-MAX_TOKENS = 8192
 MAX_WORKERS = 300
 
 # Question source: "sample_gpqa", "custom", or "gpqa_hf"
@@ -37,11 +35,14 @@ def main():
         questions = load_custom_questions(CUSTOM_QUESTIONS_FILE)
     elif QUESTION_SOURCE == "gpqa_hf":
         from src2.utils.questions import load_gpqa_from_huggingface
+
         questions = load_gpqa_from_huggingface()
     else:
         raise ValueError(f"Unknown QUESTION_SOURCE: {QUESTION_SOURCE}")
 
-    print(f"Running rollouts for {len(questions)} questions (model={MODEL}, rollouts={NUM_ROLLOUTS})")
+    print(
+        f"Running rollouts for {len(questions)} questions (model={MODEL}, rollouts={NUM_ROLLOUTS})"
+    )
     print(f"Data dir: {VERIFICATION_DIR}\n")
 
     for q in questions:

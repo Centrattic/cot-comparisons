@@ -88,6 +88,7 @@ class ForcingTask(BaseTask):
         max_sentences: Optional[int] = None,
         temperature: float = 0.7,
         max_tokens: int = 2048,
+        sentence_stride: int = 1,
         verbose: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """Run true forcing for all sentences in the CoT via Tinker."""
@@ -107,12 +108,21 @@ class ForcingTask(BaseTask):
         cot_segments = get_cumulative_cot_segments(source_cot)
         if max_sentences is not None:
             cot_segments = cot_segments[:max_sentences]
+
+        # Apply stride: keep every Nth sentence (always include first and last)
+        if sentence_stride > 1:
+            all_indices = list(range(len(cot_segments)))
+            kept = set(all_indices[::sentence_stride])
+            kept.add(all_indices[-1])  # always keep last sentence
+            cot_segments = [cot_segments[i] for i in sorted(kept)]
+
         num_sentences = len(cot_segments)
 
         config = {
             "model": self.model, "question_id": question.id,
             "rollout_idx": rollout_idx, "num_forces": num_forces,
-            "max_sentences": max_sentences, "temperature": temperature,
+            "max_sentences": max_sentences, "sentence_stride": sentence_stride,
+            "temperature": temperature,
             "max_tokens": max_tokens, "num_sentences": num_sentences,
         }
         run_dir = self.create_run_dir("forcing", question.id, rollout_idx, config)
@@ -459,6 +469,7 @@ class ForcingTask(BaseTask):
                 continue
 
             answer_distribution = {k: v / total for k, v in answer_counts.items()}
+            question_type = summary.get("question_type", "multiple_choice")
 
             # Find companion activation files
             act_files = sorted(sentence_dir.glob("force_*.npz"))
@@ -493,6 +504,7 @@ class ForcingTask(BaseTask):
                     "activation": activation,
                     "answer_distribution": answer_distribution,
                     "question_id": question_id,
+                    "question_type": question_type,
                     "sentence_idx": sentence_idx,
                     "partial_cot": text_data.get("partial_cot", ""),
                     "continued_cot": text_data.get("continued_cot", ""),
@@ -502,6 +514,81 @@ class ForcingTask(BaseTask):
                 })
 
         return samples
+
+    # ------------------------------------------------------------------
+    # Attention probe data builder
+    # ------------------------------------------------------------------
+
+    # Label maps for encoding forced answers as integer classes
+    GPQA_LABEL_MAP = {"A": 0, "B": 1, "C": 2, "D": 3}
+    BINARY_LABEL_MAP = {"YES": 0, "NO": 1}
+
+    def build_attention_probe_data(
+        self,
+        layer: int,
+        data_slice: DataSlice,
+        token_position: str = "full_sequence",
+    ) -> Dict[str, Any]:
+        """
+        Build data formatted for AttentionProbe in classification mode.
+
+        Each sample maps a forced-response activation to a hard class label
+        (the answer produced by that forcing run).
+
+        Args:
+            layer: Model layer to load activations from.
+            data_slice: Filter for question IDs and sentence indices.
+            token_position: Token position mode (default "full_sequence").
+
+        Returns:
+            {
+                "X_list": List[ndarray],   # activations
+                "y": ndarray[int],         # integer class labels
+                "question_ids": list,
+                "sentence_indices": list,
+            }
+        """
+        samples = self.get_probe_data(layer, data_slice, token_position)
+
+        X_list = []
+        y_list = []
+        question_ids = []
+        sentence_indices = []
+
+        for sample in samples:
+            answer = sample.get("answer", "").upper()
+            if not answer:
+                continue
+
+            # Determine label map from question type
+            question_type = sample.get("question_type", "")
+            if not question_type:
+                # Infer from answer value
+                if answer in self.GPQA_LABEL_MAP:
+                    label_map = self.GPQA_LABEL_MAP
+                elif answer in self.BINARY_LABEL_MAP:
+                    label_map = self.BINARY_LABEL_MAP
+                else:
+                    continue
+            elif question_type == "binary_judge":
+                label_map = self.BINARY_LABEL_MAP
+            else:
+                label_map = self.GPQA_LABEL_MAP
+
+            if answer not in label_map:
+                continue
+
+            X_list.append(sample["activation"])
+            y_list.append(label_map[answer])
+            question_ids.append(sample["question_id"])
+            sentence_indices.append(sample["sentence_idx"])
+
+        return {
+            "X_list": X_list,
+            "y": np.array(y_list, dtype=np.int64),
+            "question_ids": question_ids,
+            "sentence_indices": sentence_indices,
+        }
 
     # ------------------------------------------------------------------
     # Question/CoT loading helpers

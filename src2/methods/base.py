@@ -19,11 +19,10 @@ class BaseMethod(ABC):
 
     Lifecycle:
       1. m = SomeMethod(...)
-      2. m.set_task(task)        -> binds method to a task
-      3. folder = m.get_folder() -> creates timestamped output dir (saves config)
-      4. m.train(data)  (optional)
-      5. m.infer(data)
-      6. m._output.mark_success()  -> updates `latest` symlink
+      2. m.set_task(task)        -> binds method, creates output folder
+      3. m.train(data)  (optional)
+      4. m.infer(data)
+      5. m._output.mark_success()  -> updates `latest` symlink
     """
 
     name: str
@@ -34,27 +33,21 @@ class BaseMethod(ABC):
         self._output: Optional[OutputManager] = None
 
     def set_task(self, task) -> None:
-        """Bind this method to a task. Creates an OutputManager for it."""
+        """Bind this method to a task, create output folder, and save config."""
         self._task = task
         base_dir = task.data_dir / self.name
         self._output = OutputManager(base_dir)
-
-    def get_folder(self) -> Path:
-        """Create and return a timestamped run folder for this method+task.
-
-        Automatically saves method and task config to method_config.json.
-        """
-        if self._output is None:
-            raise RuntimeError("Call set_task() before get_folder().")
-        folder = self._output.create_run_folder()
+        self._run_folder = self._output.create_run_folder()
         config = {
             "method": self.get_config(),
+            "task": task.get_config(),
         }
-        if self._task is not None:
-            config["task"] = self._task.get_config()
-        with open(folder / "method_config.json", "w") as f:
+        with open(self._run_folder / "method_config.json", "w") as f:
             json.dump(config, f, indent=2)
-        return folder
+
+    def get_folder(self) -> Path:
+        """Return the timestamped run folder created by set_task()."""
+        return self._run_folder
 
     def get_config(self) -> Dict[str, Any]:
         """Return a dict of this method's configuration for serialization.

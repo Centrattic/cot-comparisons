@@ -34,8 +34,7 @@ class LlmMonitor(BaseMethod):
     Usage:
         prompt = ScruplesBaseMonitorPrompt("first_person")
         monitor = LlmMonitor(prompt, num_runs=50)
-        monitor.set_task(scruples)
-        folder = monitor.get_folder()
+        monitor.set_task(scruples)  # creates output folder
         results = monitor.infer(data)
         monitor._output.mark_success()
 
@@ -91,8 +90,8 @@ class LlmMonitor(BaseMethod):
               - "monitor_response": raw LLM response text
               - "monitor_prediction": parsed output from prompt.parse_response()
         """
-        if self._output is None or self._output.run_folder is None:
-            raise RuntimeError("Call set_task() and get_folder() before infer().")
+        if self._output is None:
+            raise RuntimeError("Call set_task() before infer().")
 
         rows = self._to_rows(data)
 
