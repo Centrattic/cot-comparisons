@@ -269,30 +269,53 @@ class ForcingTask(BaseTask):
 
     def prepare_for_monitor(self, data_slice: DataSlice) -> List[Dict]:
         """Prepare row dicts for LlmMonitor."""
-        data = self.get_data(load=True)
-        if data is None:
-            raise RuntimeError("No data found. Run run_data() first.")
+        # Load question definitions for question text and choices
+        from ...utils.questions import load_custom_questions
+        questions_file = Path(__file__).parent.parent.parent / "utils" / "questions.json"
+        questions = load_custom_questions(questions_file)
+        question_lookup = {q.id: q for q in questions}
+
+        # Find all sentence-level summaries (which have the actual partial_cot)
+        sentence_summaries = sorted(self.forcing_dir.rglob("sentence_*/summary.json"))
+        sentence_summaries = data_slice.filter_paths(sentence_summaries)
 
         rows = []
-        for summary in data:
-            question_id = summary["question_id"]
+        for summary_path in sentence_summaries:
+            with open(summary_path) as f:
+                sent = json.load(f)
+
+            question_id = sent.get("question_id", "")
             if not data_slice.matches_id(question_id):
                 continue
-            for sent in summary.get("sentence_summaries", []):
-                sentence_idx = sent["sentence_idx"]
-                if not data_slice.matches_sentence(sentence_idx):
-                    continue
-                row = {
-                    "question_id": question_id,
-                    "question_type": summary.get("question_type", "multiple_choice"),
-                    "partial_cot": sent.get("partial_cot", ""),
-                    "sentence_idx": sentence_idx,
-                }
-                if "correct_answer" in summary:
-                    row["correct_answer"] = summary["correct_answer"]
-                if "bad_outcome" in summary:
-                    row["bad_outcome"] = summary["bad_outcome"]
-                rows.append(row)
+
+            sentence_idx = sent.get("sentence_idx", -1)
+            if not data_slice.matches_sentence(sentence_idx):
+                continue
+
+            # Get question details from lookup
+            question = question_lookup.get(question_id)
+            if question is None:
+                continue
+
+            row = {
+                "question_id": question_id,
+                "question_type": sent.get("question_type", "multiple_choice"),
+                "partial_cot": sent.get("partial_cot", ""),
+                "sentence_idx": sentence_idx,
+                "question": question.question,
+            }
+
+            # Add choices for multiple choice questions
+            if hasattr(question, "choices"):
+                row["choices"] = question.choices
+
+            if hasattr(question, "correct_answer"):
+                row["correct_answer"] = question.correct_answer
+            if hasattr(question, "bad_outcome"):
+                row["bad_outcome"] = question.bad_outcome
+
+            rows.append(row)
+
         return rows
 
     # ------------------------------------------------------------------

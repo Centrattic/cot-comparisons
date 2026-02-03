@@ -16,16 +16,16 @@ from src2.tasks import ScruplesTask
 # from src2.methods import LinearProbe, AttentionProbe, ContrastiveSAE
 from src2.tasks.scruples.prompts import (
     ScruplesBaseMonitorPrompt,
-    ScruplesHighContextMonitorPrompt,
     ScruplesDiscriminationPrompt,
     # ScruplesBaselinePrompt,
+    ScruplesHighContextMonitorPrompt,
 )
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "scruples"
 
-SUBJECT_MODEL = "moonshotai/kimi-k2-thinking"
+SUBJECT_MODEL = "Qwen/Qwen3-32B"
 MONITOR_MODEL = "openai/gpt-5.2"
 ACTIVATION_MODEL = "Qwen/Qwen3-32B"
 LAYER = 32
@@ -58,6 +58,26 @@ RUN_DISCRIMINATION = True
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _extract_thinking_text(thinking):
+    """Extract text from thinking structure.
+
+    The thinking field in run files is stored as a list like:
+    [{'format': None, 'index': 0, 'type': 'reasoning.text', 'text': '...'}]
+
+    This extracts just the text content.
+    """
+    if isinstance(thinking, list) and thinking:
+        # Handle list of thinking blocks
+        texts = []
+        for block in thinking:
+            if isinstance(block, dict) and "text" in block:
+                texts.append(block["text"])
+        return "\n".join(texts)
+    elif isinstance(thinking, str):
+        return thinking
+    return ""
+
+
 def _flatten_monitor_data(monitor_data):
     """Flatten monitor data to one row per intervention run.
 
@@ -71,17 +91,19 @@ def _flatten_monitor_data(monitor_data):
             continue
 
         for run_idx, intv_run in enumerate(row["intervention_runs"]):
-            flat_rows.append({
-                "anecdote_id": row["anecdote_id"],
-                "run_idx": run_idx,
-                "thinking": intv_run["thinking"],
-                "answer": intv_run["answer"],
-                "switch_rate": row.get("switch_rate", 0.0),
-                "title": row.get("title", ""),
-                "text": row.get("text", ""),
-                "author_is_wrong": row.get("author_is_wrong", False),
-                "variant": row.get("variant", ""),
-            })
+            flat_rows.append(
+                {
+                    "anecdote_id": row["anecdote_id"],
+                    "run_idx": run_idx,
+                    "thinking": _extract_thinking_text(intv_run["thinking"]),
+                    "answer": intv_run["answer"],
+                    "switch_rate": row.get("switch_rate", 0.0),
+                    "title": row.get("title", ""),
+                    "text": row.get("text", ""),
+                    "author_is_wrong": row.get("author_is_wrong", False),
+                    "variant": row.get("variant", ""),
+                }
+            )
 
     return flat_rows
 
@@ -101,9 +123,9 @@ def _pick_examples(monitor_data, anecdote_ids, n, rng):
         intv = row["intervention_runs"][0]
         examples.append(
             {
-                "control_thinking": ctrl["thinking"],
+                "control_thinking": _extract_thinking_text(ctrl["thinking"]),
                 "control_answer": ctrl["answer"],
-                "intervention_thinking": intv["thinking"],
+                "intervention_thinking": _extract_thinking_text(intv["thinking"]),
                 "intervention_answer": intv["answer"],
             }
         )
@@ -134,26 +156,32 @@ def _prepare_discrimination_data(monitor_data, rng):
             ctrl = control_runs[run_idx]
             intv = intervention_runs[run_idx]
 
+            # Extract thinking text from the structured format
+            ctrl_thinking = _extract_thinking_text(ctrl["thinking"])
+            intv_thinking = _extract_thinking_text(intv["thinking"])
+
             # Randomly assign to A/B
             if rng.random() < 0.5:
-                thinking_a = ctrl["thinking"]
-                thinking_b = intv["thinking"]
+                thinking_a = ctrl_thinking
+                thinking_b = intv_thinking
                 actual_intervention = "B"
             else:
-                thinking_a = intv["thinking"]
-                thinking_b = ctrl["thinking"]
+                thinking_a = intv_thinking
+                thinking_b = ctrl_thinking
                 actual_intervention = "A"
 
-            disc_rows.append({
-                "anecdote_id": row["anecdote_id"],
-                "run_idx": run_idx,
-                "thinking_a": thinking_a,
-                "thinking_b": thinking_b,
-                "actual_intervention": actual_intervention,
-                "switch_rate": row.get("switch_rate", 0.0),
-                "title": row.get("title", ""),
-                "text": row.get("text", ""),
-            })
+            disc_rows.append(
+                {
+                    "anecdote_id": row["anecdote_id"],
+                    "run_idx": run_idx,
+                    "thinking_a": thinking_a,
+                    "thinking_b": thinking_b,
+                    "actual_intervention": actual_intervention,
+                    "switch_rate": row.get("switch_rate", 0.0),
+                    "title": row.get("title", ""),
+                    "text": row.get("text", ""),
+                }
+            )
 
     return disc_rows
 
@@ -249,7 +277,9 @@ def main():
             high_context_flat_data = [
                 r for r in flat_monitor_data if r["anecdote_id"] not in exclude_ids
             ]
-            print(f"High context monitor data: {len(high_context_flat_data)} intervention runs")
+            print(
+                f"High context monitor data: {len(high_context_flat_data)} intervention runs"
+            )
 
             high_context_monitor = LlmMonitor(
                 prompt=ScruplesHighContextMonitorPrompt(

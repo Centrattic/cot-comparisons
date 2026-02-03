@@ -1088,6 +1088,116 @@ class ScruplesTask(BaseTask):
             "run_ids": run_ids,
         }
 
+    def get_sycophancy_probe_data(
+        self,
+        variants: List[str],
+        layer: int,
+        data_slice: DataSlice,
+    ) -> Dict[str, Any]:
+        """
+        Load individual run activations labelled by sycophancy (binary).
+
+        Label = 1 if intervention run AND is_sycophantic (model switched to agree).
+        Label = 0 otherwise (control runs, or intervention runs that didn't switch).
+
+        Args:
+            variants: List of variant names, e.g. ["suggest_wrong", "suggest_right"].
+            layer: Model layer to load activations from.
+            data_slice: Filter for anecdote IDs.
+
+        Returns:
+            {
+                "X_list": List[ndarray [seq_len, hidden_dim]],
+                "y": ndarray[int],
+                "anecdote_ids": list[str],
+                "run_ids": list[str],
+                "metadata": list[dict] with keys: variant, arm, answer, is_sycophantic
+            }
+        """
+        seq_key = f"layer{layer}_full_sequence"
+        bnd_key = f"layer{layer}_boundaries"
+        boundary_names = ["last_input", "last_thinking", "last_response"]
+
+        X_list: List[np.ndarray] = []
+        y_list: List[int] = []
+        anecdote_ids: List[str] = []
+        run_ids: List[str] = []
+        metadata: List[Dict[str, Any]] = []
+
+        # Track which control runs we've already added (avoid duplicates
+        # when the same anecdote appears in multiple variants)
+        seen_control: set = set()
+
+        for variant in variants:
+            # Load results CSV for this variant
+            results_csv = self.data_dir / f"results_{variant}.csv"
+            if not results_csv.exists():
+                print(f"Warning: {results_csv} not found, skipping variant '{variant}'")
+                continue
+
+            runs_df = pd.read_csv(results_csv)
+            runs_df = runs_df[runs_df["anecdote_id"].apply(data_slice.matches_id)]
+
+            for _, row in runs_df.iterrows():
+                run_path = self.data_dir / row["run_path"]
+                act_path = run_path.with_suffix(".npz")
+                if not act_path.exists():
+                    continue
+
+                try:
+                    with np.load(act_path) as f:
+                        if seq_key not in f.files:
+                            continue
+                        full_seq = f[seq_key]
+                        boundaries = f[bnd_key]
+                except Exception:
+                    continue
+
+                # Slice to CoT + response tokens (no prompt)
+                last_input = int(boundaries[boundary_names.index("last_input")])
+                last_response = int(boundaries[boundary_names.index("last_response")])
+                if last_input < 0 or last_response <= last_input:
+                    continue
+                segment = full_seq[last_input + 1 : last_response + 1]
+                if segment.shape[0] == 0:
+                    continue
+
+                arm = row["arm"]
+                aid = row["anecdote_id"]
+                answer = row.get("answer", "")
+                is_syco = row.get("is_sycophantic", False)
+                run_id = f"{variant}/{aid}/{arm}_{row['run_idx']}"
+
+                if arm == "control":
+                    # Pool controls; deduplicate across variants
+                    ctrl_key = (aid, int(row["run_idx"]))
+                    if ctrl_key in seen_control:
+                        continue
+                    seen_control.add(ctrl_key)
+                    label = 0  # Control runs are never sycophantic
+                else:
+                    # Intervention runs: label = 1 if is_sycophantic
+                    label = 1 if is_syco else 0
+
+                X_list.append(segment)
+                y_list.append(label)
+                anecdote_ids.append(aid)
+                run_ids.append(run_id)
+                metadata.append({
+                    "variant": variant,
+                    "arm": arm,
+                    "answer": answer,
+                    "is_sycophantic": is_syco,
+                })
+
+        return {
+            "X_list": X_list,
+            "y": np.array(y_list, dtype=np.int64),
+            "anecdote_ids": anecdote_ids,
+            "run_ids": run_ids,
+            "metadata": metadata,
+        }
+
     # ------------------------------------------------------------------
     # Strict sycophancy split
     # ------------------------------------------------------------------

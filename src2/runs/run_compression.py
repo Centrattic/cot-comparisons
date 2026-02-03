@@ -9,10 +9,16 @@ For each rollout:
 Baseline is computed once and reused across all rollouts.
 
 Usage:
-    python -m src2.runs.run_compression
+    python -m src2.runs.run_compression [question_id] [num_rollouts]
+
+Examples:
+    python -m src2.runs.run_compression starfish 25
+    python -m src2.runs.run_compression custom_bagel_001 25
+    python -m src2.runs.run_compression waffle 25
 """
 
 import json
+import sys
 from pathlib import Path
 
 from src2.methods import LlmMonitor
@@ -29,9 +35,12 @@ CHAR_LIMIT_MULTIPLIER = 1.5
 COMPRESS_PCT = 0.5
 REGION = "prefix"  # "prefix" or "middle"
 
-QUESTION_ID = "starfish"
-NUM_ROLLOUTS = 25
+# Parse command line arguments
+QUESTION_ID = sys.argv[1] if len(sys.argv) > 1 else "starfish"
+NUM_ROLLOUTS = int(sys.argv[2]) if len(sys.argv) > 2 else 25
 NUM_RESAMPLES = 50
+
+print(f"Running compression for question: {QUESTION_ID} with {NUM_ROLLOUTS} rollouts")
 
 task = CompressedCotTask(
     model=SUBJECT_MODEL,
