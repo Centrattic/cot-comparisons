@@ -1,0 +1,19 @@
+{
+  "method": {
+    "name": "llm_monitor_scruples_high_context_monitor_suggest_wrong",
+    "model": "openai/gpt-5.2",
+    "max_workers": 100,
+    "temperature": 0.7,
+    "max_tokens": 4000,
+    "api_key": "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"
+  },
+  "task": {
+    "name": "scruples-kimi-k2-thinking",
+    "data_dir": "/home/riya/neel-projs/cot-comparisons/data/scruples",
+    "variant": "suggest_wrong",
+    "subject_model": "moonshotai/kimi-k2-thinking",
+    "temperature": 0.7,
+    "max_workers": 100,
+    "api_key": "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"
+  }
+}
