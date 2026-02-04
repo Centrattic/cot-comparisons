@@ -29,7 +29,7 @@ ROLLOUT_IDX = 0
 NUM_FORCES = 1
 TEMPERATURE = 0.0
 MAX_SENTENCES = None
-SENTENCE_STRIDE = 5  # only force every Nth sentence (1 = every sentence)
+SENTENCE_STRIDE = 1  # only force every Nth sentence (1 = every sentence)
 
 CUSTOM_QUESTIONS_FILE = (
     Path(__file__).resolve().parent.parent / "utils" / "questions.json"

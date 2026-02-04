@@ -40,7 +40,7 @@ NUM_CLASSES = 2
 # Training hyperparameters
 NUM_HEADS = 4
 LR = 1e-4  # Lower LR for stability
-EPOCHS = 80
+EPOCHS = 40
 BATCH_SIZE = 8
 GRAD_CLIP = 1.0  # Gradient clipping
 TEST_SPLIT = 0.2
@@ -166,6 +166,12 @@ def train_and_evaluate(
     )
     n_samples = len(train_X)
 
+    # Compute class weights (inverse frequency)
+    class_counts = np.bincount(train_y, minlength=NUM_CLASSES)
+    class_weights = n_samples / (NUM_CLASSES * class_counts + 1e-6)
+    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+    print(f"  Class counts: {class_counts.tolist()}, weights: {class_weights.tolist()}")
+
     probe = AttentionPoolingProbe(
         hidden_dim=hidden_dim,
         num_heads=num_heads,
@@ -173,7 +179,7 @@ def train_and_evaluate(
         max_seq_len=max_seq_len,
     ).to(device)
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
     probe.train()
     for epoch in range(epochs):
