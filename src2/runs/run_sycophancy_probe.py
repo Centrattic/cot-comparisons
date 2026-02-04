@@ -51,9 +51,9 @@ EXTRACT_ACTIVATIONS = False
 
 def print_dataset_statistics(metadata: list, y: np.ndarray):
     """Print breakdown of dataset by variant/arm/answer."""
-    print("\n" + "=" * 60)
-    print("  Dataset Statistics (6 groups)")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("  Dataset Statistics")
+    print("=" * 70)
 
     # Count by group
     groups = {}
@@ -63,9 +63,17 @@ def print_dataset_statistics(metadata: list, y: np.ndarray):
         answer = m["answer"]
         key = (variant, answer)
         if key not in groups:
-            groups[key] = {"count": 0, "sycophantic": 0}
+            groups[key] = {
+                "count": 0,
+                "syco_answer": 0,  # answer matches suggestion
+                "prompt_syco": 0,  # switch_rate > 0.5
+                "label": 0,  # both conditions met
+            }
         groups[key]["count"] += 1
-        groups[key]["sycophantic"] += int(y[i])
+        if arm == "intervention":
+            groups[key]["syco_answer"] += int(m.get("is_sycophantic_answer", False))
+            groups[key]["prompt_syco"] += int(m.get("prompt_is_sycophantic", False))
+        groups[key]["label"] += int(y[i])
 
     total = len(metadata)
 
@@ -76,21 +84,30 @@ def print_dataset_statistics(metadata: list, y: np.ndarray):
         ("suggest_right", "A"), ("suggest_right", "B"),
     ]
 
-    print(f"\n  {'Group':<25} {'Count':>8} {'%':>8} {'Syco':>8} {'Syco%':>8}")
-    print("  " + "-" * 57)
+    print(f"\n  {'Group':<20} {'N':>6} {'SycoAns':>8} {'PromptSyco':>11} {'Label=1':>8}")
+    print("  " + "-" * 53)
 
     for variant, answer in order:
         key = (variant, answer)
         if key in groups:
             g = groups[key]
-            pct = 100 * g["count"] / total
-            syco_pct = 100 * g["sycophantic"] / g["count"] if g["count"] > 0 else 0
-            print(f"  {variant + ' ' + answer:<25} {g['count']:>8} {pct:>7.1f}% {g['sycophantic']:>8} {syco_pct:>7.1f}%")
+            n = g["count"]
+            sa = g["syco_answer"]
+            ps = g["prompt_syco"]
+            lb = g["label"]
+            sa_pct = f"({100*sa/n:.0f}%)" if n > 0 else ""
+            ps_pct = f"({100*ps/n:.0f}%)" if n > 0 else ""
+            lb_pct = f"({100*lb/n:.0f}%)" if n > 0 else ""
+            print(f"  {variant + ' ' + answer:<20} {n:>6} {sa:>4}{sa_pct:>4} {ps:>5}{ps_pct:>6} {lb:>4}{lb_pct:>4}")
         else:
-            print(f"  {variant + ' ' + answer:<25} {0:>8} {0:>7.1f}% {0:>8} {0:>7.1f}%")
+            print(f"  {variant + ' ' + answer:<20} {0:>6} {0:>8} {0:>11} {0:>8}")
 
-    print("  " + "-" * 57)
-    print(f"  {'TOTAL':<25} {total:>8} {100:>7.1f}% {int(y.sum()):>8} {100*y.mean():>7.1f}%")
+    print("  " + "-" * 53)
+    print(f"  {'TOTAL':<20} {total:>6} {'-':>8} {'-':>11} {int(y.sum()):>4}({100*y.mean():.0f}%)")
+    print()
+    print("  SycoAns = answer matches sycophantic suggestion")
+    print("  PromptSyco = anecdote switch_rate > 0.5")
+    print("  Label=1 = SycoAns AND PromptSyco (for intervention runs)")
     print()
 
 
