@@ -9,9 +9,10 @@ CoT and lets it continue to produce an answer.
 import contextlib
 import io
 import json
+import math
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -28,7 +29,7 @@ from .prompts import get_cumulative_cot_segments
 
 @dataclass
 class ForceResult:
-    """Result of a single true-forcing attempt."""
+    """Result of a single forcing attempt (logprob-based)."""
     sentence_idx: int
     force_idx: int
     partial_cot: str
@@ -37,6 +38,8 @@ class ForceResult:
     raw_response: str
     answer: str
     full_prompt: str = ""
+    choice_logprobs: Dict[str, float] = field(default_factory=dict)
+    choice_probs: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -44,6 +47,8 @@ class ForceResult:
             "partial_cot": self.partial_cot, "continued_cot": self.continued_cot,
             "raw_tokens": self.raw_tokens, "raw_response": self.raw_response,
             "answer": self.answer, "full_prompt": self.full_prompt,
+            "choice_logprobs": self.choice_logprobs,
+            "choice_probs": self.choice_probs,
         }
 
 
@@ -78,14 +83,15 @@ class ForcingTask(BaseTask):
         self,
         question_id: str,
         rollout_idx: int = 0,
-        num_forces: int = 5,
         max_sentences: Optional[int] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
         sentence_stride: int = 1,
         verbose: bool = True,
+        # Legacy params kept for call-site compat but unused
+        num_forces: int = 1,
+        temperature: float = 0.0,
+        max_tokens: int = 2048,
     ) -> Optional[Dict[str, Any]]:
-        """Run true forcing for all sentences in the CoT via Tinker."""
+        """Run logprob-based forcing for all sentences in the CoT."""
         from tinker import ServiceClient, types
         from transformers import AutoTokenizer
 
@@ -98,6 +104,13 @@ class ForcingTask(BaseTask):
         tokenizer = AutoTokenizer.from_pretrained(self.model, trust_remote_code=True)
         client = ServiceClient()
         sampling_client = client.create_sampling_client(base_model=self.model)
+
+        # Determine answer choices based on question type
+        if isinstance(question, BinaryJudgeQuestion):
+            choices = ["YES", "NO"]
+        else:
+            choices = ["A", "B", "C", "D"]
+        choice_token_ids = self._resolve_choice_token_ids(tokenizer, choices)
 
         cot_segments = get_cumulative_cot_segments(source_cot)
         if max_sentences is not None:
@@ -114,59 +127,42 @@ class ForcingTask(BaseTask):
 
         config = {
             "model": self.model, "question_id": question.id,
-            "rollout_idx": rollout_idx, "num_forces": num_forces,
+            "rollout_idx": rollout_idx,
             "max_sentences": max_sentences, "sentence_stride": sentence_stride,
-            "temperature": temperature,
-            "max_tokens": max_tokens, "num_sentences": num_sentences,
+            "num_sentences": num_sentences,
+            "method": "anchor_logprobs",
         }
         run_dir = self.create_run_dir("forcing", question.id, rollout_idx, config)
 
         if verbose:
-            print(f"Forcing {question.id}: {num_sentences} sentences × {num_forces} forces")
+            print(f"Forcing {question.id}: {num_sentences} sentences (logprob mode)")
             print(f"Run dir: {run_dir}")
 
-        with contextlib.redirect_stdout(io.StringIO()):
-            source_token_count = len(tokenizer.encode(source_cot, add_special_tokens=False))
-
-        def force_single(sent_idx: int, force_idx: int, partial_cot: str) -> Optional[ForceResult]:
-            remaining_frac = 1.0 - len(partial_cot) / max(len(source_cot), 1)
-            sent_max_tokens = min(max(int(source_token_count * remaining_frac) + 100, 100), 1024)
-
-            prompt_str = build_thinking_prompt(
-                tokenizer, self._user_msg(question), cot_prefix=partial_cot,
+        def force_single(sent_idx: int, partial_cot: str) -> ForceResult:
+            prompt_str, choice_logprobs, choice_probs = self._get_choice_distribution(
+                sampling_client, tokenizer, types, question,
+                partial_cot, choices, choice_token_ids,
             )
-            with contextlib.redirect_stdout(io.StringIO()):
-                tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
-            model_input = types.ModelInput.from_ints(tokens)
+            # Argmax over the probability distribution
+            answer = max(choice_probs, key=choice_probs.get) if any(v > 0 for v in choice_probs.values()) else ""
+            # Serialize None logprobs to a JSON-safe value
+            safe_logprobs = {c: (lp if lp is not None else -100.0) for c, lp in choice_logprobs.items()}
+            return ForceResult(
+                sentence_idx=sent_idx, force_idx=0,
+                partial_cot=partial_cot, continued_cot="",
+                raw_tokens=[], raw_response="", answer=answer,
+                full_prompt=prompt_str,
+                choice_logprobs=safe_logprobs,
+                choice_probs=choice_probs,
+            )
 
-            params = types.SamplingParams(max_tokens=sent_max_tokens, temperature=temperature)
-            result = sampling_client.sample(prompt=model_input, num_samples=1, sampling_params=params).result()
-
-            sample_tokens = result.sequences[0].tokens
-            answer, raw_response = self._extract_answer(sample_tokens, tokenizer, question)
-
-            if answer:
-                continued_cot = raw_response.split("</think>", 1)[0] if "</think>" in raw_response else raw_response
-                return ForceResult(
-                    sentence_idx=sent_idx, force_idx=force_idx,
-                    partial_cot=partial_cot, continued_cot=continued_cot,
-                    raw_tokens=list(sample_tokens), raw_response=raw_response, answer=answer,
-                    full_prompt=prompt_str,
-                )
-            return None
-
-        all_tasks = [
-            (si, fi, cot_segments[si])
-            for si in range(num_sentences) for fi in range(num_forces)
-        ]
+        all_tasks = [(si, cot_segments[si]) for si in range(num_sentences)]
         all_results: List[ForceResult] = []
 
         with ThreadPoolExecutor(max_workers=min(300, len(all_tasks))) as executor:
-            futures = {executor.submit(force_single, si, fi, pc): (si, fi) for si, fi, pc in all_tasks}
+            futures = {executor.submit(force_single, si, pc): si for si, pc in all_tasks}
             for future in tqdm(as_completed(futures), total=len(futures), desc="Forcing", disable=not verbose):
-                r = future.result()
-                if r:
-                    all_results.append(r)
+                all_results.append(future.result())
 
         by_sentence: Dict[int, List[ForceResult]] = {}
         for r in all_results:
@@ -181,14 +177,20 @@ class ForcingTask(BaseTask):
                 force_results=[r.to_dict() for r in sent_results],
                 run_dir=run_dir,
             )
-            counts = {}
-            for r in sent_results:
-                counts[r.answer] = counts.get(r.answer, 0) + 1
+            # Use the logprob-derived probs directly as the distribution
+            if sent_results:
+                result = sent_results[0]
+                answer_distribution = result.choice_probs
+                answer = result.answer
+            else:
+                answer_distribution = {}
+                answer = ""
             all_summaries.append({
                 "sentence_idx": si, "partial_cot_length": len(cot_segments[si]),
-                "total_forces": len(sent_results), "valid_answers": len(sent_results),
-                "answer_counts": counts,
-                "most_common": max(counts.items(), key=lambda x: x[1])[0] if counts else "",
+                "total_forces": 1, "valid_answers": 1 if answer else 0,
+                "answer_distribution": answer_distribution,
+                "answer_counts": answer_distribution,  # backwards compat
+                "most_common": answer,
             })
 
         self._save_forcing_summary(question, rollout_idx, all_summaries, source_cot, run_dir)
@@ -253,12 +255,17 @@ class ForcingTask(BaseTask):
                 sentence_idx = sent["sentence_idx"]
                 if not data_slice.matches_sentence(sentence_idx):
                     continue
-                # Each sentence result has answer distributions
-                counts = sent.get("answer_counts", {})
-                total = sum(counts.values())
-                if total == 0:
+                # New format: answer_distribution stored directly
+                dist = sent.get("answer_distribution")
+                if dist is None:
+                    # Legacy format: normalize answer_counts
+                    counts = sent.get("answer_counts", {})
+                    total = sum(counts.values())
+                    if total == 0:
+                        continue
+                    dist = {k: v / total for k, v in counts.items()}
+                if not dist or all(v == 0 for v in dist.values()):
                     continue
-                dist = {k: v / total for k, v in counts.items()}
                 samples.append({
                     "question_id": question_id,
                     "sentence_idx": sentence_idx,
@@ -478,12 +485,17 @@ class ForcingTask(BaseTask):
                 continue
             if not data_slice.matches_sentence(sentence_idx):
                 continue
-            answer_counts = summary.get("answer_counts", {})
-            total = sum(answer_counts.values())
-            if total == 0:
+            # New format stores answer_distribution directly (already normalized)
+            answer_distribution = summary.get("answer_distribution")
+            if answer_distribution is None:
+                # Legacy format: normalize answer_counts
+                answer_counts = summary.get("answer_counts", {})
+                total = sum(answer_counts.values())
+                if total == 0:
+                    continue
+                answer_distribution = {k: v / total for k, v in answer_counts.items()}
+            if not answer_distribution or all(v == 0 for v in answer_distribution.values()):
                 continue
-
-            answer_distribution = {k: v / total for k, v in answer_counts.items()}
             question_type = summary.get("question_type", "multiple_choice")
 
             # Find companion activation files
@@ -765,6 +777,19 @@ class ForcingTask(BaseTask):
     @staticmethod
     def _build_sentence_summary(question: Question, sentence_idx: int,
                                 partial_cot: str, results: List[Dict]) -> Dict:
+        # New logprob-based format: use choice_probs directly if available
+        if results and "choice_probs" in results[0] and results[0]["choice_probs"]:
+            answer_distribution = results[0]["choice_probs"]
+            answer = results[0].get("answer", "")
+            return {
+                "question_id": question.id, "question_type": question.question_type,
+                "sentence_idx": sentence_idx, "partial_cot": partial_cot,
+                "total_attempts": 1, "valid_answers": 1 if answer else 0,
+                "answer_distribution": answer_distribution,
+                "answer_counts": answer_distribution,  # backwards compat
+            }
+
+        # Legacy counting-based format
         answers = [r.get("answer", "").upper() for r in results]
         if isinstance(question, BinaryJudgeQuestion):
             valid = [a for a in answers if a in ["YES", "NO"]]
@@ -779,6 +804,78 @@ class ForcingTask(BaseTask):
             "total_attempts": len(results), "valid_answers": len(valid),
             "answer_counts": counts,
         }
+
+    @staticmethod
+    def _resolve_choice_token_ids(tokenizer, choices: List[str]) -> Dict[str, int]:
+        """Map each answer string (e.g. "A") to its single token id."""
+        mapping = {}
+        for c in choices:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ids = tokenizer.encode(c, add_special_tokens=False)
+            mapping[c] = ids[-1]
+        return mapping
+
+    def _get_choice_distribution(
+        self,
+        sampling_client,
+        tokenizer,
+        types_module,
+        question: "Question",
+        partial_cot: str,
+        choices: List[str],
+        choice_token_ids: Dict[str, int],
+        topk: int = 20,
+    ) -> Tuple[str, Dict[str, Optional[float]], Dict[str, float]]:
+        """
+        Single-call logprob extraction using anchor + topk_prompt_logprobs.
+
+        Returns:
+            (full_prompt, choice_logprobs, choice_probs)
+        """
+        anchor = " So, the answer is: " if partial_cot else "So, the answer is: "
+        cot_with_anchor = partial_cot + anchor
+        prompt_str = build_thinking_prompt(
+            tokenizer, self._user_msg(question), cot_prefix=cot_with_anchor,
+        ) + "</think>\n"
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            prompt_tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
+
+        # Append a dummy answer token so the "last prompt position" becomes
+        # the answer slot. topk_prompt_logprobs[-1] then gives the model's
+        # distribution over the first response token (the answer letter).
+        dummy_id = choice_token_ids[choices[0]]
+        extended_tokens = prompt_tokens + [dummy_id]
+        extended_input = types_module.ModelInput.from_ints(extended_tokens)
+
+        topk_result = sampling_client.sample(
+            prompt=extended_input,
+            num_samples=1,
+            sampling_params=types_module.SamplingParams(max_tokens=1),
+            include_prompt_logprobs=True,
+            topk_prompt_logprobs=topk,
+        ).result()
+
+        topk_at_gen = topk_result.topk_prompt_logprobs[-1] if topk_result.topk_prompt_logprobs else []
+        topk_lookup = {tid: lp for tid, lp in topk_at_gen} if topk_at_gen else {}
+
+        # Extract logprobs for answer choices
+        choice_logprobs: Dict[str, Optional[float]] = {}
+        for c in choices:
+            tid = choice_token_ids[c]
+            choice_logprobs[c] = topk_lookup.get(tid, None)
+
+        # Softmax over found choices
+        found = {c: lp for c, lp in choice_logprobs.items() if lp is not None}
+        if found:
+            max_lp = max(found.values())
+            exps = {c: math.exp(lp - max_lp) for c, lp in found.items()}
+            total = sum(exps.values())
+            choice_probs = {c: exps.get(c, 0.0) / total for c in choices}
+        else:
+            choice_probs = {c: 0.0 for c in choices}
+
+        return prompt_str, choice_logprobs, choice_probs
 
     @staticmethod
     def _user_msg(question: Question) -> str:

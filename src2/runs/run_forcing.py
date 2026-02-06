@@ -13,7 +13,11 @@ from src2.data_slice import DataSlice
 from src2.methods import AttentionProbe, LinearProbe, LlmMonitor
 from src2.tasks import ForcingTask
 from src2.tasks.forced_response.prompts import ForcingMonitorPrompt, ForcingMonitorSingleAnswerPrompt
-from src2.utils.questions import load_custom_questions, load_gpqa_questions
+from src2.utils.questions import (
+    load_custom_questions,
+    load_gpqa_from_huggingface,
+    load_gpqa_questions,
+)
 from src2.utils.verification import ensure_verification
 
 # ── Configuration ─────────────────────────────────────────────────────
@@ -26,21 +30,40 @@ ACTIVATION_MODEL = "Qwen/Qwen3-32B"
 LAYER = 32
 
 ROLLOUT_IDX = 0
-NUM_FORCES = 1
-TEMPERATURE = 0.0
-MAX_SENTENCES = None
+MAX_SENTENCES = 30  # limit to 30 sentences per rollout
 SENTENCE_STRIDE = 1  # only force every Nth sentence (1 = every sentence)
 
+# Question source: "custom", "sample_gpqa", "gpqa_diamond", or "gpqa_hf"
+QUESTION_SOURCE = "custom"
 CUSTOM_QUESTIONS_FILE = (
     Path(__file__).resolve().parent.parent / "utils" / "questions.json"
 )
+GPQA_HF_SUBSET = "gpqa_diamond"  # HuggingFace subset name (for "gpqa_hf" source)
+MAX_QUESTIONS = None  # limit number of questions loaded (None = all)
+EXCLUDE_IDS: List[str] = ["blackmail_001"]  # question IDs to skip
+# ──────────────────────────────────────────────────────────────────────
 
 
 forcing = ForcingTask(model=SUBJECT_MODEL, data_dir=DATA_DIR)
 
-questions = load_custom_questions(CUSTOM_QUESTIONS_FILE)
-question_map = {q.id: q for q in questions if q.id != "blackmail_001"}
+if QUESTION_SOURCE == "custom":
+    questions = load_custom_questions(CUSTOM_QUESTIONS_FILE)
+elif QUESTION_SOURCE == "sample_gpqa":
+    questions = load_gpqa_questions(use_samples=True, max_questions=MAX_QUESTIONS)
+elif QUESTION_SOURCE == "gpqa_diamond":
+    questions = load_gpqa_from_huggingface(
+        subset="gpqa_diamond", max_questions=MAX_QUESTIONS
+    )
+elif QUESTION_SOURCE == "gpqa_hf":
+    questions = load_gpqa_from_huggingface(
+        subset=GPQA_HF_SUBSET, max_questions=MAX_QUESTIONS
+    )
+else:
+    raise ValueError(f"Unknown QUESTION_SOURCE: {QUESTION_SOURCE}")
+
+question_map = {q.id: q for q in questions if q.id not in EXCLUDE_IDS}
 question_ids = question_map.keys()
+print(f"Loaded {len(question_map)} questions (source={QUESTION_SOURCE})")
 
 for qid in question_map.keys():
     question = question_map.get(qid)
@@ -56,9 +79,7 @@ for qid in question_ids:
     forcing.run_data(
         question_id=qid,
         rollout_idx=ROLLOUT_IDX,
-        num_forces=NUM_FORCES,
         max_sentences=MAX_SENTENCES,
-        temperature=TEMPERATURE,
         sentence_stride=SENTENCE_STRIDE,
     )
 

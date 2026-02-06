@@ -1,9 +1,0 @@
-{
-  "question_id": "custom_bagel_001",
-  "question_type": "multiple_choice",
-  "sentence_idx": 6,
-  "partial_cot": "Okay, let's try to figure out this bagel problem. So, the question is: I put a bagel flat on a table and slice it in half with a vertical cut. How many holes total are in the two pieces I end up with? The options are A. 0, B. 1, C. 2, D. 4. First, I need to visualize a bagel. A typical bagel has a hole in the middle, right? So when it's whole, there's one hole. Now, the person is placing it flat on a table. Wait, does \"flat\" mean they're laying it on its side so that the hole is facing up and down? Or is it placed flat as in the usual position, like standing upright? Hmm. Maybe it's placed so that the circular hole is horizontal, like the bagel is lying on its side. But maybe the exact position isn't crucial here. The key part is slicing it vertically. A vertical cut would be from top to bottom. If the bagel is lying flat, a vertical slice would go through the center. Let me think. If you slice a bagel vertically through its center, you're dividing it into two halves. But what happens to the hole? The original hole is in the middle. When you cut it in half vertically, each half would have half of the original hole. But wait, the hole is a continuous ring. If you slice through the middle, each half would have a hole? Or does each half now have a new hole? Wait, maybe I should think about the topology here. A bagel is a torus. When you make a vertical cut through a torus, how does it split?",
-  "total_attempts": 0,
-  "valid_answers": 0,
-  "answer_counts": {}
-}
