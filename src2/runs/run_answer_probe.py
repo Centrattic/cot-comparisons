@@ -59,9 +59,10 @@ NUM_CLASSES = 4
 
 # Training hyperparameters
 NUM_HEADS = 4
-LR = 1e-3
-EPOCHS = 30
+LR = 1e-4
+EPOCHS = 100
 BATCH_SIZE = 32
+GRAD_CLIP = 1.0
 SEED = 42
 
 EXTRACT_ACTIVATIONS = True
@@ -200,6 +201,7 @@ def train_and_evaluate(
         max_seq_len=max_seq_len,
     ).to(device)
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     probe.train()
     for epoch in range(epochs):
@@ -229,13 +231,17 @@ def train_and_evaluate(
             pred = probe(X_pad, mask)
             loss = soft_cross_entropy(pred, y_t)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(probe.parameters(), GRAD_CLIP)
             optimizer.step()
 
             epoch_loss += loss.item()
             n_batches += 1
 
-        if (epoch + 1) % 5 == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}, loss: {epoch_loss / n_batches:.4f}")
+        scheduler.step()
+
+        if (epoch + 1) % 10 == 0:
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"  Epoch {epoch + 1}/{epochs}, loss: {epoch_loss / n_batches:.4f}, lr: {current_lr:.2e}")
 
     # Evaluate on test set (may be empty)
     probe.eval()
