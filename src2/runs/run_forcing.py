@@ -29,7 +29,7 @@ MONITOR_MODEL = "openai/gpt-5.2"
 ACTIVATION_MODEL = "Qwen/Qwen3-32B"
 LAYER = 32
 
-ROLLOUT_IDX = 0
+NUM_ROLLOUTS = 10
 MAX_SENTENCES = 30  # limit to 30 sentences per rollout
 SENTENCE_STRIDE = 1  # only force every Nth sentence (1 = every sentence)
 
@@ -41,6 +41,7 @@ CUSTOM_QUESTIONS_FILE = (
 GPQA_HF_SUBSET = "gpqa_diamond"  # HuggingFace subset name (for "gpqa_hf" source)
 MAX_QUESTIONS = None  # limit number of questions loaded (None = all)
 EXCLUDE_IDS: List[str] = ["blackmail_001"]  # question IDs to skip
+INCLUDE_IDS: List[str] = ["blackmail_mc_001", "blackmail_ab_001"]  # if non-empty, ONLY run these IDs
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -62,6 +63,8 @@ else:
     raise ValueError(f"Unknown QUESTION_SOURCE: {QUESTION_SOURCE}")
 
 question_map = {q.id: q for q in questions if q.id not in EXCLUDE_IDS}
+if INCLUDE_IDS:
+    question_map = {qid: q for qid, q in question_map.items() if qid in INCLUDE_IDS}
 question_ids = question_map.keys()
 print(f"Loaded {len(question_map)} questions (source={QUESTION_SOURCE})")
 
@@ -76,45 +79,46 @@ for qid in question_map.keys():
 
 # generate forcing data
 for qid in question_ids:
-    forcing.run_data(
-        question_id=qid,
-        rollout_idx=ROLLOUT_IDX,
-        max_sentences=MAX_SENTENCES,
-        sentence_stride=SENTENCE_STRIDE,
-    )
+    for rollout_idx in range(NUM_ROLLOUTS):
+        forcing.run_data(
+            question_id=qid,
+            rollout_idx=rollout_idx,
+            max_sentences=MAX_SENTENCES,
+            sentence_stride=SENTENCE_STRIDE,
+        )
 
 assert forcing.get_data()
 
-# extract activations for white box methods
-forcing.extract_activations(
-    model_name=ACTIVATION_MODEL,
-    layer=LAYER,
-    data_slice=DataSlice.all(),
-)
+# # extract activations for white box methods
+# forcing.extract_activations(
+#     model_name=ACTIVATION_MODEL,
+#     layer=LAYER,
+#     data_slice=DataSlice.all(),
+# )
 
-methods = []
-# Use single-answer prompt with temperature=0 for deterministic predictions
-methods.append(LlmMonitor(
-    prompt=ForcingMonitorSingleAnswerPrompt(),
-    model=MONITOR_MODEL,
-    temperature=0.0,
-))
+# methods = []
+# # Use single-answer prompt with temperature=0 for deterministic predictions
+# methods.append(LlmMonitor(
+#     prompt=ForcingMonitorSingleAnswerPrompt(),
+#     model=MONITOR_MODEL,
+#     temperature=0.0,
+# ))
 
-# methods.append(LinearProbe(layer=LAYER, mode="soft_ce"))
+# # methods.append(LinearProbe(layer=LAYER, mode="soft_ce"))
 
-for m in methods:
-    m.set_task(forcing)
+# for m in methods:
+#     m.set_task(forcing)
 
-    if isinstance(m, LlmMonitor):
-        monitor_data = forcing.prepare_for_monitor(DataSlice.all())
-        m.infer(monitor_data)
-    elif isinstance(m, LinearProbe):
-        probe_data = forcing.get_probe_data(layer=LAYER, data_slice=DataSlice.all())
-        m.train(probe_data)
-        m.infer(probe_data)
+#     if isinstance(m, LlmMonitor):
+#         monitor_data = forcing.prepare_for_monitor(DataSlice.all())
+#         m.infer(monitor_data)
+#     elif isinstance(m, LinearProbe):
+#         probe_data = forcing.get_probe_data(layer=LAYER, data_slice=DataSlice.all())
+#         m.train(probe_data)
+#         m.infer(probe_data)
 
-    assert m._output is not None
-    m._output.mark_success()
+#     assert m._output is not None
+#     m._output.mark_success()
 
 # attention probe
 # probe_data = forcing.build_attention_probe_data(

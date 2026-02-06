@@ -46,7 +46,7 @@ NUM_GPQA_TRAIN = 50
 NUM_GPQA_EVAL = 10
 
 # Extra eval-only questions
-EXTRA_EVAL_IDS = ["blackmail_mc_001"]
+EXTRA_EVAL_IDS = ["blackmail_mc_001", "blackmail_ab_001"]
 
 # Sentence sampling: sample this many sentence indices per question.
 # Each index appears in all rollouts, so total samples per question ≈
@@ -447,18 +447,13 @@ def main():
 
     # ── Step 3: Extract activations if needed ─────────────────────────
     if EXTRACT_ACTIVATIONS:
-        # Merge all sampled sentence indices into one DataSlice so the model
-        # is loaded only once for the entire extraction pass.
-        all_sentence_indices = set()
-        for indices in sentence_map.values():
-            all_sentence_indices.update(indices)
-        ds = DataSlice(
-            ids=set(all_question_ids),
-            sentence_indices=all_sentence_indices,
-        )
-        print(f"\nExtracting activations for {len(all_question_ids)} questions, "
-              f"{len(all_sentence_indices)} unique sentence indices...")
-        forcing.extract_activations(
+        # No sentence_indices filter: batched extraction runs one forward pass
+        # per rollout covering ALL sentences. Sentence sampling happens at
+        # data-loading time (step 4).
+        ds = DataSlice(ids=set(all_question_ids))
+        print(f"\nExtracting activations for {len(all_question_ids)} questions "
+              f"(all sentences per rollout, batched)...")
+        forcing.extract_activations_batched(
             model_name=ACTIVATION_MODEL,
             layer=LAYER,
             data_slice=ds,

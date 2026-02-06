@@ -34,7 +34,9 @@ SUBJECT_MODEL = "Qwen/Qwen3-32B"
 
 # Questions
 NUM_GPQA_QUESTIONS = 60  # load enough for 50 train + 10 eval
-CUSTOM_QUESTIONS_FILE = Path(__file__).resolve().parent.parent / "utils" / "questions.json"
+CUSTOM_QUESTIONS_FILE = (
+    Path(__file__).resolve().parent.parent / "utils" / "questions.json"
+)
 CUSTOM_IDS = ["custom_bagel_001", "starfish", "waffle"]  # also need 10 rollouts
 EXCLUDE_IDS: List[str] = ["blackmail_001", "blackmail_mc_001"]
 
@@ -94,11 +96,14 @@ def main():
     # ── Step 1: Load custom + GPQA Diamond questions ────────────────
     custom_questions = load_custom_questions(CUSTOM_QUESTIONS_FILE)
     custom_questions = [q for q in custom_questions if q.id in CUSTOM_IDS]
-    print(f"Loaded {len(custom_questions)} custom questions: {[q.id for q in custom_questions]}")
+    print(
+        f"Loaded {len(custom_questions)} custom questions: {[q.id for q in custom_questions]}"
+    )
 
     print(f"Loading {NUM_GPQA_QUESTIONS} GPQA Diamond questions from HuggingFace...")
     gpqa_questions = load_gpqa_from_huggingface(
-        subset="gpqa_diamond", max_questions=NUM_GPQA_QUESTIONS,
+        subset="gpqa_diamond",
+        max_questions=NUM_GPQA_QUESTIONS,
     )
     gpqa_questions = [q for q in gpqa_questions if q.id not in EXCLUDE_IDS]
     print(f"  {len(gpqa_questions)} GPQA questions loaded")
@@ -107,31 +112,33 @@ def main():
     print(f"  {len(questions)} total questions")
 
     # ── Step 2: Run verification for all questions in parallel ──────
-    print(f"\nStep 1/2: Verification ({NUM_VERIFICATION_ROLLOUTS} rollouts × {len(questions)} questions, all parallel)")
-    print("=" * 60)
+    # print(f"\nStep 1/2: Verification ({NUM_VERIFICATION_ROLLOUTS} rollouts × {len(questions)} questions, all parallel)")
+    # print("=" * 60)
 
-    def _verify_one(q):
-        return q, ensure_verification(
-            question=q,
-            verification_dir=VERIFICATION_DIR,
-            num_rollouts=NUM_VERIFICATION_ROLLOUTS,
-            model=SUBJECT_MODEL,
-            temperature=VERIFICATION_TEMPERATURE,
-            max_tokens=VERIFICATION_MAX_TOKENS,
-            max_workers=VERIFICATION_MAX_WORKERS,
-        )
+    # def _verify_one(q):
+    #     return q, ensure_verification(
+    #         question=q,
+    #         verification_dir=VERIFICATION_DIR,
+    #         num_rollouts=NUM_VERIFICATION_ROLLOUTS,
+    #         model=SUBJECT_MODEL,
+    #         temperature=VERIFICATION_TEMPERATURE,
+    #         max_tokens=VERIFICATION_MAX_TOKENS,
+    #         max_workers=VERIFICATION_MAX_WORKERS,
+    #     )
 
-    with ThreadPoolExecutor(max_workers=len(questions)) as executor:
-        futures = {executor.submit(_verify_one, q): q for q in questions}
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Verification"):
-            q, summary = future.result()
-            rate = summary["agreement_rate"]
-            top = summary["most_common_answer"]
-            valid = summary["valid_rollouts"]
-            tqdm.write(f"  {q.id}: {valid}/{summary['total_rollouts']} valid, agreement={rate:.0%} ({top})")
+    # with ThreadPoolExecutor(max_workers=len(questions)) as executor:
+    #     futures = {executor.submit(_verify_one, q): q for q in questions}
+    #     for future in tqdm(as_completed(futures), total=len(futures), desc="Verification"):
+    #         q, summary = future.result()
+    #         rate = summary["agreement_rate"]
+    #         top = summary["most_common_answer"]
+    #         valid = summary["valid_rollouts"]
+    #         tqdm.write(f"  {q.id}: {valid}/{summary['total_rollouts']} valid, agreement={rate:.0%} ({top})")
 
     # ── Step 3: Build list of all (question, rollout) forcing jobs ─────
-    print(f"\nStep 2/2: Forcing (rollouts 0-{NUM_VERIFICATION_ROLLOUTS - 1} per question)")
+    print(
+        f"\nStep 2/2: Forcing (rollouts 0-{NUM_VERIFICATION_ROLLOUTS - 1} per question)"
+    )
     print("=" * 60)
 
     jobs = []
@@ -159,12 +166,15 @@ def main():
     results = []
     failed = []
 
-    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+    with ThreadPoolExecutor(max_workers=15) as executor:
         futures = {
             executor.submit(
                 run_single_forcing_job,
-                forcing, qid, ridx,
-                MAX_SENTENCES, SENTENCE_STRIDE,
+                forcing,
+                qid,
+                ridx,
+                MAX_SENTENCES,
+                SENTENCE_STRIDE,
             ): (qid, ridx)
             for qid, ridx in jobs
         }
@@ -179,7 +189,9 @@ def main():
                 n_sent = result["num_sentences"]
                 pbar.set_postfix_str(f"{qid} r{ridx}: {status} ({n_sent} sent)")
             except Exception as e:
-                failed.append({"question_id": qid, "rollout_idx": ridx, "error": str(e)})
+                failed.append(
+                    {"question_id": qid, "rollout_idx": ridx, "error": str(e)}
+                )
                 tqdm.write(f"  FAILED: {qid} rollout {ridx}: {e}")
                 traceback.print_exc()
             pbar.update(1)
@@ -188,7 +200,9 @@ def main():
     # ── Step 5: Summary ───────────────────────────────────────────────
     ok = [r for r in results if r["status"] == "ok"]
     skip = [r for r in results if r["status"] == "skipped"]
-    print(f"\nDone: {len(ok)} succeeded, {len(skip)} skipped (no CoT), {len(failed)} failed")
+    print(
+        f"\nDone: {len(ok)} succeeded, {len(skip)} skipped (no CoT), {len(failed)} failed"
+    )
 
     if failed:
         print("\nFailed jobs:")

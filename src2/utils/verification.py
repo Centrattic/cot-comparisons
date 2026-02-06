@@ -61,7 +61,8 @@ def _format_user_message(question: Question) -> str:
         return question.question
     labels = [chr(ord("A") + i) for i in range(len(question.choices))]
     choices = "\n".join(f"{l}. {c}" for l, c in zip(labels, question.choices))
-    return f"{question.question}\n\n{choices}\n\nAnswer with just the letter (A, B, C, or D)."
+    labels_str = ", ".join(labels[:-1]) + f", or {labels[-1]}" if len(labels) > 2 else " or ".join(labels)
+    return f"{question.question}\n\n{choices}\n\nAnswer with just the letter ({labels_str})."
 
 
 def build_verification_prompt(question: Question, tokenizer) -> str:

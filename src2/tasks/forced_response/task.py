@@ -109,7 +109,8 @@ class ForcingTask(BaseTask):
         if isinstance(question, BinaryJudgeQuestion):
             choices = ["YES", "NO"]
         else:
-            choices = ["A", "B", "C", "D"]
+            n_choices = len(question.choices)
+            choices = [chr(ord("A") + i) for i in range(n_choices)]
         choice_token_ids = self._resolve_choice_token_ids(tokenizer, choices)
 
         cot_segments = get_cumulative_cot_segments(source_cot)
@@ -435,6 +436,147 @@ class ForcingTask(BaseTask):
 
         print(f"Activations extracted for forcing data in {self.forcing_dir}")
 
+    def extract_activations_batched(
+        self,
+        model_name: str,
+        layer: int,
+        data_slice: DataSlice,
+        load_in_4bit: bool = False,
+    ) -> None:
+        """Extract prompt-only activations using rollout batching.
+
+        Groups force files by rollout ``(question_id, rollout_idx, timestamp)``
+        and runs ONE forward pass per rollout on the longest prompt.  Saves a
+        single ``rollout_activations.npz`` per rollout containing the full
+        activation array plus a sentence→token_count mapping.  At training time,
+        ``get_probe_data`` slices the appropriate prefix for each sentence.
+
+        Only filters by ``data_slice.ids`` (question IDs).  Sentence sampling
+        happens later at training-data-loading time, since the forward pass
+        already covers every sentence in the rollout.
+        """
+        from ...utils.activations import ActivationExtractor
+
+        if not self.forcing_dir.exists():
+            raise RuntimeError(f"No forcing data found at {self.forcing_dir}")
+
+        run_files = sorted(self.forcing_dir.rglob("force_*.json"))
+        if not run_files:
+            raise RuntimeError(f"No force run files found in {self.forcing_dir}")
+
+        run_files = data_slice.filter_paths(run_files)
+
+        seq_key = f"layer{layer}_full_sequence"
+        idx_key = f"layer{layer}_sentence_indices"
+        cnt_key = f"layer{layer}_token_counts"
+
+        # Group files by rollout: (question_id, rollout_dir, timestamp) → [(sentence_idx, path)]
+        # No sentence_idx filtering — we extract ALL sentences per rollout.
+        rollout_groups: Dict[Tuple[str, str, str], List[Tuple[int, Path]]] = {}
+
+        for rp in run_files:
+            parts = rp.parts
+            sentence_idx = None
+            for part in parts:
+                if part.startswith("sentence_"):
+                    try:
+                        sentence_idx = int(part.split("_", 1)[1])
+                    except ValueError:
+                        pass
+            question_id = None
+            try:
+                forcing_idx = parts.index("forcing")
+                if forcing_idx + 1 < len(parts):
+                    question_id = parts[forcing_idx + 1]
+            except ValueError:
+                pass
+
+            if question_id is not None and not data_slice.matches_id(question_id):
+                continue
+            if question_id is None or sentence_idx is None:
+                continue
+
+            try:
+                rollout_dir = parts[forcing_idx + 2]
+                timestamp = parts[forcing_idx + 3]
+            except IndexError:
+                continue
+
+            key = (question_id, rollout_dir, timestamp)
+            rollout_groups.setdefault(key, []).append((sentence_idx, rp))
+
+        if not rollout_groups:
+            print("No matching force files found after filtering.")
+            return
+
+        extractor = ActivationExtractor(
+            model_name=model_name, load_in_4bit=load_in_4bit,
+        )
+
+        total_rollouts = len(rollout_groups)
+        total_sentences = sum(len(v) for v in rollout_groups.values())
+        print(f"Batched extraction: {total_sentences} sentences across {total_rollouts} rollouts")
+
+        for group_key, sentence_files in tqdm(
+            rollout_groups.items(), desc="Extracting activations (batched)",
+        ):
+            # Determine the rollout-level save path from any sentence's path
+            # .../forcing/{qid}/{rollout_NNN}/{timestamp}/sentence_*/force_*.json
+            # → .../forcing/{qid}/{rollout_NNN}/{timestamp}/rollout_activations.npz
+            sample_path = sentence_files[0][1]
+            rollout_dir_path = sample_path.parent.parent  # timestamp directory
+            act_path = rollout_dir_path / "rollout_activations.npz"
+
+            # Skip if already extracted for this layer
+            if act_path.exists():
+                with np.load(act_path) as f:
+                    if seq_key in f.files:
+                        continue
+
+            # Load full_prompt for every sentence in the rollout
+            prompts_by_sentence: Dict[int, str] = {}
+            for sent_idx, run_path in sentence_files:
+                with open(run_path) as f:
+                    run_data = json.load(f)
+                full_prompt = run_data.get("full_prompt", "")
+                if full_prompt:
+                    prompts_by_sentence[sent_idx] = full_prompt
+
+            if not prompts_by_sentence:
+                continue
+
+            # ONE forward pass for the entire rollout
+            try:
+                result = extractor.extract_rollout_activations(
+                    prompts_by_sentence, layer,
+                )
+            except Exception:
+                continue
+            if result is None:
+                continue
+
+            full_activations, token_counts = result
+
+            # Build parallel arrays for sentence_idx → token_count mapping
+            sorted_sents = sorted(token_counts.keys())
+            sent_indices_arr = np.array(sorted_sents, dtype=np.int64)
+            token_counts_arr = np.array(
+                [token_counts[s] for s in sorted_sents], dtype=np.int64,
+            )
+
+            # Save (merge with any existing keys from other layers)
+            arrays = {}
+            if act_path.exists():
+                with np.load(act_path) as f:
+                    for k in f.files:
+                        arrays[k] = f[k]
+            arrays[seq_key] = full_activations
+            arrays[idx_key] = sent_indices_arr
+            arrays[cnt_key] = token_counts_arr
+            np.savez(act_path, **arrays)
+
+        print(f"Batched activations extracted for forcing data in {self.forcing_dir}")
+
     def get_probe_data(
         self,
         layer: int,
@@ -466,12 +608,18 @@ class ForcingTask(BaseTask):
         """
         seq_key = f"layer{layer}_full_sequence"
         bnd_key = f"layer{layer}_boundaries"
+        idx_key = f"layer{layer}_sentence_indices"
+        cnt_key = f"layer{layer}_token_counts"
         legacy_key = f"layer{layer}_{token_position}"
         boundary_names = ["last_input", "last_thinking", "last_response"]
 
         # Load sentence-level summaries to get answer distributions
         summary_files = sorted(self.forcing_dir.rglob("sentence_*/summary.json"))
         summary_files = data_slice.filter_paths(summary_files)
+
+        # Cache rollout-level npz data to avoid re-loading for every sentence
+        # Key: rollout_dir_path (Path) → (full_seq, {sentence_idx: n_tokens})
+        _rollout_cache: Dict[Path, Tuple[np.ndarray, Dict[int, int]]] = {}
 
         samples = []
         for summary_path in summary_files:
@@ -498,47 +646,80 @@ class ForcingTask(BaseTask):
                 continue
             question_type = summary.get("question_type", "multiple_choice")
 
-            # Find companion activation files
-            act_files = sorted(sentence_dir.glob("force_*.npz"))
-            for act_path in act_files:
-                with np.load(act_path) as f:
-                    if seq_key in f.files:
-                        full_seq = f[seq_key]
-                        boundaries = f[bnd_key]
+            activation = None
+
+            # --- Try rollout-level npz first (new batched format) ---
+            rollout_dir_path = sentence_dir.parent
+            rollout_npz = rollout_dir_path / "rollout_activations.npz"
+            if rollout_npz.exists():
+                if rollout_dir_path not in _rollout_cache:
+                    with np.load(rollout_npz) as f:
+                        if seq_key in f.files and idx_key in f.files and cnt_key in f.files:
+                            full_seq = f[seq_key]
+                            sent_indices = f[idx_key]
+                            tok_counts = f[cnt_key]
+                            tc_map = dict(zip(sent_indices.tolist(), tok_counts.tolist()))
+                            _rollout_cache[rollout_dir_path] = (full_seq, tc_map)
+
+                cached = _rollout_cache.get(rollout_dir_path)
+                if cached is not None:
+                    full_seq, tc_map = cached
+                    n_tokens = tc_map.get(sentence_idx)
+                    if n_tokens is not None:
                         if token_position == "full_sequence":
-                            activation = full_seq
+                            activation = full_seq[:n_tokens, :].copy()
                         elif token_position in boundary_names:
-                            idx = boundaries[boundary_names.index(token_position)]
-                            if idx < 0:
+                            # Prompt-only: all boundaries point to end of prompt
+                            activation = full_seq[n_tokens - 1].copy()
+                        else:
+                            pass  # fall through
+
+            # --- Fall back to sentence-level npz (old per-file format) ---
+            if activation is None:
+                act_files = sorted(sentence_dir.glob("force_*.npz"))
+                for act_path in act_files:
+                    with np.load(act_path) as f:
+                        if seq_key in f.files:
+                            full_seq = f[seq_key]
+                            boundaries = f[bnd_key]
+                            if token_position == "full_sequence":
+                                activation = full_seq
+                            elif token_position in boundary_names:
+                                idx = boundaries[boundary_names.index(token_position)]
+                                if idx < 0:
+                                    continue
+                                activation = full_seq[idx]
+                            else:
                                 continue
-                            activation = full_seq[idx]
+                        elif legacy_key in f.files:
+                            # Backwards compat: old single-token extractions
+                            activation = f[legacy_key]
                         else:
                             continue
-                    elif legacy_key in f.files:
-                        # Backwards compat: old single-token extractions
-                        activation = f[legacy_key]
-                    else:
-                        continue
+                    break  # use first valid npz
 
-                # Load companion JSON for text data
-                json_path = act_path.with_suffix(".json")
-                text_data = {}
-                if json_path.exists():
-                    with open(json_path) as f:
-                        text_data = json.load(f)
+            if activation is None:
+                continue
 
-                samples.append({
-                    "activation": activation,
-                    "answer_distribution": answer_distribution,
-                    "question_id": question_id,
-                    "question_type": question_type,
-                    "sentence_idx": sentence_idx,
-                    "partial_cot": text_data.get("partial_cot", ""),
-                    "continued_cot": text_data.get("continued_cot", ""),
-                    "raw_response": text_data.get("raw_response", ""),
-                    "full_prompt": text_data.get("full_prompt", ""),
-                    "answer": text_data.get("answer", ""),
-                })
+            # Load companion JSON for text data
+            json_path = sentence_dir / "force_000.json"
+            text_data = {}
+            if json_path.exists():
+                with open(json_path) as f:
+                    text_data = json.load(f)
+
+            samples.append({
+                "activation": activation,
+                "answer_distribution": answer_distribution,
+                "question_id": question_id,
+                "question_type": question_type,
+                "sentence_idx": sentence_idx,
+                "partial_cot": text_data.get("partial_cot", ""),
+                "continued_cot": text_data.get("continued_cot", ""),
+                "raw_response": text_data.get("raw_response", ""),
+                "full_prompt": text_data.get("full_prompt", ""),
+                "answer": text_data.get("answer", ""),
+            })
 
         return samples
 
@@ -650,18 +831,6 @@ class ForcingTask(BaseTask):
             return None
 
         return question, source_cot
-
-    def get_verified_questions(self, threshold: float = 0.8) -> List[str]:
-        """Get question IDs that meet the verification agreement threshold."""
-        verified = []
-        if not self.verification_dir.exists():
-            return verified
-        for qdir in self.verification_dir.iterdir():
-            if qdir.is_dir():
-                summary = self._load_verification_summary(qdir.name)
-                if summary and summary.get("agreement_rate", 0) >= threshold:
-                    verified.append(qdir.name)
-        return verified
 
     # ------------------------------------------------------------------
     # Directory helpers
@@ -883,7 +1052,8 @@ class ForcingTask(BaseTask):
             return question.question
         labels = [chr(ord("A") + i) for i in range(len(question.choices))]
         choices = "\n".join(f"{l}. {c}" for l, c in zip(labels, question.choices))
-        return f"{question.question}\n\n{choices}\n\nAnswer with just the letter (A, B, C, or D)."
+        labels_str = ", ".join(labels[:-1]) + f", or {labels[-1]}" if len(labels) > 2 else " or ".join(labels)
+        return f"{question.question}\n\n{choices}\n\nAnswer with just the letter ({labels_str})."
 
     @staticmethod
     def _extract_answer(tokens, tokenizer, question: Question):

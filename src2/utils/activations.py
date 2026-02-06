@@ -156,6 +156,55 @@ class ActivationExtractor:
 
         return activations["resid"][0].cpu().float().numpy()  # [seq_len, hidden_dim]
 
+    def extract_rollout_activations(
+        self,
+        prompts_by_sentence: Dict[int, str],
+        layer: int,
+        max_length: int = 4096,
+    ) -> Optional[tuple]:
+        """Extract prompt-only activations for all sentences in a rollout with one forward pass.
+
+        Because prompts within a rollout are nested prefixes (sentence 0's prompt
+        is a prefix of sentence 1's, etc.), a single forward pass on the longest
+        prompt gives correct activations for ALL sentences — the caller just
+        slices ``full_activations[:token_counts[i], :]`` for sentence ``i``.
+
+        Args:
+            prompts_by_sentence: ``{sentence_idx: full_prompt_text}`` — must be
+                nested prefixes (each shorter prompt is a prefix of longer ones).
+            layer: Model layer to extract from.
+            max_length: Tokenizer truncation limit.
+
+        Returns:
+            ``(full_activations [max_tokens, hidden_dim], token_counts {sentence_idx: n_tokens})``
+            or ``None`` if prompts_by_sentence is empty.
+        """
+        if not prompts_by_sentence:
+            return None
+
+        # Find the sentence with the longest prompt
+        longest_idx = max(prompts_by_sentence, key=lambda k: len(prompts_by_sentence[k]))
+        longest_prompt = prompts_by_sentence[longest_idx]
+
+        # Tokenize each prompt to get its token count.
+        # Use self.tokenizer() (not .encode(add_special_tokens=False)) to match
+        # how extract_full_sequence tokenizes the longest prompt for the forward pass.
+        token_counts: Dict[int, int] = {}
+        for sent_idx, prompt_text in prompts_by_sentence.items():
+            ids = self.tokenizer(
+                prompt_text, truncation=True, max_length=max_length,
+            )["input_ids"]
+            token_counts[sent_idx] = len(ids)
+
+        # Run ONE forward pass on the longest prompt
+        full_activations = self.extract_full_sequence(longest_prompt, layer, max_length)
+
+        # Clamp token counts to actual sequence length (handles truncation)
+        for sent_idx in token_counts:
+            token_counts[sent_idx] = min(token_counts[sent_idx], full_activations.shape[0])
+
+        return full_activations, token_counts
+
     def find_token_positions(self, prompt: str, thinking: str, answer: str) -> Dict[str, int]:
         """Find token indices for last_input, last_thinking, last_response."""
         full_response = f"<think>{thinking}</think>{answer}"
