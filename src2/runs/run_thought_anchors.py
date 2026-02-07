@@ -11,10 +11,11 @@ Two evaluation modes:
   - "correctness": P(correct_answer | compressed_cot). No baseline needed.
 
 Usage:
-    python -m src2.runs.run_thought_anchors
+    python -m src2.runs.run_thought_anchors [question_id] [num_rollouts]
 """
 
 import json
+import sys
 from pathlib import Path
 
 from src2.methods import ThoughtAnchors
@@ -31,8 +32,11 @@ REGION = "prefix"
 
 EVAL_MODE = "kl_divergence"  # "kl_divergence" or "correctness"
 
-QUESTION_ID = "starfish"
+QUESTION_ID = sys.argv[1] if len(sys.argv) > 1 else "starfish"
+NUM_ROLLOUTS = int(sys.argv[2]) if len(sys.argv) > 2 else 25
 NUM_RESAMPLES = 50
+
+print(f"Thought Anchors: {QUESTION_ID}, {NUM_ROLLOUTS} rollouts, mode={EVAL_MODE}")
 
 task = CompressedCotTask(
     model=SUBJECT_MODEL,
@@ -41,6 +45,13 @@ task = CompressedCotTask(
     compress_pct=COMPRESS_PCT,
     region=REGION,
 )
+
+# Generate any missing compression specs (no API calls, just metadata)
+for ridx in range(NUM_ROLLOUTS):
+    spec_dir = task.compression_dir / QUESTION_ID / f"rollout_{ridx:03d}"
+    if not any(spec_dir.rglob("compression_spec.json")) if spec_dir.exists() else True:
+        print(f"  Generating spec for rollout {ridx}...")
+        task.run_data(question_id=QUESTION_ID, rollout_idx=ridx, verbose=False)
 
 # Baseline only needed for KL mode
 baseline = None
@@ -52,13 +63,24 @@ if EVAL_MODE == "kl_divergence":
     with open(baseline_path) as f:
         baseline = json.load(f)
 
+# Load all specs, filter to our question, deduplicate by rollout_idx (keep latest)
 all_rows = task.prepare_for_thought_anchors()
-assert all_rows, "No compression specs found — run run_compression.py first"
-print(f"Found {len(all_rows)} rollout specs")
+seen = {}
+for row in all_rows:
+    if row.get("question_id") != QUESTION_ID:
+        continue
+    ridx = row.get("rollout_idx", -1)
+    if ridx < 0 or ridx >= NUM_ROLLOUTS:
+        continue
+    seen[ridx] = row  # later entries overwrite earlier (sorted by time)
+rows = [seen[k] for k in sorted(seen)]
+
+assert rows, f"No specs found for {QUESTION_ID}"
+print(f"Running on {len(rows)} rollouts")
 
 anchors = ThoughtAnchors(model=SUBJECT_MODEL)
 anchors.set_task(task)
-anchor_results = anchors.infer(all_rows)
+anchor_results = anchors.infer(rows)
 anchors._output.mark_success()
 
 all_eval_results = []

@@ -60,7 +60,8 @@ NUM_CLASSES = 4
 
 # Training hyperparameters
 BOTTLENECK_DIM = 64  # project 5120→64 before probe
-FREEZE_PROJECTION = True  # frozen random projection (can't memorize) vs learned bottleneck
+FREEZE_PROJECTION = False  # frozen random projection vs learned bottleneck
+MEAN_SUBTRACT = True  # subtract per-question mean activation to remove question identity
 NUM_HEADS = 2
 LR = 4e-4
 EPOCHS = 200
@@ -210,6 +211,38 @@ def load_probe_data(
         "question_ids": q_ids,
         "sentence_indices": s_indices,
     }
+
+
+def mean_subtract_per_question(data: dict) -> dict:
+    """Subtract per-question mean activation from every token in every sample.
+
+    For each question, computes the mean activation vector across ALL tokens
+    across ALL samples, then subtracts it from every token position. This
+    removes the question-specific fingerprint, leaving only within-question
+    variation (how certainty evolves through the CoT).
+
+    Modifies data in-place and returns it. Also returns the computed means
+    so they can be applied to other splits of the same questions.
+    """
+    from collections import defaultdict
+
+    # Group sample indices by question
+    qid_to_indices = defaultdict(list)
+    for i, qid in enumerate(data["question_ids"]):
+        qid_to_indices[qid].append(i)
+
+    # Compute mean activation per question (mean over all tokens in all samples)
+    question_means = {}
+    for qid, indices in qid_to_indices.items():
+        all_tokens = np.concatenate([data["X_list"][i] for i in indices], axis=0)
+        question_means[qid] = all_tokens.mean(axis=0)  # [hidden_dim]
+
+    # Subtract from each sample
+    for i, qid in enumerate(data["question_ids"]):
+        data["X_list"][i] = data["X_list"][i] - question_means[qid]
+
+    data["_question_means"] = question_means
+    return data
 
 
 def soft_cross_entropy(
@@ -752,6 +785,15 @@ def main():
         print("Too few training samples. Exiting.")
         return
 
+    # ── Step 5b: Per-question mean subtraction ────────────────────────
+    if MEAN_SUBTRACT:
+        print("\nApplying per-question mean subtraction...")
+        train_data = mean_subtract_per_question(train_data)
+        val_data = mean_subtract_per_question(val_data)
+        if eval_data:
+            eval_data = mean_subtract_per_question(eval_data)
+        print("  Done — question identity signal removed from activations")
+
     # ── Step 6: Train and evaluate ────────────────────────────────────
     print("\nTraining soft-label attention probe...")
     results = train_and_evaluate(
@@ -810,6 +852,7 @@ def main():
             "num_gpqa_eval": NUM_GPQA_EVAL,
             "bottleneck_dim": BOTTLENECK_DIM,
             "freeze_projection": FREEZE_PROJECTION,
+            "mean_subtract": MEAN_SUBTRACT,
             "num_heads": NUM_HEADS,
             "lr": LR,
             "epochs": EPOCHS,
