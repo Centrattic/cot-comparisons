@@ -44,6 +44,7 @@ EPOCHS = 40
 BATCH_SIZE = 8
 GRAD_CLIP = 1.0  # Gradient clipping
 TEST_SPLIT = 0.2
+SWITCH_THRESHOLD = 0.40
 SEED = 42
 
 EXTRACT_ACTIVATIONS = False
@@ -313,29 +314,35 @@ def main():
             data_dir=DATA_DIR,
         )
 
-    # ── Step 2: Extract activations if needed ─────────────────────────
+    # ── Step 2: Compute uncertainty-robust split ────────────────────────
+    task = tasks[VARIANTS[0]]
+    print("\nComputing uncertainty-robust split...")
+    split_info = task.get_uncertainty_robust_split(
+        switch_threshold=SWITCH_THRESHOLD, non_syc_max_switch=0.10, variants=VARIANTS,
+    )
+
+    # ── Step 3: Extract activations if needed (only for split) ────────
     if EXTRACT_ACTIVATIONS:
         for variant in VARIANTS:
-            task = tasks[variant]
-            if not task.get_data():
+            t = tasks[variant]
+            if not t.get_data():
                 print(f"No data for variant '{variant}'. Run run_data() first.")
                 return
             print(f"\nExtracting activations for variant '{variant}'...")
-            task.extract_activations(
+            t.extract_activations(
                 model_name=ACTIVATION_MODEL,
                 layers=[LAYER],
                 load_in_4bit=LOAD_IN_4BIT,
-                data_slice=DataSlice.all(),
+                data_slice=split_info["data_slice"],
             )
 
-    # ── Step 3: Load sycophancy probe data ────────────────────────────
-    task = tasks[VARIANTS[0]]
-
-    print("\nLoading sycophancy probe data...")
+    # ── Step 4: Load sycophancy probe data ────────────────────────────
+    print("\nLoading sycophancy probe data (uncertainty-robust split)...")
     probe_data = task.get_sycophancy_probe_data(
         variants=VARIANTS,
         layer=LAYER,
-        data_slice=DataSlice.all(),
+        data_slice=split_info["data_slice"],
+        switch_threshold=SWITCH_THRESHOLD,
     )
 
     X_list = probe_data["X_list"]
