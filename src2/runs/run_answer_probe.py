@@ -59,10 +59,11 @@ ANSWER_LABELS = ["A", "B", "C", "D"]
 NUM_CLASSES = 4
 
 # Training hyperparameters
+BOTTLENECK_DIM = 64  # project 5120→64 before attention probe (~330K params vs ~26M)
 NUM_HEADS = 2
 LR = 4e-4
 EPOCHS = 200
-BATCH_SIZE = 32
+BATCH_SIZE = 256
 GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.01
 DROPOUT = 0.3
@@ -70,10 +71,10 @@ SEED = 42
 
 # Validation / early stopping
 VAL_SPLIT = 0.2   # fraction of train questions held out for validation
-PATIENCE = 10      # stop if val loss doesn't improve for this many epochs
+PATIENCE = 20      # stop if val loss doesn't improve for this many epochs
 MIN_DELTA = 0.01   # minimum val loss decrease to count as improvement
 
-EXTRACT_ACTIVATIONS = True
+EXTRACT_ACTIVATIONS = False
 TOKEN_POSITION = "full_sequence"
 
 
@@ -175,6 +176,45 @@ def soft_cross_entropy(
     return -(target_probs * log_probs).sum(dim=-1).mean()
 
 
+# ── Bottleneck wrapper ────────────────────────────────────────────
+
+
+class BottleneckAttentionProbe(nn.Module):
+    """Project high-dim activations down before attention pooling.
+
+    5120 → bottleneck_dim → AttentionPoolingProbe(hidden_dim=bottleneck_dim)
+    Reduces param count from ~26M to ~330K.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        bottleneck_dim: int,
+        num_heads: int,
+        output_dim: int,
+        max_seq_len: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim, bottleneck_dim),
+            nn.LayerNorm(bottleneck_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.attn_probe = AttentionPoolingProbe(
+            hidden_dim=bottleneck_dim,
+            num_heads=num_heads,
+            output_dim=output_dim,
+            max_seq_len=max_seq_len,
+            dropout=dropout,
+        )
+
+    def forward(self, x, mask=None):
+        x = self.proj(x)
+        return self.attn_probe(x, mask)
+
+
 # ── Training ──────────────────────────────────────────────────────────
 
 
@@ -261,15 +301,21 @@ def train_and_evaluate(
     max_seq_len = max(x.shape[0] for x in all_X) if all_X else 1
     n_samples = len(train_X)
 
-    probe = AttentionPoolingProbe(
-        hidden_dim=hidden_dim,
+    probe = BottleneckAttentionProbe(
+        input_dim=hidden_dim,
+        bottleneck_dim=BOTTLENECK_DIM,
         num_heads=num_heads,
         output_dim=NUM_CLASSES,
         max_seq_len=max_seq_len,
         dropout=DROPOUT,
     ).to(device)
+    n_params = sum(p.numel() for p in probe.parameters())
+    print(f"  Probe params: {n_params:,} (bottleneck {hidden_dim}→{BOTTLENECK_DIM})")
     optimizer = torch.optim.AdamW(probe.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    # Use ReduceLROnPlateau so schedule responds to actual val loss, not a fixed cycle
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6,
+    )
 
     # Early stopping state
     best_val_loss = float("inf")
@@ -312,7 +358,6 @@ def train_and_evaluate(
             epoch_loss += loss.item()
             n_batches += 1
 
-        scheduler.step()
         train_loss = epoch_loss / max(n_batches, 1)
 
         # ── Validation ──
@@ -320,7 +365,8 @@ def train_and_evaluate(
             val_loss, val_acc = _eval_loss_and_acc(probe, val_X, val_y_soft, device)
         else:
             val_loss, val_acc = train_loss, 0.0
-        _, train_acc = _eval_loss_and_acc(probe, train_X, train_y_soft, device)
+
+        scheduler.step(val_loss)
 
         # ── Early stopping ──
         if val_loss < best_val_loss - MIN_DELTA:
@@ -332,7 +378,9 @@ def train_and_evaluate(
             epochs_without_improvement += 1
 
         if (epoch + 1) % 5 == 0:
-            current_lr = scheduler.get_last_lr()[0]
+            # Only compute train acc on log epochs to save compute
+            _, train_acc = _eval_loss_and_acc(probe, train_X, train_y_soft, device)
+            current_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"  Epoch {epoch + 1:3d}/{epochs}  "
                 f"train: {train_loss:.4f} (acc {train_acc:.3f})  "
@@ -390,10 +438,14 @@ def compute_metrics(
     class_counts = Counter(true_hard.tolist())
     chance_baseline = max(class_counts.values()) / n if n > 0 else 0.0
 
-    # Mean KL divergence: KL(true || pred)
+    # Soft cross-entropy: -sum(true * log(pred))
     eps = 1e-8
     pred_clipped = np.clip(y_pred_soft, eps, 1.0)
     true_clipped = np.clip(y_true_soft, eps, 1.0)
+    soft_ce_per_sample = -(true_clipped * np.log(pred_clipped)).sum(axis=1)
+    mean_soft_ce = float(soft_ce_per_sample.mean())
+
+    # Mean KL divergence: KL(true || pred)
     kl_per_sample = (true_clipped * np.log(true_clipped / pred_clipped)).sum(axis=1)
     mean_kl = float(kl_per_sample.mean())
 
@@ -410,15 +462,18 @@ def compute_metrics(
         q_true = true_hard[idx]
         q_pred = pred_hard[idx]
         q_kl = kl_per_sample[idx]
+        q_ce = soft_ce_per_sample[idx]
         per_question[qid] = {
             "n_samples": len(idx),
             "hard_accuracy": float((q_true == q_pred).mean()),
+            "mean_soft_ce": float(q_ce.mean()),
             "mean_kl": float(q_kl.mean()),
         }
 
     return {
         "hard_accuracy": float(hard_accuracy),
         "chance_baseline": float(chance_baseline),
+        "mean_soft_ce": mean_soft_ce,
         "mean_kl_divergence": mean_kl,
         "n_samples": n,
         "confusion_matrix": conf_matrix.tolist(),
@@ -437,8 +492,9 @@ def print_results(metrics: dict, label: str = "Results"):
         print("  No samples.")
         return
 
-    print(f"  Hard accuracy:   {metrics['hard_accuracy']:.3f}")
+    print(f"  Argmax accuracy: {metrics['hard_accuracy']:.3f}  (does top predicted label match top true label?)")
     print(f"  Chance baseline: {metrics['chance_baseline']:.3f}")
+    print(f"  Soft CE loss:    {metrics['mean_soft_ce']:.4f}  (distribution-level match)")
     print(f"  Mean KL div:     {metrics['mean_kl_divergence']:.4f}")
     print(f"  N samples:       {metrics['n_samples']}")
 
@@ -447,7 +503,8 @@ def print_results(metrics: dict, label: str = "Results"):
         for qid, vals in metrics["per_question"].items():
             print(
                 f"    {qid:>25s}: "
-                f"acc={vals['hard_accuracy']:.3f}  "
+                f"argmax_acc={vals['hard_accuracy']:.3f}  "
+                f"soft_ce={vals['mean_soft_ce']:.4f}  "
                 f"KL={vals['mean_kl']:.4f}  "
                 f"n={vals['n_samples']}"
             )
@@ -643,6 +700,7 @@ def main():
             "max_sentences_per_question_eval": MAX_SENTENCES_PER_QUESTION_EVAL,
             "num_gpqa_train": NUM_GPQA_TRAIN,
             "num_gpqa_eval": NUM_GPQA_EVAL,
+            "bottleneck_dim": BOTTLENECK_DIM,
             "num_heads": NUM_HEADS,
             "lr": LR,
             "epochs": EPOCHS,
