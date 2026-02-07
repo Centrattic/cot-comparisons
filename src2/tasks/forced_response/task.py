@@ -564,7 +564,25 @@ class ForcingTask(BaseTask):
                 [token_counts[s] for s in sorted_sents], dtype=np.int64,
             )
 
+            # Compute base prompt token count (tokens before <think>\n)
+            # Same for all sentences in the rollout — use any sentence's prompt.
+            any_prompt = next(iter(prompts_by_sentence.values()))
+            think_tag = "<think>"
+            think_pos = any_prompt.find(think_tag)
+            if think_pos >= 0:
+                base_end = think_pos + len(think_tag)
+                if base_end < len(any_prompt) and any_prompt[base_end] == "\n":
+                    base_end += 1
+                base_text = any_prompt[:base_end]
+                base_ids = extractor.tokenizer(
+                    base_text, truncation=True, max_length=4096,
+                )["input_ids"]
+                base_prompt_tokens = len(base_ids)
+            else:
+                base_prompt_tokens = 0
+
             # Save (merge with any existing keys from other layers)
+            bpt_key = f"layer{layer}_base_prompt_tokens"
             arrays = {}
             if act_path.exists():
                 with np.load(act_path) as f:
@@ -573,6 +591,7 @@ class ForcingTask(BaseTask):
             arrays[seq_key] = full_activations
             arrays[idx_key] = sent_indices_arr
             arrays[cnt_key] = token_counts_arr
+            arrays[bpt_key] = np.array(base_prompt_tokens, dtype=np.int64)
             np.savez(act_path, **arrays)
 
         print(f"Batched activations extracted for forcing data in {self.forcing_dir}")
@@ -591,7 +610,9 @@ class ForcingTask(BaseTask):
             data_slice: Filter for question IDs and sentence indices.
             token_position: One of "last_input", "last_thinking",
                 "last_response" (returns [hidden_dim] sliced from full
-                sequence), or "full_sequence" (returns [seq_len, hidden_dim]).
+                sequence), "full_sequence" (returns [seq_len, hidden_dim]),
+                or "cot_only" (returns [cot_len, hidden_dim] — tokens after
+                <think>, excluding the base prompt).
 
         Returns list of dicts:
             {
@@ -610,6 +631,7 @@ class ForcingTask(BaseTask):
         bnd_key = f"layer{layer}_boundaries"
         idx_key = f"layer{layer}_sentence_indices"
         cnt_key = f"layer{layer}_token_counts"
+        bpt_key = f"layer{layer}_base_prompt_tokens"
         legacy_key = f"layer{layer}_{token_position}"
         boundary_names = ["last_input", "last_thinking", "last_response"]
 
@@ -659,15 +681,20 @@ class ForcingTask(BaseTask):
                             sent_indices = f[idx_key]
                             tok_counts = f[cnt_key]
                             tc_map = dict(zip(sent_indices.tolist(), tok_counts.tolist()))
-                            _rollout_cache[rollout_dir_path] = (full_seq, tc_map)
+                            base_toks = int(f[bpt_key]) if bpt_key in f.files else 0
+                            _rollout_cache[rollout_dir_path] = (full_seq, tc_map, base_toks)
 
                 cached = _rollout_cache.get(rollout_dir_path)
                 if cached is not None:
-                    full_seq, tc_map = cached
+                    full_seq, tc_map, base_toks = cached
                     n_tokens = tc_map.get(sentence_idx)
                     if n_tokens is not None:
                         if token_position == "full_sequence":
                             activation = full_seq[:n_tokens, :].copy()
+                        elif token_position == "cot_only":
+                            start = base_toks if base_toks > 0 else 0
+                            if start < n_tokens:
+                                activation = full_seq[start:n_tokens, :].copy()
                         elif token_position in boundary_names:
                             # Prompt-only: all boundaries point to end of prompt
                             activation = full_seq[n_tokens - 1].copy()

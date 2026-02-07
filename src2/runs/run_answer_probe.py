@@ -75,7 +75,8 @@ PATIENCE = 20      # stop if val loss doesn't improve for this many epochs
 MIN_DELTA = 0.01   # minimum val loss decrease to count as improvement
 
 EXTRACT_ACTIVATIONS = False
-TOKEN_POSITION = "full_sequence"
+TOKEN_POSITION = "full_sequence"  # after re-extraction, can use "cot_only" directly
+TRIM_TO_COT = True  # tokenizer-based trim; not needed if TOKEN_POSITION="cot_only"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -121,16 +122,42 @@ def dist_dict_to_array(dist_dict: dict) -> np.ndarray:
     return np.array([v / total for v in vals], dtype=np.float32)
 
 
+def _compute_base_prompt_tokens(full_prompt: str, tokenizer) -> int:
+    """Find number of tokens in the base prompt (everything up to and including <think>).
+
+    Returns 0 if <think> not found (no trimming).
+    """
+    think_tag = "<think>"
+    pos = full_prompt.find(think_tag)
+    if pos < 0:
+        return 0
+    # Include the <think> tag and any trailing newline
+    end = pos + len(think_tag)
+    if end < len(full_prompt) and full_prompt[end] == "\n":
+        end += 1
+    base_text = full_prompt[:end]
+    # Match tokenization used during extraction
+    ids = tokenizer(base_text, truncation=True, max_length=4096)["input_ids"]
+    return len(ids)
+
+
 def load_probe_data(
     forcing: ForcingTask,
     question_ids: list,
     sentence_map: dict,
     layer: int,
     token_position: str,
+    tokenizer=None,
+    trim_to_cot: bool = False,
 ) -> dict:
     """Load activations + soft distributions for the given questions.
 
     Uses per-question DataSlice to respect sampled sentences.
+
+    Args:
+        tokenizer: HuggingFace tokenizer, required if trim_to_cot=True.
+        trim_to_cot: If True, slice full_sequence activations to only include
+            tokens after <think> (removes system/user prompt tokens).
 
     Returns:
         {
@@ -145,6 +172,9 @@ def load_probe_data(
     q_ids = []
     s_indices = []
 
+    # Cache base prompt token count per question (same for all sentences)
+    base_token_cache = {}
+
     for qid in question_ids:
         ds = DataSlice(ids={qid}, sentence_indices=sentence_map.get(qid))
         samples = forcing.get_probe_data(layer, ds, token_position)
@@ -153,7 +183,20 @@ def load_probe_data(
             dist = dist_dict_to_array(sample["answer_distribution"])
             if dist is None:
                 continue
-            X_list.append(sample["activation"])
+
+            act = sample["activation"]
+
+            # Trim to CoT-only tokens (remove prompt prefix)
+            if trim_to_cot and tokenizer is not None and act.ndim == 2:
+                if qid not in base_token_cache:
+                    base_token_cache[qid] = _compute_base_prompt_tokens(
+                        sample["full_prompt"], tokenizer,
+                    )
+                n_trim = base_token_cache[qid]
+                if n_trim > 0 and act.shape[0] > n_trim:
+                    act = act[n_trim:]
+
+            X_list.append(act)
             y_soft_list.append(dist)
             q_ids.append(sample["question_id"])
             s_indices.append(sample["sentence_idx"])
@@ -621,15 +664,26 @@ def main():
     print(f"\n  Train/val split: {len(actual_train_ids)} train questions, {len(val_ids)} val questions")
 
     # ── Step 5: Load data ─────────────────────────────────────────────
+    tokenizer = None
+    if TRIM_TO_COT:
+        from transformers import AutoTokenizer
+        print("\nLoading tokenizer for CoT trimming...")
+        tokenizer = AutoTokenizer.from_pretrained(ACTIVATION_MODEL, trust_remote_code=True)
+
     print("\nLoading training data...")
     train_data = load_probe_data(
         forcing, actual_train_ids, sentence_map, LAYER, TOKEN_POSITION,
+        tokenizer=tokenizer, trim_to_cot=TRIM_TO_COT,
     )
     print(f"  Train: {len(train_data['X_list'])} samples from {len(actual_train_ids)} questions")
+    if TRIM_TO_COT and train_data["X_list"]:
+        seq_lens = [x.shape[0] for x in train_data["X_list"]]
+        print(f"    CoT-only seq lengths: min={min(seq_lens)}, max={max(seq_lens)}, mean={np.mean(seq_lens):.0f}")
 
     print("Loading validation data...")
     val_data = load_probe_data(
         forcing, val_ids, sentence_map, LAYER, TOKEN_POSITION,
+        tokenizer=tokenizer, trim_to_cot=TRIM_TO_COT,
     )
     print(f"  Val:   {len(val_data['X_list'])} samples from {len(val_ids)} questions")
 
@@ -638,6 +692,7 @@ def main():
         print("Loading eval data...")
         eval_data = load_probe_data(
             forcing, eval_ids, sentence_map, LAYER, TOKEN_POSITION,
+            tokenizer=tokenizer, trim_to_cot=TRIM_TO_COT,
         )
         print(f"  Eval:  {len(eval_data['X_list'])} samples from {len(eval_ids)} questions")
 
@@ -693,6 +748,7 @@ def main():
             "activation_model": ACTIVATION_MODEL,
             "layer": LAYER,
             "token_position": TOKEN_POSITION,
+            "trim_to_cot": TRIM_TO_COT,
             "train_question_ids": actual_train_ids,
             "val_question_ids": val_ids,
             "eval_question_ids": eval_ids,
