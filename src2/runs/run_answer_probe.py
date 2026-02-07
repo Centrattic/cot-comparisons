@@ -50,20 +50,28 @@ EXTRA_EVAL_IDS = ["blackmail_mc_001", "blackmail_ab_001"]
 
 # Sentence sampling: sample this many sentence indices per question.
 # Each index appears in all rollouts, so total samples per question ≈
-# MAX_SENTENCES_PER_QUESTION × num_rollouts.
-# With 10 rollouts: 20 sentences × 10 rollouts = 200 samples/question.
-# With 53 train questions: ~10,600 training samples.
-MAX_SENTENCES_PER_QUESTION = 20
+# max_sentences × num_rollouts.
+# Keep train low to reduce correlated samples and overfitting.
+# Eval can be larger for more reliable metrics.
+MAX_SENTENCES_PER_QUESTION_TRAIN = 5   # ~50 samples/question (× 10 rollouts)
+MAX_SENTENCES_PER_QUESTION_EVAL = 20   # ~200 samples/question (× 10 rollouts)
 ANSWER_LABELS = ["A", "B", "C", "D"]
 NUM_CLASSES = 4
 
 # Training hyperparameters
-NUM_HEADS = 4
-LR = 1e-4
-EPOCHS = 100
+NUM_HEADS = 2
+LR = 5e-5
+EPOCHS = 200
 BATCH_SIZE = 32
 GRAD_CLIP = 1.0
+WEIGHT_DECAY = 0.01
+DROPOUT = 0.3
 SEED = 42
+
+# Validation / early stopping
+VAL_SPLIT = 0.2   # fraction of train questions held out for validation
+PATIENCE = 10      # stop if val loss doesn't improve for this many epochs
+MIN_DELTA = 0.01   # minimum val loss decrease to count as improvement
 
 EXTRACT_ACTIVATIONS = True
 TOKEN_POSITION = "full_sequence"
@@ -170,9 +178,68 @@ def soft_cross_entropy(
 # ── Training ──────────────────────────────────────────────────────────
 
 
+def _eval_loss_and_acc(probe, X_list, y_soft, device, batch_size=64):
+    """Compute soft CE loss and argmax accuracy over a dataset without gradients.
+
+    Returns (loss, argmax_accuracy).
+    """
+    probe.eval()
+    hidden_dim = X_list[0].shape[1]
+    total_loss = 0.0
+    n_batches = 0
+    correct = 0
+    total = 0
+    for start in range(0, len(X_list), batch_size):
+        end = min(start + batch_size, len(X_list))
+        batch_X = X_list[start:end]
+        batch_y = y_soft[start:end]
+        batch_max_len = max(x.shape[0] for x in batch_X)
+
+        X_pad = torch.zeros(len(batch_X), batch_max_len, hidden_dim, device=device)
+        mask = torch.zeros(len(batch_X), batch_max_len, dtype=torch.bool, device=device)
+        for i, x in enumerate(batch_X):
+            sl = x.shape[0]
+            X_pad[i, :sl, :] = torch.from_numpy(x).to(device)
+            mask[i, :sl] = True
+        y_t = torch.from_numpy(batch_y).float().to(device)
+
+        with torch.no_grad():
+            pred = probe(X_pad, mask)
+            loss = soft_cross_entropy(pred, y_t)
+        total_loss += loss.item()
+        n_batches += 1
+
+        # Argmax accuracy: does probe's top prediction match the true top label?
+        pred_labels = pred.argmax(dim=-1)
+        true_labels = y_t.argmax(dim=-1)
+        correct += (pred_labels == true_labels).sum().item()
+        total += len(batch_X)
+
+    avg_loss = total_loss / max(n_batches, 1)
+    accuracy = correct / max(total, 1)
+    return avg_loss, accuracy
+
+
+def _predict_dists(probe, X_list, device):
+    """Get predicted probability distributions for a list of activations."""
+    probe.eval()
+    pred_dists = []
+    for x in X_list:
+        seq_len = x.shape[0]
+        x_t = torch.from_numpy(x).float().unsqueeze(0).to(device)
+        m = torch.ones(1, seq_len, dtype=torch.bool, device=device)
+        with torch.no_grad():
+            logits = probe(x_t, m)
+            probs = torch.softmax(logits, dim=-1).squeeze(0)
+        pred_dists.append(probs.cpu().numpy())
+    return np.array(pred_dists) if pred_dists else np.zeros((0, NUM_CLASSES))
+
+
 def train_and_evaluate(
     train_X: list,
     train_y_soft: np.ndarray,
+    val_X: list,
+    val_y_soft: np.ndarray,
     test_X: list,
     test_y_soft: np.ndarray,
     num_heads: int = NUM_HEADS,
@@ -180,18 +247,18 @@ def train_and_evaluate(
     epochs: int = EPOCHS,
     batch_size: int = BATCH_SIZE,
 ) -> dict:
-    """Train probe with soft CE loss on train set, evaluate on test set.
+    """Train probe with soft CE loss, early stopping on validation set.
 
-    Returns dict with predictions, true labels, and final train loss.
+    Returns dict with predictions, true labels, and training info.
     """
+    import copy
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Using device: {device}, batch_size: {batch_size}")
 
     hidden_dim = train_X[0].shape[1]
-    max_seq_len = max(
-        max(x.shape[0] for x in train_X),
-        max(x.shape[0] for x in test_X) if test_X else 0,
-    )
+    all_X = list(train_X) + list(val_X) + list(test_X)
+    max_seq_len = max(x.shape[0] for x in all_X) if all_X else 1
     n_samples = len(train_X)
 
     probe = AttentionPoolingProbe(
@@ -199,12 +266,20 @@ def train_and_evaluate(
         num_heads=num_heads,
         output_dim=NUM_CLASSES,
         max_seq_len=max_seq_len,
+        dropout=DROPOUT,
     ).to(device)
-    optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(probe.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    probe.train()
+    # Early stopping state
+    best_val_loss = float("inf")
+    best_epoch = 0
+    best_state = None
+    epochs_without_improvement = 0
+
     for epoch in range(epochs):
+        # ── Train ──
+        probe.train()
         perm = np.random.permutation(n_samples)
         epoch_loss = 0.0
         n_batches = 0
@@ -238,41 +313,52 @@ def train_and_evaluate(
             n_batches += 1
 
         scheduler.step()
+        train_loss = epoch_loss / max(n_batches, 1)
 
-        if (epoch + 1) % 10 == 0:
+        # ── Validation ──
+        if val_X:
+            val_loss, val_acc = _eval_loss_and_acc(probe, val_X, val_y_soft, device)
+        else:
+            val_loss, val_acc = train_loss, 0.0
+        _, train_acc = _eval_loss_and_acc(probe, train_X, train_y_soft, device)
+
+        # ── Early stopping ──
+        if val_loss < best_val_loss - MIN_DELTA:
+            best_val_loss = val_loss
+            best_epoch = epoch + 1
+            best_state = copy.deepcopy(probe.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if (epoch + 1) % 5 == 0:
             current_lr = scheduler.get_last_lr()[0]
-            print(f"  Epoch {epoch + 1}/{epochs}, loss: {epoch_loss / n_batches:.4f}, lr: {current_lr:.2e}")
+            print(
+                f"  Epoch {epoch + 1:3d}/{epochs}  "
+                f"train: {train_loss:.4f} (acc {train_acc:.3f})  "
+                f"val: {val_loss:.4f} (acc {val_acc:.3f})  "
+                f"best_val: {best_val_loss:.4f} (ep {best_epoch})  "
+                f"lr: {current_lr:.2e}"
+            )
 
-    # Evaluate on test set (may be empty)
-    probe.eval()
-    test_pred_dists = []
-    if test_X:
-        for x in test_X:
-            seq_len = x.shape[0]
-            x_t = torch.from_numpy(x).float().unsqueeze(0).to(device)
-            m = torch.ones(1, seq_len, dtype=torch.bool, device=device)
-            with torch.no_grad():
-                logits = probe(x_t, m)
-                probs = torch.softmax(logits, dim=-1).squeeze(0)
-            test_pred_dists.append(probs.cpu().numpy())
+        if epochs_without_improvement >= PATIENCE:
+            print(f"  Early stopping at epoch {epoch + 1} (no val improvement for {PATIENCE} epochs)")
+            break
 
-    # Also get train predictions for metrics
-    train_pred_dists = []
-    for x in train_X:
-        seq_len = x.shape[0]
-        x_t = torch.from_numpy(x).float().unsqueeze(0).to(device)
-        m = torch.ones(1, seq_len, dtype=torch.bool, device=device)
-        with torch.no_grad():
-            logits = probe(x_t, m)
-            probs = torch.softmax(logits, dim=-1).squeeze(0)
-        train_pred_dists.append(probs.cpu().numpy())
+    # Restore best model
+    if best_state is not None:
+        probe.load_state_dict(best_state)
+        print(f"  Restored best model from epoch {best_epoch} (val_loss={best_val_loss:.4f})")
 
+    # ── Predictions ──
     return {
-        "test_pred_dists": np.array(test_pred_dists)
-        if test_pred_dists
-        else np.zeros((0, NUM_CLASSES)),
-        "train_pred_dists": np.array(train_pred_dists),
-        "final_train_loss": float(epoch_loss / max(n_batches, 1)),
+        "test_pred_dists": _predict_dists(probe, test_X, device),
+        "train_pred_dists": _predict_dists(probe, train_X, device),
+        "val_pred_dists": _predict_dists(probe, val_X, device),
+        "final_train_loss": train_loss,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+        "total_epochs": epoch + 1,
     }
 
 
@@ -440,16 +526,19 @@ def main():
 
     all_question_ids = train_ids + eval_ids
 
-    # ── Step 2: Sample sentence indices ───────────────────────────────
+    # ── Step 2: Sample sentence indices (fewer for train, more for eval) ─
     print("\nSampling sentence indices...")
-    sentence_map = sample_sentence_indices(
-        forcing.forcing_dir,
-        all_question_ids,
-        MAX_SENTENCES_PER_QUESTION,
-        SEED,
+    train_sentence_map = sample_sentence_indices(
+        forcing.forcing_dir, train_ids, MAX_SENTENCES_PER_QUESTION_TRAIN, SEED,
     )
-    total_sentences = sum(len(v) for v in sentence_map.values())
-    print(f"  {total_sentences} unique sentence indices across {len(sentence_map)} questions")
+    eval_sentence_map = sample_sentence_indices(
+        forcing.forcing_dir, eval_ids, MAX_SENTENCES_PER_QUESTION_EVAL, SEED,
+    )
+    sentence_map = {**train_sentence_map, **eval_sentence_map}
+    train_sents = sum(len(v) for v in train_sentence_map.values())
+    eval_sents = sum(len(v) for v in eval_sentence_map.values())
+    print(f"  Train/val: {train_sents} sentence indices ({MAX_SENTENCES_PER_QUESTION_TRAIN}/question)")
+    print(f"  Eval:      {eval_sents} sentence indices ({MAX_SENTENCES_PER_QUESTION_EVAL}/question)")
 
     # ── Step 3: Extract activations if needed ─────────────────────────
     if EXTRACT_ACTIVATIONS:
@@ -465,12 +554,27 @@ def main():
             data_slice=ds,
         )
 
-    # ── Step 4: Load data ─────────────────────────────────────────────
+    # ── Step 4: Split train into train/val by question_id ───────────
+    rng = np.random.default_rng(SEED)
+    shuffled_train = list(train_ids)
+    rng.shuffle(shuffled_train)
+    n_val = max(1, int(len(shuffled_train) * VAL_SPLIT))
+    val_ids = shuffled_train[:n_val]
+    actual_train_ids = shuffled_train[n_val:]
+    print(f"\n  Train/val split: {len(actual_train_ids)} train questions, {len(val_ids)} val questions")
+
+    # ── Step 5: Load data ─────────────────────────────────────────────
     print("\nLoading training data...")
     train_data = load_probe_data(
-        forcing, train_ids, sentence_map, LAYER, TOKEN_POSITION,
+        forcing, actual_train_ids, sentence_map, LAYER, TOKEN_POSITION,
     )
-    print(f"  Train: {len(train_data['X_list'])} samples from {len(train_ids)} questions")
+    print(f"  Train: {len(train_data['X_list'])} samples from {len(actual_train_ids)} questions")
+
+    print("Loading validation data...")
+    val_data = load_probe_data(
+        forcing, val_ids, sentence_map, LAYER, TOKEN_POSITION,
+    )
+    print(f"  Val:   {len(val_data['X_list'])} samples from {len(val_ids)} questions")
 
     eval_data = None
     if eval_ids:
@@ -478,28 +582,37 @@ def main():
         eval_data = load_probe_data(
             forcing, eval_ids, sentence_map, LAYER, TOKEN_POSITION,
         )
-        print(f"  Eval: {len(eval_data['X_list'])} samples from {len(eval_ids)} questions")
+        print(f"  Eval:  {len(eval_data['X_list'])} samples from {len(eval_ids)} questions")
 
     if len(train_data["X_list"]) < 5:
         print("Too few training samples. Exiting.")
         return
 
-    # ── Step 5: Train and evaluate ────────────────────────────────────
+    # ── Step 6: Train and evaluate ────────────────────────────────────
     print("\nTraining soft-label attention probe...")
     results = train_and_evaluate(
         train_X=train_data["X_list"],
         train_y_soft=train_data["y_soft"],
+        val_X=val_data["X_list"],
+        val_y_soft=val_data["y_soft"],
         test_X=eval_data["X_list"] if eval_data else [],
         test_y_soft=eval_data["y_soft"] if eval_data else np.zeros((0, NUM_CLASSES)),
     )
 
-    # ── Step 6: Compute and print metrics ─────────────────────────────
+    # ── Step 7: Compute and print metrics ─────────────────────────────
     train_metrics = compute_metrics(
         train_data["y_soft"],
         results["train_pred_dists"],
         train_data["question_ids"],
     )
     print_results(train_metrics, label="Train Set Results")
+
+    val_metrics = compute_metrics(
+        val_data["y_soft"],
+        results["val_pred_dists"],
+        val_data["question_ids"],
+    )
+    print_results(val_metrics, label="Validation Set Results")
 
     eval_metrics = {}
     if eval_data and len(eval_data["X_list"]) > 0:
@@ -508,21 +621,23 @@ def main():
             results["test_pred_dists"],
             eval_data["question_ids"],
         )
-        print_results(eval_metrics, label="Eval Set Results")
+        print_results(eval_metrics, label="Eval Set Results (held-out questions)")
 
-    # ── Step 7: Save results ──────────────────────────────────────────
+    # ── Step 8: Save results ──────────────────────────────────────────
     output_dir = DATA_DIR / "answer_probe"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     output = {
         "train_metrics": train_metrics,
+        "val_metrics": val_metrics,
         "eval_metrics": eval_metrics,
         "config": {
             "subject_model": SUBJECT_MODEL,
             "activation_model": ACTIVATION_MODEL,
             "layer": LAYER,
             "token_position": TOKEN_POSITION,
-            "train_question_ids": train_ids,
+            "train_question_ids": actual_train_ids,
+            "val_question_ids": val_ids,
             "eval_question_ids": eval_ids,
             "max_sentences_per_question": MAX_SENTENCES_PER_QUESTION,
             "num_gpqa_train": NUM_GPQA_TRAIN,
@@ -531,18 +646,37 @@ def main():
             "lr": LR,
             "epochs": EPOCHS,
             "batch_size": BATCH_SIZE,
+            "weight_decay": WEIGHT_DECAY,
+            "dropout": DROPOUT,
+            "patience": PATIENCE,
+            "min_delta": MIN_DELTA,
+            "val_split": VAL_SPLIT,
             "seed": SEED,
             "n_train_samples": len(train_data["X_list"]),
+            "n_val_samples": len(val_data["X_list"]),
             "n_eval_samples": len(eval_data["X_list"]) if eval_data else 0,
             "sentence_map": {
-                qid: sorted(indices) for qid, indices in sentence_map.items()
+                qid: [int(i) for i in sorted(indices)] for qid, indices in sentence_map.items()
             },
         },
+        "best_val_loss": results["best_val_loss"],
+        "best_epoch": results["best_epoch"],
+        "total_epochs": results["total_epochs"],
         "final_train_loss": results["final_train_loss"],
     }
 
+    class _NumpyEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return super().default(obj)
+
     with open(output_dir / "results.json", "w") as f:
-        json.dump(output, f, indent=2)
+        json.dump(output, f, indent=2, cls=_NumpyEncoder)
 
     print(f"\nResults saved to {output_dir / 'results.json'}")
 

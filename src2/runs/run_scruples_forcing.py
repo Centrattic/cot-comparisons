@@ -12,6 +12,7 @@ Usage:
     python -m src2.runs.run_scruples_forcing
 """
 
+import argparse
 import contextlib
 import io
 import json
@@ -238,6 +239,9 @@ def plot_entropy(
     intervention_results: List[Tuple[int, List[Dict]]],
     title: str,
     save_path: Path,
+    ctrl_label: str = "Control (non-sycophantic)",
+    intv_label: str = "Intervention (sycophantic)",
+    suptitle: Optional[str] = None,
 ):
     """
     Create entropy vs fraction of reasoning remaining plot.
@@ -252,8 +256,8 @@ def plot_entropy(
     COLOR_B = "#1f77b4"  # blue — non-sycophantic answer
 
     for ax, results_list, arm_label in [
-        (axes[0], control_results, "Control (non-sycophantic)"),
-        (axes[1], intervention_results, "Intervention (sycophantic)"),
+        (axes[0], control_results, ctrl_label),
+        (axes[1], intervention_results, intv_label),
     ]:
         all_frac = []
         all_ent = []
@@ -323,7 +327,7 @@ def plot_entropy(
     axes[0].set_ylabel("Entropy (bits)", fontsize=10)
 
     fig.suptitle(
-        f"Forced Answer Entropy — Scruples\n"
+        suptitle or f"Forced Answer Entropy — Scruples\n"
         f"\"AITA? Phone for 3h on 10h bus trip\" (answers: A/B, sycophantic=A)",
         fontsize=12, fontweight="bold",
     )
@@ -333,14 +337,75 @@ def plot_entropy(
     plt.close(fig)
 
 
+# ── Replot from JSON ─────────────────────────────────────────────────
+
+def replot_from_json(
+    json_path: Path,
+    save_path: Path,
+    suptitle: str,
+    ctrl_label: str = "Control (non-sycophantic only)",
+    intv_label: str = "Intervention (sycophantic only)",
+):
+    """Replot from saved JSON, filtering to matching sycophancy status."""
+    with open(json_path) as f:
+        data = json.load(f)
+
+    # Filter control to non-sycophantic, intervention to sycophantic
+    control_results = []
+    ctrl_skipped = 0
+    for entry in data["control"]:
+        if not entry["is_sycophantic"]:
+            control_results.append((entry["run_idx"], entry["results"]))
+        else:
+            ctrl_skipped += 1
+
+    intervention_results = []
+    intv_skipped = 0
+    for entry in data["intervention"]:
+        if entry["is_sycophantic"]:
+            intervention_results.append((entry["run_idx"], entry["results"]))
+        else:
+            intv_skipped += 1
+
+    print(f"Control: kept {len(control_results)}, filtered out {ctrl_skipped} sycophantic")
+    print(f"Intervention: kept {len(intervention_results)}, filtered out {intv_skipped} non-sycophantic")
+
+    if not control_results or not intervention_results:
+        print("ERROR: No rollouts left after filtering!")
+        return
+
+    plot_entropy(
+        control_results, intervention_results,
+        title="replot", save_path=save_path,
+        ctrl_label=ctrl_label, intv_label=intv_label,
+        suptitle=suptitle,
+    )
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
-def main():
+def print_summary(label: str, results_list: List[Tuple[int, List[Dict]]]):
+    """Print summary stats for one arm."""
+    all_ent = [r["entropy"] for _, results in results_list for r in results]
+    early = [r["entropy"] for _, results in results_list for r in results if r["fraction_remaining"] > 0.7]
+    late = [r["entropy"] for _, results in results_list for r in results if r["fraction_remaining"] < 0.3]
+    print(f"  {label}:")
+    print(f"    Mean entropy: {np.mean(all_ent):.3f} bits")
+    print(f"    Early (>70% remaining): {np.mean(early):.3f} bits" if early else "    Early: N/A")
+    print(f"    Late (<30% remaining): {np.mean(late):.3f} bits" if late else "    Late: N/A")
+
+
+def cmd_force(args):
+    """Run forcing on rollouts (requires Tinker)."""
     from tinker import ServiceClient, types
     from transformers import AutoTokenizer
 
+    anecdote_id = args.anecdote_id
+    suffix = f"_{args.suffix}" if args.suffix else ""
+
     print("=" * 70)
     print("Scruples Forced-Answer Entropy Analysis")
+    print(f"Anecdote: {anecdote_id}")
     print("=" * 70)
 
     # Setup
@@ -351,12 +416,12 @@ def main():
     choice_token_ids = resolve_choice_token_ids(tokenizer, CHOICES)
     print(f"Choice token IDs: {choice_token_ids}")
 
-    # Load rollouts
-    print(f"\nLoading rollouts for anecdote {ANECDOTE_ID}...")
-    control_rollouts = load_rollouts(ANECDOTE_ID, "control", MAX_CONTROL_ROLLOUTS)
-    intervention_rollouts = load_rollouts(ANECDOTE_ID, "intervention", MAX_INTERVENTION_ROLLOUTS)
-    print(f"  Control rollouts: {len(control_rollouts)}")
-    print(f"  Intervention rollouts: {len(intervention_rollouts)}")
+    # Load rollouts (filtering by sycophancy status happens in load_rollouts)
+    print(f"\nLoading rollouts for anecdote {anecdote_id}...")
+    control_rollouts = load_rollouts(anecdote_id, "control", MAX_CONTROL_ROLLOUTS)
+    intervention_rollouts = load_rollouts(anecdote_id, "intervention", MAX_INTERVENTION_ROLLOUTS)
+    print(f"  Control rollouts: {len(control_rollouts)} (all non-sycophantic)")
+    print(f"  Intervention rollouts: {len(intervention_rollouts)} (all sycophantic)")
 
     if not control_rollouts or not intervention_rollouts:
         print("ERROR: Not enough rollouts found!")
@@ -386,39 +451,92 @@ def main():
         n_sent = len(split_cot_into_sentences(rollout["thinking"]))
         print(f"  Intervention run {rollout['run_idx']}: {n_sent} sentences, answer={rollout['answer']}")
 
-    # Save raw results
+    # Save raw results (include sycophancy metadata for replotting)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_path = OUTPUT_DIR / f"forcing_results_{timestamp}.json"
+    results_path = OUTPUT_DIR / f"forcing_results{suffix}_{timestamp}.json"
     with open(results_path, "w") as f:
         json.dump({
-            "anecdote_id": ANECDOTE_ID,
+            "anecdote_id": anecdote_id,
             "model": SUBJECT_MODEL,
             "choices": CHOICES,
             "timestamp": datetime.now().isoformat(),
             "control": [
-                {"run_idx": ri, "results": res} for ri, res in all_control
+                {"run_idx": ri, "answer": ro["answer"], "is_sycophantic": ro["is_sycophantic"], "results": res}
+                for (ri, res), ro in zip(all_control, control_rollouts)
             ],
             "intervention": [
-                {"run_idx": ri, "results": res} for ri, res in all_intervention
+                {"run_idx": ri, "answer": ro["answer"], "is_sycophantic": ro["is_sycophantic"], "results": res}
+                for (ri, res), ro in zip(all_intervention, intervention_rollouts)
             ],
         }, f, indent=2)
     print(f"\nRaw results saved: {results_path}")
 
     # Plot
-    plot_path = OUTPUT_DIR / "entropy_vs_remaining_scruples.png"
-    plot_entropy(all_control, all_intervention, "Scruples Forcing", plot_path)
+    suptitle = args.title or (
+        f"Forced Answer Entropy — Scruples\n"
+        f"Anecdote {anecdote_id[:12]}... (answers: A/B, sycophantic=A)"
+    )
+    plot_path = OUTPUT_DIR / f"entropy_vs_remaining_scruples{suffix}.png"
+    plot_entropy(
+        all_control, all_intervention,
+        title="Scruples Forcing", save_path=plot_path,
+        suptitle=suptitle,
+    )
 
     # Print summary stats
     print("\n" + "=" * 70)
     print("Summary:")
-    for label, results_list in [("Control", all_control), ("Intervention", all_intervention)]:
-        all_ent = [r["entropy"] for _, results in results_list for r in results]
-        early = [r["entropy"] for _, results in results_list for r in results if r["fraction_remaining"] > 0.7]
-        late = [r["entropy"] for _, results in results_list for r in results if r["fraction_remaining"] < 0.3]
-        print(f"  {label}:")
-        print(f"    Mean entropy: {np.mean(all_ent):.3f} bits")
-        print(f"    Early (>70% remaining): {np.mean(early):.3f} bits" if early else "    Early: N/A")
-        print(f"    Late (<30% remaining): {np.mean(late):.3f} bits" if late else "    Late: N/A")
+    print_summary("Control", all_control)
+    print_summary("Intervention", all_intervention)
+
+
+def cmd_replot(args):
+    """Replot from existing JSON with proper sycophancy filtering."""
+    json_path = Path(args.json)
+    suffix = f"_{args.suffix}" if args.suffix else ""
+    save_path = Path(args.output) if args.output else OUTPUT_DIR / f"entropy_vs_remaining_scruples{suffix}.png"
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    suptitle = args.title or "Forced Answer Entropy — Scruples (replotted with filtering)"
+
+    print("=" * 70)
+    print("Replotting with sycophancy filtering")
+    print(f"Source: {json_path}")
+    print(f"Output: {save_path}")
+    print("=" * 70)
+
+    replot_from_json(
+        json_path, save_path=save_path, suptitle=suptitle,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Scruples forced-answer entropy analysis")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Force subcommand (requires Tinker)
+    p_force = subparsers.add_parser("force", help="Run forcing on rollouts (requires Tinker)")
+    p_force.add_argument("--anecdote-id", default=ANECDOTE_ID, help="Anecdote ID to analyze")
+    p_force.add_argument("--suffix", default="", help="Output file suffix (e.g. 'highctrl')")
+    p_force.add_argument("--title", default=None, help="Custom plot suptitle")
+
+    # Replot subcommand (no Tinker needed)
+    p_replot = subparsers.add_parser("replot", help="Replot from saved JSON with proper filtering")
+    p_replot.add_argument("json", help="Path to forcing results JSON")
+    p_replot.add_argument("--suffix", default="", help="Output file suffix")
+    p_replot.add_argument("--output", default=None, help="Output PNG path (overrides suffix)")
+    p_replot.add_argument("--title", default=None, help="Custom plot suptitle")
+
+    args = parser.parse_args()
+
+    if args.command == "force":
+        cmd_force(args)
+    elif args.command == "replot":
+        cmd_replot(args)
+    else:
+        # Default: legacy behavior (force with default anecdote)
+        parser.print_help()
 
 
 if __name__ == "__main__":

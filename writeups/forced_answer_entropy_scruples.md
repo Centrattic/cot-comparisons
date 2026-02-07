@@ -25,6 +25,10 @@ We applied this to the **scruples sycophancy task** and found something striking
 - Compute Shannon entropy: H = -sum(p * log2(p))
 - Plot entropy vs. fraction of reasoning remaining
 
+**Why "So, the answer is" instead of forcing `</think>` directly:**
+
+Our earlier approach ("end_think") simply forced `</think>` after the partial CoT and read the logprob distribution over the first response token. We switched to the anchor-phrase method ("cot_anchor") for two reasons: (1) other papers probing reasoning models use this technique (e.g. Anthropic's work on monitoring reasoning), and (2) we found empirically that end_think produces noisier, often near-deterministic distributions — the model seems to treat the forced `</think>` as an unnatural break, collapsing to a single answer even when it's genuinely uncertain mid-reasoning. The anchor phrase ("So, the answer is: ") stays inside `<think>`, cueing the model to summarize its current belief naturally before we close the block, giving cleaner and more calibrated probability distributions.
+
 For GPQA the pattern is clean: model starts near max entropy (uniform over 4 choices) and converges as reasoning builds. The correlation between remaining fraction and entropy is strong (r = 0.75, 0.83, 0.74 for starfish, bagel, waffle respectively).
 
 ---
