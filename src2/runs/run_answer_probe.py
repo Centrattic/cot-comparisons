@@ -60,7 +60,7 @@ NUM_CLASSES = 4
 
 # Training hyperparameters
 NUM_HEADS = 2
-LR = 5e-5
+LR = 4e-4
 EPOCHS = 200
 BATCH_SIZE = 32
 GRAD_CLIP = 1.0
@@ -639,7 +639,8 @@ def main():
             "train_question_ids": actual_train_ids,
             "val_question_ids": val_ids,
             "eval_question_ids": eval_ids,
-            "max_sentences_per_question": MAX_SENTENCES_PER_QUESTION,
+            "max_sentences_per_question_train": MAX_SENTENCES_PER_QUESTION_TRAIN,
+            "max_sentences_per_question_eval": MAX_SENTENCES_PER_QUESTION_EVAL,
             "num_gpqa_train": NUM_GPQA_TRAIN,
             "num_gpqa_eval": NUM_GPQA_EVAL,
             "num_heads": NUM_HEADS,
