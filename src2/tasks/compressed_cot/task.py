@@ -253,28 +253,53 @@ class CompressedCotTask(BaseTask):
         return None
 
     def evaluate(
-        self, predictions: List[Any], ground_truth: List[Any]
+        self,
+        predictions: List[Any],
+        ground_truth: List[Any] = None,
+        *,
+        mode: str = "kl_divergence",
+        correct_answer: Optional[str] = None,
     ) -> Dict[str, float]:
-        """Compare predicted vs ground-truth answer distributions via JS divergence."""
-        if not predictions or not ground_truth:
-            return {"js_divergence": 1.0, "agreement": 0.0}
+        """
+        Evaluate compressed distributions.
 
-        js_divs = []
-        agreements = []
-        for pred, gt in zip(predictions, ground_truth):
-            if pred is None or gt is None:
-                js_divs.append(1.0)
-                agreements.append(0.0)
-                continue
-            js_divs.append(_js_divergence(pred, gt))
-            pred_top = max(pred, key=pred.get) if pred else ""
-            gt_top = max(gt, key=gt.get) if gt else ""
-            agreements.append(1.0 if pred_top == gt_top else 0.0)
-
-        return {
-            "js_divergence": float(np.mean(js_divs)),
-            "agreement": float(np.mean(agreements)),
-        }
+        mode="kl_divergence": KL(baseline || compressed) + top-answer agreement.
+            Requires ground_truth (list of baseline distributions).
+        mode="correctness": P(correct_answer) under compressed distribution.
+            Requires correct_answer (the true answer string, e.g. "B").
+        """
+        if mode == "kl_divergence":
+            if not predictions or not ground_truth:
+                return {"kl_divergence": float("inf"), "agreement": 0.0}
+            kl_divs = []
+            agreements = []
+            for pred, gt in zip(predictions, ground_truth):
+                if pred is None or gt is None:
+                    kl_divs.append(float("inf"))
+                    agreements.append(0.0)
+                    continue
+                kl_divs.append(_kl_divergence(gt, pred))
+                pred_top = max(pred, key=pred.get) if pred else ""
+                gt_top = max(gt, key=gt.get) if gt else ""
+                agreements.append(1.0 if pred_top == gt_top else 0.0)
+            return {
+                "kl_divergence": float(np.mean(kl_divs)),
+                "agreement": float(np.mean(agreements)),
+            }
+        elif mode == "correctness":
+            if not predictions or correct_answer is None:
+                return {"correctness": 0.0}
+            accuracies = []
+            for pred in predictions:
+                if pred is None:
+                    accuracies.append(0.0)
+                    continue
+                accuracies.append(pred.get(correct_answer, 0.0))
+            return {"correctness": float(np.mean(accuracies))}
+        else:
+            raise ValueError(
+                f"Unknown eval mode: {mode!r}. Use 'kl_divergence' or 'correctness'."
+            )
 
     # ------------------------------------------------------------------
     # Data preparation for methods
@@ -509,15 +534,15 @@ class CompressedCotTask(BaseTask):
         temperature: float = 0.7,
         verbose: bool = True,
         baseline: Optional[Dict[str, Any]] = None,
+        mode: str = "kl_divergence",
     ) -> Dict[str, Any]:
         """
         Evaluate compression from monitor sentence-selection results.
 
-        Takes the first monitor result, converts selected indices to
-        region-relative, reconstructs the compressed CoT, runs evaluation
-        resamples, and saves results to output_folder.
-
-        If baseline is provided, it's used directly instead of recomputing.
+        mode="kl_divergence": compare compressed distribution to baseline via
+            KL divergence. If baseline is provided it's reused, otherwise computed.
+        mode="correctness": measure P(correct_answer) under compressed distribution.
+            No baseline needed.
         """
         # Extract selected indices from monitor prediction
         selected_indices = monitor_results[0].get("monitor_prediction", [])
@@ -536,24 +561,36 @@ class CompressedCotTask(BaseTask):
             num_resamples=num_resamples, temperature=temperature, verbose=verbose,
         )
 
-        # Use provided baseline or compute it
-        baseline_dist = baseline if baseline is not None else self.get_baseline_distribution(
-            spec.question_id, spec.rollout_idx,
-            num_resamples=num_resamples, temperature=temperature, verbose=verbose,
-        )
-
-        # Compute metrics
-        metrics = self.evaluate(
-            [compressed_dist["distribution"]], [baseline_dist["distribution"]],
-        )
-
         eval_results = {
+            "mode": mode,
             "selected_indices": selected_indices,
             "relative_indices": relative_indices,
             "compressed_distribution": compressed_dist,
-            "baseline_distribution": baseline_dist,
-            **metrics,
         }
+
+        if mode == "kl_divergence":
+            baseline_dist = baseline if baseline is not None else self.get_baseline_distribution(
+                spec.question_id, spec.rollout_idx,
+                num_resamples=num_resamples, temperature=temperature, verbose=verbose,
+            )
+            metrics = self.evaluate(
+                [compressed_dist["distribution"]], [baseline_dist["distribution"]],
+                mode=mode,
+            )
+            eval_results["baseline_distribution"] = baseline_dist
+        elif mode == "correctness":
+            correct_answer = self._get_correct_answer(spec.question_id, spec.rollout_idx)
+            metrics = self.evaluate(
+                [compressed_dist["distribution"]],
+                mode=mode, correct_answer=correct_answer,
+            )
+            eval_results["correct_answer"] = correct_answer
+        else:
+            raise ValueError(
+                f"Unknown eval mode: {mode!r}. Use 'kl_divergence' or 'correctness'."
+            )
+
+        eval_results.update(metrics)
 
         # Save outputs
         output_folder = Path(output_folder)
@@ -563,8 +600,11 @@ class CompressedCotTask(BaseTask):
             f.write(compressed_cot)
 
         if verbose:
-            print(f"JS divergence: {metrics['js_divergence']:.4f}")
-            print(f"Agreement: {metrics['agreement']:.1%}")
+            if mode == "kl_divergence":
+                print(f"KL divergence: {metrics['kl_divergence']:.4f}")
+                print(f"Agreement: {metrics['agreement']:.1%}")
+            else:
+                print(f"Correctness: {metrics['correctness']:.1%}")
             print(f"Saved to {output_folder}")
 
         return eval_results
@@ -572,6 +612,16 @@ class CompressedCotTask(BaseTask):
     # ------------------------------------------------------------------
     # Question/CoT loading helpers
     # ------------------------------------------------------------------
+
+    def _get_correct_answer(self, question_id: str, rollout_idx: int = 0) -> Optional[str]:
+        """Get the correct answer letter for a question (MC only)."""
+        loaded = self.load_question_and_cot(question_id, rollout_idx)
+        if loaded is None:
+            return None
+        question, _ = loaded
+        if isinstance(question, GPQAQuestion):
+            return question.correct_answer
+        return None
 
     def load_question_and_cot(
         self, question_id: str, rollout_idx: int = 0,
@@ -738,11 +788,11 @@ class CompressedCotTask(BaseTask):
 # Utility: JS divergence for comparing distributions
 # ------------------------------------------------------------------
 
-def _js_divergence(p: Dict[str, float], q: Dict[str, float]) -> float:
-    """Jensen-Shannon divergence between two distributions (as dicts)."""
+def _kl_divergence(p: Dict[str, float], q: Dict[str, float]) -> float:
+    """KL(P || Q) — divergence of Q from reference distribution P."""
     all_keys = set(p.keys()) | set(q.keys())
     if not all_keys:
-        return 1.0
+        return float("inf")
 
     p_arr = np.array([p.get(k, 0.0) for k in sorted(all_keys)])
     q_arr = np.array([q.get(k, 0.0) for k in sorted(all_keys)])
@@ -754,12 +804,11 @@ def _js_divergence(p: Dict[str, float], q: Dict[str, float]) -> float:
     if q_sum > 0:
         q_arr = q_arr / q_sum
 
-    m = 0.5 * (p_arr + q_arr)
+    # Small epsilon to avoid log(0) where Q has zero mass
+    eps = 1e-10
+    q_arr = np.maximum(q_arr, eps)
 
-    def _kl(a, b):
-        mask = (a > 0) & (b > 0)
-        if not mask.any():
-            return 0.0
-        return float(np.sum(a[mask] * np.log(a[mask] / b[mask])))
-
-    return 0.5 * _kl(p_arr, m) + 0.5 * _kl(q_arr, m)
+    mask = p_arr > 0
+    if not mask.any():
+        return 0.0
+    return float(np.sum(p_arr[mask] * np.log(p_arr[mask] / q_arr[mask])))

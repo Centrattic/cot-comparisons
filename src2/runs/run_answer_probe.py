@@ -59,7 +59,8 @@ ANSWER_LABELS = ["A", "B", "C", "D"]
 NUM_CLASSES = 4
 
 # Training hyperparameters
-BOTTLENECK_DIM = 64  # project 5120→64 before attention probe (~330K params vs ~26M)
+BOTTLENECK_DIM = 64  # project 5120→64 before probe
+FREEZE_PROJECTION = True  # frozen random projection (can't memorize) vs learned bottleneck
 NUM_HEADS = 2
 LR = 4e-4
 EPOCHS = 200
@@ -219,14 +220,52 @@ def soft_cross_entropy(
     return -(target_probs * log_probs).sum(dim=-1).mean()
 
 
-# ── Bottleneck wrapper ────────────────────────────────────────────
+# ── Probe wrappers ────────────────────────────────────────────────
+
+
+class FrozenProjectionProbe(nn.Module):
+    """Fixed random projection → attention pooling → classifier.
+
+    The projection is a frozen random matrix (not learned), so the probe
+    cannot memorize question-specific directions. Only the small attention
+    probe + classifier are trainable (~12K params).
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        proj_dim: int,
+        num_heads: int,
+        output_dim: int,
+        max_seq_len: int,
+        dropout: float,
+        seed: int = 42,
+    ):
+        super().__init__()
+        # Frozen random projection (JL-style, preserves distances)
+        gen = torch.Generator().manual_seed(seed)
+        W = torch.randn(input_dim, proj_dim, generator=gen) / (proj_dim ** 0.5)
+        self.register_buffer("proj_weight", W)
+
+        self.norm = nn.LayerNorm(proj_dim)
+        self.attn_probe = AttentionPoolingProbe(
+            hidden_dim=proj_dim,
+            num_heads=num_heads,
+            output_dim=output_dim,
+            max_seq_len=max_seq_len,
+            dropout=dropout,
+        )
+
+    def forward(self, x, mask=None):
+        x = x @ self.proj_weight  # frozen, no gradient
+        x = self.norm(x)
+        return self.attn_probe(x, mask)
 
 
 class BottleneckAttentionProbe(nn.Module):
-    """Project high-dim activations down before attention pooling.
+    """Learned projection → attention pooling (for comparison).
 
     5120 → bottleneck_dim → AttentionPoolingProbe(hidden_dim=bottleneck_dim)
-    Reduces param count from ~26M to ~330K.
     """
 
     def __init__(
@@ -344,16 +383,29 @@ def train_and_evaluate(
     max_seq_len = max(x.shape[0] for x in all_X) if all_X else 1
     n_samples = len(train_X)
 
-    probe = BottleneckAttentionProbe(
-        input_dim=hidden_dim,
-        bottleneck_dim=BOTTLENECK_DIM,
-        num_heads=num_heads,
-        output_dim=NUM_CLASSES,
-        max_seq_len=max_seq_len,
-        dropout=DROPOUT,
-    ).to(device)
-    n_params = sum(p.numel() for p in probe.parameters())
-    print(f"  Probe params: {n_params:,} (bottleneck {hidden_dim}→{BOTTLENECK_DIM})")
+    if FREEZE_PROJECTION:
+        probe = FrozenProjectionProbe(
+            input_dim=hidden_dim,
+            proj_dim=BOTTLENECK_DIM,
+            num_heads=num_heads,
+            output_dim=NUM_CLASSES,
+            max_seq_len=max_seq_len,
+            dropout=DROPOUT,
+            seed=SEED,
+        ).to(device)
+    else:
+        probe = BottleneckAttentionProbe(
+            input_dim=hidden_dim,
+            bottleneck_dim=BOTTLENECK_DIM,
+            num_heads=num_heads,
+            output_dim=NUM_CLASSES,
+            max_seq_len=max_seq_len,
+            dropout=DROPOUT,
+        ).to(device)
+    n_trainable = sum(p.numel() for p in probe.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in probe.parameters())
+    proj_label = "frozen" if FREEZE_PROJECTION else "learned"
+    print(f"  Probe: {n_trainable:,} trainable / {n_total:,} total params ({proj_label} projection {hidden_dim}→{BOTTLENECK_DIM})")
     optimizer = torch.optim.AdamW(probe.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     # Use ReduceLROnPlateau so schedule responds to actual val loss, not a fixed cycle
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -757,6 +809,7 @@ def main():
             "num_gpqa_train": NUM_GPQA_TRAIN,
             "num_gpqa_eval": NUM_GPQA_EVAL,
             "bottleneck_dim": BOTTLENECK_DIM,
+            "freeze_projection": FREEZE_PROJECTION,
             "num_heads": NUM_HEADS,
             "lr": LR,
             "epochs": EPOCHS,

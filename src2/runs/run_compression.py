@@ -4,9 +4,13 @@ Run the CoT Compression pipeline across all rollouts for a question.
 For each rollout:
   1. Prepare compression spec
   2. Run LLM sentence selection
-  3. Evaluate compressed CoT vs baseline (50 resamples each)
+  3. Evaluate compressed CoT
 
-Baseline is computed once and reused across all rollouts.
+Two evaluation modes:
+  - "kl_divergence": KL(baseline || compressed) — how well the compressed CoT
+    preserves the original answer distribution. Needs baseline (computed once).
+  - "correctness": P(correct_answer | compressed_cot) — how often the compressed
+    CoT still gets the right answer. No baseline needed.
 
 Usage:
     python -m src2.runs.run_compression [question_id] [num_rollouts]
@@ -35,12 +39,15 @@ CHAR_LIMIT_MULTIPLIER = 1.5
 COMPRESS_PCT = 0.5
 REGION = "prefix"  # "prefix" or "middle"
 
+EVAL_MODE = "kl_divergence"  # "kl_divergence" or "correctness"
+
 # Parse command line arguments
 QUESTION_ID = sys.argv[1] if len(sys.argv) > 1 else "starfish"
 NUM_ROLLOUTS = int(sys.argv[2]) if len(sys.argv) > 2 else 25
 NUM_RESAMPLES = 50
 
 print(f"Running compression for question: {QUESTION_ID} with {NUM_ROLLOUTS} rollouts")
+print(f"Eval mode: {EVAL_MODE}")
 
 task = CompressedCotTask(
     model=SUBJECT_MODEL,
@@ -50,21 +57,23 @@ task = CompressedCotTask(
     region=REGION,
 )
 
-# only get baseline once
-baseline_path = task.compression_dir / QUESTION_ID / "baseline_distribution.json"
-if baseline_path.exists():
-    with open(baseline_path) as f:
-        baseline = json.load(f)
-else:
-    baseline = task.get_baseline_distribution(
-        QUESTION_ID,
-        rollout_idx=0,
-        num_resamples=NUM_RESAMPLES,
-    )
-    baseline_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(baseline_path, "w") as f:
-        json.dump(baseline, f, indent=2)
-    print(f"Saved baseline to {baseline_path}")
+# Baseline only needed for KL mode
+baseline = None
+if EVAL_MODE == "kl_divergence":
+    baseline_path = task.compression_dir / QUESTION_ID / "baseline_distribution.json"
+    if baseline_path.exists():
+        with open(baseline_path) as f:
+            baseline = json.load(f)
+    else:
+        baseline = task.get_baseline_distribution(
+            QUESTION_ID,
+            rollout_idx=0,
+            num_resamples=NUM_RESAMPLES,
+        )
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(baseline_path, "w") as f:
+            json.dump(baseline, f, indent=2)
+        print(f"Saved baseline to {baseline_path}")
 
 all_eval_results = []
 
@@ -87,6 +96,7 @@ for rollout_idx in range(NUM_ROLLOUTS):
         monitor.get_folder(),
         num_resamples=NUM_RESAMPLES,
         baseline=baseline,
+        mode=EVAL_MODE,
     )
     all_eval_results.append(
         {
@@ -98,15 +108,14 @@ for rollout_idx in range(NUM_ROLLOUTS):
     assert monitor._output is not None
     monitor._output.mark_success()
 
-    js = eval_results["js_divergence"]
-    agr = eval_results["agreement"]
-    print(f"  JS divergence: {js:.4f}, Agreement: {agr:.1%}\n")
+    if EVAL_MODE == "kl_divergence":
+        print(f"  KL divergence: {eval_results['kl_divergence']:.4f}, "
+              f"Agreement: {eval_results['agreement']:.1%}\n")
+    else:
+        print(f"  Correctness: {eval_results['correctness']:.1%}\n")
 
 # save agg results
 if all_eval_results:
-    js_vals = [r["js_divergence"] for r in all_eval_results]
-    agr_vals = [r["agreement"] for r in all_eval_results]
-
     summary_path = task.compression_dir / QUESTION_ID / "all_rollouts_eval.json"
     with open(summary_path, "w") as f:
         json.dump(all_eval_results, f, indent=2)
