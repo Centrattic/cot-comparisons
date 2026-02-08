@@ -56,9 +56,10 @@ ANSWER_LABELS = ["A", "B", "C", "D"]
 # Training hyperparameters
 BOTTLENECK_DIM = 32
 FREEZE_PROJECTION = False
+USE_PCA = True  # PCA reduce 5120→BOTTLENECK_DIM before probe (fit on train only)
 MEAN_SUBTRACT = True  # remove question identity → force within-question generalization
 NUM_HEADS = 2
-LR = 1e-4
+LR = 1e-3  # can be higher since only tiny attention probe trains after PCA
 EPOCHS = 500
 BATCH_SIZE = 256
 GRAD_CLIP = 1.0
@@ -214,6 +215,32 @@ def mean_subtract_per_question(data: dict) -> dict:
     return data
 
 
+def fit_pca(train_data: dict, n_components: int) -> dict:
+    """Fit PCA on train token activations, return projection info.
+
+    Concatenates all tokens from all train samples, fits PCA, returns
+    the mean and components needed to transform any data.
+    """
+    from sklearn.decomposition import IncrementalPCA
+
+    print(f"  Fitting PCA ({n_components} components) on train activations...")
+    # Use IncrementalPCA to avoid memory issues with large datasets
+    pca = IncrementalPCA(n_components=n_components, batch_size=4096)
+    # Fit on all train tokens
+    all_tokens = np.concatenate(train_data["X_list"], axis=0)
+    print(f"    Total tokens for PCA fit: {all_tokens.shape[0]:,} × {all_tokens.shape[1]}")
+    pca.fit(all_tokens)
+    explained = pca.explained_variance_ratio_.sum()
+    print(f"    Explained variance: {explained:.4f} ({n_components} components)")
+    return pca
+
+
+def apply_pca(data: dict, pca) -> dict:
+    """Transform activations using fitted PCA. Modifies data in-place."""
+    data["X_list"] = [pca.transform(x).astype(np.float32) for x in data["X_list"]]
+    return data
+
+
 # ── Probe wrappers ────────────────────────────────────────────────
 
 
@@ -358,7 +385,21 @@ def train_and_evaluate(
     max_seq_len = max(x.shape[0] for x in all_X) if all_X else 1
     n_samples = len(train_X)
 
-    if FREEZE_PROJECTION:
+    if USE_PCA:
+        # Data already PCA'd — just attention probe, no projection layer
+        probe = AttentionPoolingProbe(
+            hidden_dim=hidden_dim,  # already BOTTLENECK_DIM after PCA
+            num_heads=num_heads,
+            output_dim=1,
+            max_seq_len=max_seq_len,
+            dropout=DROPOUT,
+        ).to(device)
+        # Wrap forward to squeeze output
+        _orig_forward = probe.forward
+        def _squeezed_forward(x, mask=None):
+            return _orig_forward(x, mask).squeeze(-1)
+        probe.forward = _squeezed_forward
+    elif FREEZE_PROJECTION:
         probe = FrozenProjectionProbe(
             input_dim=hidden_dim,
             proj_dim=BOTTLENECK_DIM,
@@ -378,8 +419,8 @@ def train_and_evaluate(
 
     n_trainable = sum(p.numel() for p in probe.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in probe.parameters())
-    proj_label = "frozen" if FREEZE_PROJECTION else "learned"
-    print(f"  Probe: {n_trainable:,} trainable / {n_total:,} total params ({proj_label} projection {hidden_dim}→{BOTTLENECK_DIM})")
+    proj_label = "PCA" if USE_PCA else ("frozen" if FREEZE_PROJECTION else "learned")
+    print(f"  Probe: {n_trainable:,} trainable / {n_total:,} total params ({proj_label} projection → {hidden_dim}d input)")
 
     # Print target stats
     print(f"  Entropy target stats: mean={train_y.mean():.4f}, std={train_y.std():.4f}, "
@@ -588,8 +629,44 @@ def print_results(metrics: dict, label: str = "Results"):
 # ── Main ──────────────────────────────────────────────────────────────
 
 
+def _compute_question_mean_entropy(forcing_dir: Path, question_ids: list) -> dict:
+    """Compute mean entropy per question from forcing summaries on disk."""
+    question_mean_entropy = {}
+    for qid in question_ids:
+        summaries = sorted(
+            forcing_dir.glob(f"{qid}/rollout_*/*/sentence_*/summary.json")
+        )
+        entropies = []
+        for sp in summaries:
+            with open(sp) as f:
+                s = json.load(f)
+            ad = s.get("answer_distribution", {})
+            ent = dist_dict_to_entropy(ad)
+            if ent is not None:
+                entropies.append(ent)
+        question_mean_entropy[qid] = np.mean(entropies) if entropies else 0.0
+    return question_mean_entropy
+
+
+def _stratified_interleave(ids: list, entropy_map: dict, n_splits: int) -> list:
+    """Sort IDs by entropy, then deal them round-robin into n_splits buckets.
+
+    Returns list of n_splits lists, each covering the full entropy range.
+    """
+    sorted_ids = sorted(ids, key=lambda qid: entropy_map.get(qid, 0.0))
+    buckets = [[] for _ in range(n_splits)]
+    for i, qid in enumerate(sorted_ids):
+        buckets[i % n_splits].append(qid)
+    return buckets
+
+
 def build_question_splits(forcing_dir: Path, seed: int = SEED) -> dict:
-    """Build train/eval question ID lists from custom + GPQA Diamond questions."""
+    """Build train/val/eval splits, stratified by mean entropy.
+
+    All three splits cover the full entropy range via interleaved assignment.
+    Custom and extra eval IDs are assigned first, then GPQA questions are
+    stratified across remaining slots.
+    """
     rng = np.random.default_rng(seed)
 
     gpqa_questions = load_gpqa_from_huggingface(
@@ -602,21 +679,69 @@ def build_question_splits(forcing_dir: Path, seed: int = SEED) -> dict:
     ]
     skipped = len(gpqa_ids) - len(available_ids)
 
-    available_ids = list(available_ids)
-    rng.shuffle(available_ids)
-    gpqa_train = available_ids[:NUM_GPQA_TRAIN]
-    gpqa_eval = available_ids[NUM_GPQA_TRAIN : NUM_GPQA_TRAIN + NUM_GPQA_EVAL]
+    # Compute mean entropy for all available GPQA questions
+    all_candidate_ids = (
+        CUSTOM_TRAIN_IDS
+        + available_ids
+        + [eid for eid in EXTRA_EVAL_IDS if (forcing_dir / eid).exists()]
+    )
+    entropy_map = _compute_question_mean_entropy(forcing_dir, all_candidate_ids)
 
+    # Total questions to distribute across train/val/eval
+    n_total = NUM_GPQA_TRAIN + NUM_GPQA_EVAL
+    n_available = len(available_ids)
+    n_eval = min(NUM_GPQA_EVAL, n_available)
+    n_train_val = min(NUM_GPQA_TRAIN, n_available - n_eval)
+    n_val = max(1, int(n_train_val * VAL_SPLIT))
+    n_train = n_train_val - n_val
+
+    # Stratified split: sort GPQA by entropy, interleave into 3 buckets
+    # (train, val, eval) so each covers the full range
+    gpqa_sorted = sorted(available_ids[:n_train_val + n_eval],
+                         key=lambda qid: entropy_map.get(qid, 0.0))
+
+    gpqa_train, gpqa_val, gpqa_eval = [], [], []
+    for i, qid in enumerate(gpqa_sorted):
+        bucket = i % 3
+        if bucket == 0 and len(gpqa_train) < n_train:
+            gpqa_train.append(qid)
+        elif bucket == 1 and len(gpqa_val) < n_val:
+            gpqa_val.append(qid)
+        elif bucket == 2 and len(gpqa_eval) < n_eval:
+            gpqa_eval.append(qid)
+        # Overflow: fill whichever bucket still has room
+        elif len(gpqa_train) < n_train:
+            gpqa_train.append(qid)
+        elif len(gpqa_eval) < n_eval:
+            gpqa_eval.append(qid)
+        elif len(gpqa_val) < n_val:
+            gpqa_val.append(qid)
+
+    # Custom always train, extra eval always eval
     train_ids = CUSTOM_TRAIN_IDS + gpqa_train
+    val_ids = gpqa_val
     eval_ids = gpqa_eval + [
         eid for eid in EXTRA_EVAL_IDS if (forcing_dir / eid).exists()
     ]
 
+    # Shuffle within splits
+    rng.shuffle(train_ids)
+    rng.shuffle(val_ids)
+    rng.shuffle(eval_ids)
+
+    # Print entropy balance
+    for label, ids in [("Train", train_ids), ("Val", val_ids), ("Eval", eval_ids)]:
+        ents = [entropy_map.get(q, 0.0) for q in ids]
+        if ents:
+            print(f"  {label:5s}: {len(ids)} questions, mean_entropy={np.mean(ents):.4f} (std={np.std(ents):.4f})")
+
     return {
         "train_ids": train_ids,
+        "val_ids": val_ids,
         "eval_ids": eval_ids,
-        "n_gpqa_available": len(available_ids),
+        "n_gpqa_available": n_available,
         "n_gpqa_skipped": skipped,
+        "entropy_map": entropy_map,
     }
 
 
@@ -624,32 +749,36 @@ def main():
     forcing = ForcingTask(model=SUBJECT_MODEL, data_dir=DATA_DIR)
 
     # ── Step 1: Build question splits ─────────────────────────────────
-    print("Building question splits from custom + GPQA Diamond...")
+    print("Building question splits (stratified by entropy)...")
     splits = build_question_splits(forcing.forcing_dir)
     train_ids = splits["train_ids"]
+    val_ids = splits["val_ids"]
     eval_ids = splits["eval_ids"]
 
     print(f"  GPQA Diamond available on disk: {splits['n_gpqa_available']}")
     if splits["n_gpqa_skipped"] > 0:
         print(f"  GPQA Diamond not yet forced (skipped): {splits['n_gpqa_skipped']}")
-    print(f"  Train questions: {len(train_ids)} ({len(CUSTOM_TRAIN_IDS)} custom + {len(train_ids) - len(CUSTOM_TRAIN_IDS)} GPQA)")
-    print(f"  Eval questions:  {len(eval_ids)}")
 
-    all_question_ids = train_ids + eval_ids
+    all_question_ids = train_ids + val_ids + eval_ids
 
     # ── Step 2: Sample sentence indices ───────────────────────────────
     print("\nSampling sentence indices...")
     train_sentence_map = sample_sentence_indices(
         forcing.forcing_dir, train_ids, MAX_SENTENCES_PER_QUESTION_TRAIN, SEED,
     )
+    val_sentence_map = sample_sentence_indices(
+        forcing.forcing_dir, val_ids, MAX_SENTENCES_PER_QUESTION_EVAL, SEED,
+    )
     eval_sentence_map = sample_sentence_indices(
         forcing.forcing_dir, eval_ids, MAX_SENTENCES_PER_QUESTION_EVAL, SEED,
     )
-    sentence_map = {**train_sentence_map, **eval_sentence_map}
+    sentence_map = {**train_sentence_map, **val_sentence_map, **eval_sentence_map}
     train_sents = sum(len(v) for v in train_sentence_map.values())
+    val_sents = sum(len(v) for v in val_sentence_map.values())
     eval_sents = sum(len(v) for v in eval_sentence_map.values())
-    print(f"  Train/val: {train_sents} sentence indices ({MAX_SENTENCES_PER_QUESTION_TRAIN}/question)")
-    print(f"  Eval:      {eval_sents} sentence indices ({MAX_SENTENCES_PER_QUESTION_EVAL}/question)")
+    print(f"  Train: {train_sents} sentence indices ({MAX_SENTENCES_PER_QUESTION_TRAIN}/question)")
+    print(f"  Val:   {val_sents} sentence indices ({MAX_SENTENCES_PER_QUESTION_EVAL}/question)")
+    print(f"  Eval:  {eval_sents} sentence indices ({MAX_SENTENCES_PER_QUESTION_EVAL}/question)")
 
     # ── Step 3: Extract activations if needed ─────────────────────────
     if EXTRACT_ACTIVATIONS:
@@ -662,16 +791,8 @@ def main():
             data_slice=ds,
         )
 
-    # ── Step 4: Split train into train/val by question_id ───────────
-    rng = np.random.default_rng(SEED)
-    shuffled_train = list(train_ids)
-    rng.shuffle(shuffled_train)
-    n_val = max(1, int(len(shuffled_train) * VAL_SPLIT))
-    val_ids = shuffled_train[:n_val]
-    actual_train_ids = shuffled_train[n_val:]
-    print(f"\n  Train/val split: {len(actual_train_ids)} train questions, {len(val_ids)} val questions")
-
-    # ── Step 5: Load data ─────────────────────────────────────────────
+    # ── Step 4: Load data ───────────────────────────────────────────────
+    actual_train_ids = train_ids  # train/val/eval already split in build_question_splits
     tokenizer = None
     if TRIM_TO_COT:
         from transformers import AutoTokenizer
@@ -727,6 +848,15 @@ def main():
             eval_data = mean_subtract_per_question(eval_data)
         print("  Done — question identity signal removed from activations")
 
+    # ── Step 5c: PCA dimensionality reduction ─────────────────────────
+    if USE_PCA:
+        print(f"\nApplying PCA: {train_data['X_list'][0].shape[1]} → {BOTTLENECK_DIM}")
+        pca = fit_pca(train_data, n_components=BOTTLENECK_DIM)
+        train_data = apply_pca(train_data, pca)
+        val_data = apply_pca(val_data, pca)
+        if eval_data:
+            eval_data = apply_pca(eval_data, pca)
+
     # ── Step 6: Train and evaluate ────────────────────────────────────
     print("\nTraining entropy attention probe...")
     results = train_and_evaluate(
@@ -763,8 +893,18 @@ def main():
         print_results(eval_metrics, label="Eval Set Results (held-out questions)")
 
     # ── Step 8: Save results ──────────────────────────────────────────
-    output_dir = DATA_DIR / "entropy_probe"
+    from datetime import datetime
+    base_dir = DATA_DIR / "entropy_probe"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = base_dir / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Update "latest" symlink
+    latest_link = base_dir / "latest"
+    if latest_link.is_symlink() or latest_link.exists():
+        latest_link.unlink()
+    latest_link.symlink_to(timestamp)
 
     output = {
         "train_metrics": train_metrics,
@@ -784,6 +924,7 @@ def main():
             "num_gpqa_train": NUM_GPQA_TRAIN,
             "num_gpqa_eval": NUM_GPQA_EVAL,
             "bottleneck_dim": BOTTLENECK_DIM,
+            "use_pca": USE_PCA,
             "freeze_projection": FREEZE_PROJECTION,
             "mean_subtract": MEAN_SUBTRACT,
             "num_heads": NUM_HEADS,
