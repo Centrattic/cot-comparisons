@@ -55,14 +55,14 @@ ANSWER_LABELS = ["A", "B", "C", "D"]
 
 # Training hyperparameters
 BOTTLENECK_DIM = 32
-FREEZE_PROJECTION = True   # frozen random proj can't memorize question identity
-MEAN_SUBTRACT = False
+FREEZE_PROJECTION = False
+MEAN_SUBTRACT = True  # remove question identity → force within-question generalization
 NUM_HEADS = 2
-LR = 1e-3
+LR = 1e-4
 EPOCHS = 500
 BATCH_SIZE = 256
 GRAD_CLIP = 1.0
-WEIGHT_DECAY = 0.01
+WEIGHT_DECAY = 0.02
 DROPOUT = 0.3
 SEED = 42
 
