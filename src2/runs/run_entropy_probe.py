@@ -54,17 +54,17 @@ MAX_SENTENCES_PER_QUESTION_EVAL = 50
 ANSWER_LABELS = ["A", "B", "C", "D"]
 
 # Training hyperparameters
-BOTTLENECK_DIM = 32
+BOTTLENECK_DIM = 8
 FREEZE_PROJECTION = False
 USE_PCA = False
 MEAN_SUBTRACT = True  # remove question identity → force within-question generalization
-NUM_HEADS = 2
-LR = 1e-3  # can be higher since only tiny attention probe trains after PCA
+NUM_HEADS = 1
+LR = 3e-4
 EPOCHS = 500
 BATCH_SIZE = 256
 GRAD_CLIP = 1.0
-WEIGHT_DECAY = 0.02
-DROPOUT = 0.3
+WEIGHT_DECAY = 0.1
+DROPOUT = 0.5
 SEED = 42
 
 # Validation / early stopping
@@ -72,7 +72,7 @@ VAL_SPLIT = 0.2
 PATIENCE = 50
 MIN_DELTA = 0.001  # smaller delta for regression (MSE scale is smaller)
 
-EXTRACT_ACTIVATIONS = True
+EXTRACT_ACTIVATIONS = False
 TOKEN_POSITION = "full_sequence"
 TRIM_TO_COT = True
 
