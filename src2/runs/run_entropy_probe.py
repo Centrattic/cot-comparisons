@@ -56,9 +56,9 @@ ANSWER_LABELS = ["A", "B", "C", "D"]
 # Training hyperparameters
 BOTTLENECK_DIM = 64
 FREEZE_PROJECTION = False
-MEAN_SUBTRACT = True
+MEAN_SUBTRACT = False
 NUM_HEADS = 2
-LR = 4e-4
+LR = 2e-3
 EPOCHS = 200
 BATCH_SIZE = 256
 GRAD_CLIP = 1.0
@@ -68,7 +68,7 @@ SEED = 42
 
 # Validation / early stopping
 VAL_SPLIT = 0.2
-PATIENCE = 20
+PATIENCE = 50
 MIN_DELTA = 0.001  # smaller delta for regression (MSE scale is smaller)
 
 EXTRACT_ACTIVATIONS = False
@@ -331,7 +331,7 @@ def _predict(probe, X_list, device):
         m = torch.ones(1, seq_len, dtype=torch.bool, device=device)
         with torch.no_grad():
             pred = probe(x_t, m)
-        preds.append(float(pred.cpu().numpy()))
+        preds.append(pred.item())
     return np.array(preds, dtype=np.float32)
 
 
