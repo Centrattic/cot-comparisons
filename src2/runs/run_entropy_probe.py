@@ -49,8 +49,8 @@ NUM_GPQA_EVAL = 10
 EXTRA_EVAL_IDS = ["blackmail_mc_001", "blackmail_ab_001"]
 
 # Sentence sampling
-MAX_SENTENCES_PER_QUESTION_TRAIN = 5
-MAX_SENTENCES_PER_QUESTION_EVAL = 20
+MAX_SENTENCES_PER_QUESTION_TRAIN = 50
+MAX_SENTENCES_PER_QUESTION_EVAL = 50
 ANSWER_LABELS = ["A", "B", "C", "D"]
 
 # Training hyperparameters
@@ -71,7 +71,7 @@ VAL_SPLIT = 0.2
 PATIENCE = 50
 MIN_DELTA = 0.001  # smaller delta for regression (MSE scale is smaller)
 
-EXTRACT_ACTIVATIONS = False
+EXTRACT_ACTIVATIONS = True
 TOKEN_POSITION = "full_sequence"
 TRIM_TO_COT = True
 
@@ -386,8 +386,8 @@ def train_and_evaluate(
           f"min={train_y.min():.4f}, max={train_y.max():.4f}")
 
     optimizer = torch.optim.AdamW(probe.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6,
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6,
     )
     loss_fn = nn.MSELoss()
 
@@ -440,7 +440,7 @@ def train_and_evaluate(
         else:
             val_mse, val_r2 = train_loss, 0.0
 
-        scheduler.step(val_mse)
+        scheduler.step()
 
         # ── Early stopping ──
         if val_mse < best_val_loss - MIN_DELTA:
