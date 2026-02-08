@@ -56,7 +56,7 @@ ANSWER_LABELS = ["A", "B", "C", "D"]
 # Training hyperparameters
 BOTTLENECK_DIM = 32
 FREEZE_PROJECTION = False
-USE_PCA = True  # PCA reduce 5120→BOTTLENECK_DIM before probe (fit on train only)
+USE_PCA = False
 MEAN_SUBTRACT = True  # remove question identity → force within-question generalization
 NUM_HEADS = 2
 LR = 1e-3  # can be higher since only tiny attention probe trains after PCA
@@ -695,27 +695,23 @@ def build_question_splits(forcing_dir: Path, seed: int = SEED) -> dict:
     n_val = max(1, int(n_train_val * VAL_SPLIT))
     n_train = n_train_val - n_val
 
-    # Stratified split: sort GPQA by entropy, interleave into 3 buckets
-    # (train, val, eval) so each covers the full range
+    # Stratified split: sort GPQA by entropy, then in each group of
+    # (n_train + n_val + n_eval) / n_val ≈ 6 consecutive questions,
+    # assign 1 to val, 1 to eval, rest to train. This ensures all
+    # splits cover the full entropy range proportionally.
     gpqa_sorted = sorted(available_ids[:n_train_val + n_eval],
                          key=lambda qid: entropy_map.get(qid, 0.0))
 
+    group_size = max(1, len(gpqa_sorted) // max(n_val, 1))  # e.g. 60/10 = 6
     gpqa_train, gpqa_val, gpqa_eval = [], [], []
     for i, qid in enumerate(gpqa_sorted):
-        bucket = i % 3
-        if bucket == 0 and len(gpqa_train) < n_train:
-            gpqa_train.append(qid)
-        elif bucket == 1 and len(gpqa_val) < n_val:
+        pos_in_group = i % group_size
+        if pos_in_group == 0 and len(gpqa_val) < n_val:
             gpqa_val.append(qid)
-        elif bucket == 2 and len(gpqa_eval) < n_eval:
+        elif pos_in_group == 1 and len(gpqa_eval) < n_eval:
             gpqa_eval.append(qid)
-        # Overflow: fill whichever bucket still has room
-        elif len(gpqa_train) < n_train:
+        else:
             gpqa_train.append(qid)
-        elif len(gpqa_eval) < n_eval:
-            gpqa_eval.append(qid)
-        elif len(gpqa_val) < n_val:
-            gpqa_val.append(qid)
 
     # Custom always train, extra eval always eval
     train_ids = CUSTOM_TRAIN_IDS + gpqa_train

@@ -10,8 +10,8 @@
 
 set -euo pipefail
 
-BUCKET="s3://riya-mats-bucket/data/forced_response"
-LOCAL="./data/forced_response"
+BUCKET="s3://riya-mats-bucket/data/"
+LOCAL="./data/"
 
 aws configure set default.s3.max_concurrent_requests 100
 
