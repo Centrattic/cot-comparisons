@@ -54,16 +54,16 @@ MAX_SENTENCES_PER_QUESTION_EVAL = 20
 ANSWER_LABELS = ["A", "B", "C", "D"]
 
 # Training hyperparameters
-BOTTLENECK_DIM = 16
-FREEZE_PROJECTION = False
+BOTTLENECK_DIM = 32
+FREEZE_PROJECTION = True   # frozen random proj can't memorize question identity
 MEAN_SUBTRACT = False
 NUM_HEADS = 2
-LR = 3e-5
+LR = 1e-3
 EPOCHS = 500
 BATCH_SIZE = 256
 GRAD_CLIP = 1.0
-WEIGHT_DECAY = 0.05
-DROPOUT = 0.5
+WEIGHT_DECAY = 0.01
+DROPOUT = 0.3
 SEED = 42
 
 # Validation / early stopping
