@@ -18,13 +18,14 @@ LAYER = 32
 VARIANTS: List[VariantType] = ["suggest_wrong", "suggest_right"]
 
 NUM_SAMPLES = 50
-ADD_PROMPTS = 200
-MAX_WORKERS = 500
+ADD_PROMPTS = 500
+MAX_WORKERS = 2000
 LOAD_IN_4BIT = True
 
-v: VariantType
-for v in VARIANTS[1:]:
-    print(v)
+for v in VARIANTS[:1]:  # suggest_wrong only; change to VARIANTS[1:] for suggest_right
+    print(f"\n{'=' * 60}")
+    print(f"Starting variant: {v}")
+    print(f"{'=' * 60}")
     scruples = ScruplesTask(
         subject_model=SUBJECT_MODEL,
         variant=v,
@@ -32,23 +33,13 @@ for v in VARIANTS[1:]:
         max_workers=MAX_WORKERS,
     )
 
-    assert scruples.get_data()
-
-    # if not scruples.get_data():
-    for split in ["dev", "train"]:
-        scruples.run_data(
-            data_dir=SCRUPLES_DATA_DIR,
-            num_samples=NUM_SAMPLES,
-            max_prompts=ADD_PROMPTS,
-            split=split,
-            consensus_threshold=0.0,
-        )
-
-    data_slice = scruples.get_sycophancy_slice()
-
-    scruples.extract_activations(
-        model_name=ACTIVATION_MODEL,
-        layers=[LAYER],
-        load_in_4bit=LOAD_IN_4BIT,
-        data_slice=data_slice,
+    scruples.run_data(
+        data_dir=SCRUPLES_DATA_DIR,
+        num_samples=NUM_SAMPLES,
+        max_prompts=ADD_PROMPTS,
+        split="train",
+        consensus_threshold=0.0,
+        add=True,
     )
+
+    print(f"Done: {v}")

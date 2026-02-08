@@ -45,6 +45,11 @@ BATCH_SIZE = 8
 GRAD_CLIP = 1.0  # Gradient clipping
 TEST_SPLIT = 0.2
 SWITCH_THRESHOLD = 0.40
+HIGH_INTERVENTION_RATE = 0.82
+LOW_INTERVENTION_RATE = 0.60
+N_SYC_HIGH_PER_VARIANT = 25
+N_SYC_LOW_PER_VARIANT = 25
+N_NON_SYC_PER_VARIANT = 50
 SEED = 42
 
 EXTRACT_ACTIVATIONS = False
@@ -119,15 +124,46 @@ def train_test_split_by_anecdote(
     metadata: list,
     test_fraction: float = TEST_SPLIT,
     seed: int = SEED,
+    anecdote_strata: dict = None,
 ) -> dict:
-    """Split data into train/test by anecdote."""
-    rng = np.random.default_rng(seed)
-    unique_anecdotes = list(set(anecdote_ids))
-    rng.shuffle(unique_anecdotes)
+    """Split data into train/test by anecdote, with optional stratification.
 
-    n_test = max(1, int(len(unique_anecdotes) * test_fraction))
-    test_anecdotes = set(unique_anecdotes[:n_test])
-    train_anecdotes = set(unique_anecdotes[n_test:])
+    When *anecdote_strata* is provided (mapping anecdote_id -> stratum label),
+    each stratum is split independently so that the stratum proportions are
+    preserved in both train and test sets.
+    """
+    rng = np.random.default_rng(seed)
+
+    if anecdote_strata is not None:
+        # Group anecdotes by stratum
+        strata_groups: dict = {}
+        for aid in set(anecdote_ids):
+            s = anecdote_strata.get(aid, "unknown")
+            strata_groups.setdefault(s, []).append(aid)
+
+        train_anecdotes: set = set()
+        test_anecdotes: set = set()
+
+        for stratum, aids in sorted(strata_groups.items()):
+            aids = sorted(aids)
+            rng.shuffle(aids)
+            n_test = max(1, int(len(aids) * test_fraction))
+            test_anecdotes.update(aids[:n_test])
+            train_anecdotes.update(aids[n_test:])
+
+        # Print stratification summary
+        print("  Stratified split by anecdote:")
+        for stratum in sorted(strata_groups):
+            aids = strata_groups[stratum]
+            n_train = sum(1 for a in aids if a in train_anecdotes)
+            n_test = sum(1 for a in aids if a in test_anecdotes)
+            print(f"    {stratum}: {n_train} train, {n_test} test")
+    else:
+        unique_anecdotes = list(set(anecdote_ids))
+        rng.shuffle(unique_anecdotes)
+        n_test = max(1, int(len(unique_anecdotes) * test_fraction))
+        test_anecdotes = set(unique_anecdotes[:n_test])
+        train_anecdotes = set(unique_anecdotes[n_test:])
 
     train_idx = [i for i, a in enumerate(anecdote_ids) if a in train_anecdotes]
     test_idx = [i for i, a in enumerate(anecdote_ids) if a in test_anecdotes]
@@ -318,7 +354,14 @@ def main():
     task = tasks[VARIANTS[0]]
     print("\nComputing uncertainty-robust split...")
     split_info = task.get_uncertainty_robust_split(
-        switch_threshold=SWITCH_THRESHOLD, non_syc_max_switch=0.10, variants=VARIANTS,
+        switch_threshold=SWITCH_THRESHOLD,
+        non_syc_max_switch=0.10,
+        high_intervention_rate=HIGH_INTERVENTION_RATE,
+        low_intervention_rate=LOW_INTERVENTION_RATE,
+        n_syc_high_per_variant=N_SYC_HIGH_PER_VARIANT,
+        n_syc_low_per_variant=N_SYC_LOW_PER_VARIANT,
+        n_non_syc_per_variant=N_NON_SYC_PER_VARIANT,
+        variants=VARIANTS,
     )
 
     # ── Step 3: Extract activations if needed (only for split) ────────
@@ -362,9 +405,12 @@ def main():
         print("Too few samples. Exiting.")
         return
 
-    # ── Step 4: Train/test split ──────────────────────────────────────
+    # ── Step 5: Train/test split (stratified by uncertainty strata) ──
     print(f"Splitting data ({1 - TEST_SPLIT:.0%} train, {TEST_SPLIT:.0%} test)...")
-    split = train_test_split_by_anecdote(X_list, y, anecdote_ids, metadata)
+    split = train_test_split_by_anecdote(
+        X_list, y, anecdote_ids, metadata,
+        anecdote_strata=split_info.get("anecdote_strata"),
+    )
 
     print(
         f"  Train: {len(split['train_X'])} samples from {split['n_train_anecdotes']} anecdotes"
