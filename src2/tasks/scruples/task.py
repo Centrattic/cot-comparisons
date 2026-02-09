@@ -938,6 +938,11 @@ class ScruplesTask(BaseTask):
         syc_control_rates: list = []
         non_syc_control_rates: list = []
 
+        # Track full candidate pools across variants for top-up after dedup
+        full_syc_high_pool: set = set()
+        full_syc_low_pool: set = set()
+        full_non_syc_pool: set = set()
+
         for variant in variants:
             prompts_csv = self.data_dir / f"prompts_{variant}.csv"
             if not prompts_csv.exists():
@@ -963,27 +968,15 @@ class ScruplesTask(BaseTask):
             syc_low_pool = prompts_df.loc[syc_low_mask, "anecdote_id"].tolist()
             non_syc_pool = prompts_df.loc[non_syc_mask, "anecdote_id"].tolist()
 
+            full_syc_high_pool.update(syc_high_pool)
+            full_syc_low_pool.update(syc_low_pool)
+            full_non_syc_pool.update(non_syc_pool)
+
             print(
                 f"  {variant}: {len(syc_high_pool)} syc_high, "
                 f"{len(syc_low_pool)} syc_low, "
                 f"{len(non_syc_pool)} non_syc available"
             )
-
-            if len(syc_high_pool) < n_syc_high_per_variant:
-                print(
-                    f"    Warning: only {len(syc_high_pool)} syc_high available "
-                    f"(requested {n_syc_high_per_variant})"
-                )
-            if len(syc_low_pool) < n_syc_low_per_variant:
-                print(
-                    f"    Warning: only {len(syc_low_pool)} syc_low available "
-                    f"(requested {n_syc_low_per_variant})"
-                )
-            if len(non_syc_pool) < n_non_syc_per_variant:
-                print(
-                    f"    Warning: only {len(non_syc_pool)} non_syc available "
-                    f"(requested {n_non_syc_per_variant})"
-                )
 
             n_high = min(n_syc_high_per_variant, len(syc_high_pool))
             n_low = min(n_syc_low_per_variant, len(syc_low_pool))
@@ -1014,6 +1007,24 @@ class ScruplesTask(BaseTask):
                         syc_control_rates.append(cr)
                     elif aid in sampled_non_set:
                         non_syc_control_rates.append(cr)
+
+        # Top up if cross-variant dedup reduced counts below target
+        n_variants = len(variants)
+        for label, sampled, pool, n_per in [
+            ("syc_high", all_syc_high_ids, full_syc_high_pool, n_syc_high_per_variant),
+            ("syc_low", all_syc_low_ids, full_syc_low_pool, n_syc_low_per_variant),
+            ("non_syc", all_non_syc_ids, full_non_syc_pool, n_non_syc_per_variant),
+        ]:
+            target = n_per * n_variants
+            if len(sampled) < target:
+                remaining = sorted(pool - sampled)
+                needed = target - len(sampled)
+                if remaining and needed > 0:
+                    topup = rng.choice(
+                        remaining, size=min(needed, len(remaining)), replace=False
+                    ).tolist()
+                    sampled.update(topup)
+                    print(f"  Top-up {label}: added {len(topup)} to reach {len(sampled)}/{target}")
 
         # Resolve any overlaps: if an anecdote ended up in both syc and non_syc
         # across variants, keep it in the syc group

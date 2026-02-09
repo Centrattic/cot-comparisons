@@ -51,7 +51,7 @@ SENTENCE_STRIDE = 1
 # Match sycophancy probe's split config
 SWITCH_THRESHOLD = 0.40
 HIGH_INTERVENTION_RATE = 0.82
-LOW_INTERVENTION_RATE = 0.60
+LOW_INTERVENTION_RATE = 0.70
 N_SYC_HIGH_PER_VARIANT = 25
 N_SYC_LOW_PER_VARIANT = 25
 N_NON_SYC_PER_VARIANT = 50
@@ -169,7 +169,7 @@ def generate_forcing_data():
                 "entropy": _shannon_entropy(probs),
             }
 
-        with ThreadPoolExecutor(max_workers=min(50, len(indices))) as executor:
+        with ThreadPoolExecutor(max_workers=min(2000, len(indices))) as executor:
             futures = {executor.submit(_force_at, idx): idx for idx in indices}
             for future in as_completed(futures):
                 results.append(future.result())
@@ -190,7 +190,7 @@ def generate_forcing_data():
         n_non_syc_per_variant=N_NON_SYC_PER_VARIANT,
         variants=VARIANTS,
     )
-    target_anecdotes = split_info["syc_ids"] | split_info["non_syc_ids"]
+    target_anecdotes = set(split_info["syc_ids"]) | set(split_info["non_syc_ids"])
     print(f"Target anecdotes: {len(target_anecdotes)} "
           f"({len(split_info['syc_ids'])} syc, {len(split_info['non_syc_ids'])} non-syc)")
 
