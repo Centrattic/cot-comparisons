@@ -59,7 +59,7 @@ FREEZE_PROJECTION = False
 USE_PCA = False
 MEAN_SUBTRACT = True  # remove question identity → force within-question generalization
 NUM_HEADS = 1
-LR = 3e-4
+LR = 2e-3
 EPOCHS = 500
 BATCH_SIZE = 256
 GRAD_CLIP = 1.0
@@ -136,6 +136,40 @@ def _compute_base_prompt_tokens(full_prompt: str, tokenizer) -> int:
     return len(ids)
 
 
+def _load_question_data(
+    forcing: ForcingTask,
+    qid: str,
+    sentence_indices,
+    layer: int,
+    token_position: str,
+    tokenizer,
+    trim_to_cot: bool,
+) -> list:
+    """Load data for a single question. Designed to run in a thread."""
+    ds = DataSlice(ids={qid}, sentence_indices=sentence_indices)
+    samples = forcing.get_probe_data(layer, ds, token_position)
+
+    base_prompt_tokens = None
+    results = []
+    for sample in samples:
+        entropy = dist_dict_to_entropy(sample["answer_distribution"])
+        if entropy is None:
+            continue
+
+        act = sample["activation"]
+
+        if trim_to_cot and tokenizer is not None and act.ndim == 2:
+            if base_prompt_tokens is None:
+                base_prompt_tokens = _compute_base_prompt_tokens(
+                    sample["full_prompt"], tokenizer,
+                )
+            if base_prompt_tokens > 0 and act.shape[0] > base_prompt_tokens:
+                act = act[base_prompt_tokens:]
+
+        results.append((act, entropy, sample["question_id"], sample["sentence_idx"]))
+    return results
+
+
 def load_probe_data(
     forcing: ForcingTask,
     question_ids: list,
@@ -144,48 +178,39 @@ def load_probe_data(
     token_position: str,
     tokenizer=None,
     trim_to_cot: bool = False,
+    max_workers: int = 8,
 ) -> dict:
     """Load activations + entropy targets for the given questions.
 
-    Returns:
-        {
-            "X_list": list of ndarrays,
-            "y_entropy": ndarray [n],
-            "question_ids": list,
-            "sentence_indices": list,
-        }
+    Parallelizes across questions using threads (I/O bound).
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     X_list = []
     y_entropy_list = []
     q_ids = []
     s_indices = []
 
-    base_token_cache = {}
+    futures = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for qid in question_ids:
+            fut = pool.submit(
+                _load_question_data,
+                forcing, qid, sentence_map.get(qid),
+                layer, token_position, tokenizer, trim_to_cot,
+            )
+            futures[fut] = qid
 
-    for qid in question_ids:
-        ds = DataSlice(ids={qid}, sentence_indices=sentence_map.get(qid))
-        samples = forcing.get_probe_data(layer, ds, token_position)
-
-        for sample in samples:
-            entropy = dist_dict_to_entropy(sample["answer_distribution"])
-            if entropy is None:
-                continue
-
-            act = sample["activation"]
-
-            if trim_to_cot and tokenizer is not None and act.ndim == 2:
-                if qid not in base_token_cache:
-                    base_token_cache[qid] = _compute_base_prompt_tokens(
-                        sample["full_prompt"], tokenizer,
-                    )
-                n_trim = base_token_cache[qid]
-                if n_trim > 0 and act.shape[0] > n_trim:
-                    act = act[n_trim:]
-
-            X_list.append(act)
-            y_entropy_list.append(entropy)
-            q_ids.append(sample["question_id"])
-            s_indices.append(sample["sentence_idx"])
+        done = 0
+        for fut in as_completed(futures):
+            done += 1
+            if done % 10 == 0:
+                print(f"    Loaded {done}/{len(question_ids)} questions...")
+            for act, entropy, question_id, sentence_idx in fut.result():
+                X_list.append(act)
+                y_entropy_list.append(entropy)
+                q_ids.append(question_id)
+                s_indices.append(sentence_idx)
 
     y_entropy = np.array(y_entropy_list, dtype=np.float32) if y_entropy_list else np.zeros(0, dtype=np.float32)
 
