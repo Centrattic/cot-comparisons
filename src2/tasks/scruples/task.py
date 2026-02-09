@@ -362,8 +362,12 @@ class ScruplesTask(BaseTask):
                 skipped += 1
                 continue
 
-            with open(run_path) as f:
-                run_data = json.load(f)
+            try:
+                with open(run_path) as f:
+                    run_data = json.load(f)
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                print(f"Skipping corrupt file {run_path}: {e}")
+                continue
 
             user_msg = run_data.get("prompt", "")
             thinking = run_data.get("thinking", "")
