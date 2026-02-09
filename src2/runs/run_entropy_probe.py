@@ -58,12 +58,13 @@ BOTTLENECK_DIM = 8
 FREEZE_PROJECTION = False
 USE_PCA = False
 MEAN_SUBTRACT = True  # remove question identity → force within-question generalization
+USE_LINEAR_BASELINE = True  # mean-pool + linear instead of attention probe
 NUM_HEADS = 1
-LR = 2e-3
+LR = 1e-3
 EPOCHS = 500
 BATCH_SIZE = 256
 GRAD_CLIP = 1.0
-WEIGHT_DECAY = 0.1
+WEIGHT_DECAY = 0.05
 DROPOUT = 0.5
 SEED = 42
 
@@ -301,6 +302,26 @@ class FrozenProjectionProbe(nn.Module):
         return self.attn_probe(x, mask).squeeze(-1)  # [batch]
 
 
+class MeanPoolLinearProbe(nn.Module):
+    """Mean-pool over sequence → dropout → linear → scalar. Simplest baseline."""
+
+    def __init__(self, input_dim: int, dropout: float):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.linear = nn.Linear(input_dim, 1)
+
+    def forward(self, x, mask=None):
+        # x: [batch, seq_len, hidden_dim], mask: [batch, seq_len]
+        if mask is not None:
+            x = x * mask.unsqueeze(-1).float()
+            lengths = mask.sum(dim=1, keepdim=True).clamp(min=1)
+            pooled = x.sum(dim=1) / lengths  # [batch, hidden_dim]
+        else:
+            pooled = x.mean(dim=1)
+        pooled = self.dropout(pooled)
+        return self.linear(pooled).squeeze(-1)  # [batch]
+
+
 class BottleneckAttentionProbe(nn.Module):
     """Learned projection → attention pooling → regression head."""
 
@@ -410,7 +431,13 @@ def train_and_evaluate(
     max_seq_len = max(x.shape[0] for x in all_X) if all_X else 1
     n_samples = len(train_X)
 
-    if USE_PCA:
+    if USE_LINEAR_BASELINE:
+        probe = MeanPoolLinearProbe(
+            input_dim=hidden_dim,
+            dropout=DROPOUT,
+        ).to(device)
+        proj_label = "mean-pool linear"
+    elif USE_PCA:
         # Data already PCA'd — just attention probe, no projection layer
         probe = AttentionPoolingProbe(
             hidden_dim=hidden_dim,  # already BOTTLENECK_DIM after PCA
@@ -424,6 +451,7 @@ def train_and_evaluate(
         def _squeezed_forward(x, mask=None):
             return _orig_forward(x, mask).squeeze(-1)
         probe.forward = _squeezed_forward
+        proj_label = "PCA"
     elif FREEZE_PROJECTION:
         probe = FrozenProjectionProbe(
             input_dim=hidden_dim,
@@ -433,6 +461,7 @@ def train_and_evaluate(
             dropout=DROPOUT,
             seed=SEED,
         ).to(device)
+        proj_label = "frozen"
     else:
         probe = BottleneckAttentionProbe(
             input_dim=hidden_dim,
@@ -441,10 +470,10 @@ def train_and_evaluate(
             max_seq_len=max_seq_len,
             dropout=DROPOUT,
         ).to(device)
+        proj_label = "learned"
 
     n_trainable = sum(p.numel() for p in probe.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in probe.parameters())
-    proj_label = "PCA" if USE_PCA else ("frozen" if FREEZE_PROJECTION else "learned")
     print(f"  Probe: {n_trainable:,} trainable / {n_total:,} total params ({proj_label} projection → {hidden_dim}d input)")
 
     # Print target stats
@@ -926,6 +955,34 @@ def main():
     if latest_link.is_symlink() or latest_link.exists():
         latest_link.unlink()
     latest_link.symlink_to(timestamp)
+
+    # Save key params for quick reference
+    params = {
+        "bottleneck_dim": BOTTLENECK_DIM,
+        "use_linear_baseline": USE_LINEAR_BASELINE,
+        "freeze_projection": FREEZE_PROJECTION,
+        "use_pca": USE_PCA,
+        "mean_subtract": MEAN_SUBTRACT,
+        "num_heads": NUM_HEADS,
+        "lr": LR,
+        "epochs": EPOCHS,
+        "batch_size": BATCH_SIZE,
+        "weight_decay": WEIGHT_DECAY,
+        "dropout": DROPOUT,
+        "grad_clip": GRAD_CLIP,
+        "patience": PATIENCE,
+        "layer": LAYER,
+        "max_sentences_train": MAX_SENTENCES_PER_QUESTION_TRAIN,
+        "max_sentences_eval": MAX_SENTENCES_PER_QUESTION_EVAL,
+        "n_train": len(train_data["X_list"]),
+        "n_val": len(val_data["X_list"]),
+        "n_eval": len(eval_data["X_list"]) if eval_data else 0,
+        "best_val_loss": results["best_val_loss"],
+        "best_epoch": results["best_epoch"],
+        "total_epochs": results["total_epochs"],
+    }
+    with open(output_dir / "params.json", "w") as f:
+        json.dump(params, f, indent=2)
 
     output = {
         "train_metrics": train_metrics,
