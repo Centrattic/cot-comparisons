@@ -627,11 +627,11 @@ class ScruplesTask(BaseTask):
                     continue
 
                 try:
-                    with np.load(act_path) as f:
-                        if seq_key not in f.files:
-                            continue
-                        full_seq = f[seq_key]
-                        boundaries = f[bnd_key]
+                    f = np.load(act_path, mmap_mode="r")
+                    if seq_key not in f.files:
+                        del f
+                        continue
+                    boundaries = f[bnd_key]
                 except Exception:
                     continue
 
@@ -639,8 +639,13 @@ class ScruplesTask(BaseTask):
                 last_input = int(boundaries[boundary_names.index("last_input")])
                 last_response = int(boundaries[boundary_names.index("last_response")])
                 if last_input < 0 or last_response <= last_input:
+                    del f
                     continue
-                segment = full_seq[last_input + 1 : last_response + 1]
+                segment = np.array(
+                    f[seq_key][last_input + 1 : last_response + 1],
+                    dtype=np.float16,
+                )
+                del f
                 if segment.shape[0] == 0:
                     continue
 
@@ -742,11 +747,11 @@ class ScruplesTask(BaseTask):
                     continue
 
                 try:
-                    with np.load(act_path) as f:
-                        if seq_key not in f.files:
-                            continue
-                        full_seq = f[seq_key]
-                        boundaries = f[bnd_key]
+                    f = np.load(act_path, mmap_mode="r")
+                    if seq_key not in f.files:
+                        del f
+                        continue
+                    boundaries = f[bnd_key]
                 except Exception:
                     continue
 
@@ -754,8 +759,13 @@ class ScruplesTask(BaseTask):
                 last_input = int(boundaries[boundary_names.index("last_input")])
                 last_response = int(boundaries[boundary_names.index("last_response")])
                 if last_input < 0 or last_response <= last_input:
+                    del f
                     continue
-                segment = full_seq[last_input + 1 : last_response + 1]
+                segment = np.array(
+                    f[seq_key][last_input + 1 : last_response + 1],
+                    dtype=np.float16,
+                )
+                del f
                 if segment.shape[0] == 0:
                     continue
 
