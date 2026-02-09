@@ -40,10 +40,12 @@ NUM_CLASSES = 2
 # Training hyperparameters
 NUM_HEADS = 4
 LR = 1e-4  # Lower LR for stability
-EPOCHS = 40
+EPOCHS = 60
 BATCH_SIZE = 8
 GRAD_CLIP = 1.0  # Gradient clipping
 TEST_SPLIT = 0.2
+VAL_SPLIT = 0.15  # fraction of train set for F1-based early stopping
+PATIENCE = 15  # stop if val F1 doesn't improve for this many epochs
 SWITCH_THRESHOLD = 0.40
 HIGH_INTERVENTION_RATE = 0.82
 LOW_INTERVENTION_RATE = 0.60
@@ -182,29 +184,81 @@ def train_test_split_by_anecdote(
     }
 
 
+def _predict_labels(probe, X_list, device):
+    """Get predicted class labels for a list of activations."""
+    probe.eval()
+    preds = []
+    for x in X_list:
+        seq_len = x.shape[0]
+        x_t = torch.from_numpy(x).float().unsqueeze(0).to(device)
+        m = torch.ones(1, seq_len, dtype=torch.bool, device=device)
+        with torch.no_grad():
+            logits = probe(x_t, m)
+            pred = logits.argmax(dim=-1).item()
+        preds.append(pred)
+    return np.array(preds)
+
+
+def _compute_f1(y_true, y_pred):
+    """Compute F1 for the sycophantic class (class 1)."""
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    return 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+
 def train_and_evaluate(
     train_X: list,
     train_y: np.ndarray,
     test_X: list,
     test_y: np.ndarray,
+    train_anecdote_ids: list = None,
+    train_metadata: list = None,
     num_heads: int = NUM_HEADS,
     lr: float = LR,
     epochs: int = EPOCHS,
     batch_size: int = BATCH_SIZE,
 ) -> dict:
-    """Train probe on train set, evaluate on test set."""
+    """Train probe with F1-based early stopping, evaluate on test set.
+
+    Splits off a validation set from training data (by anecdote) and selects
+    the model checkpoint with the best validation F1 for the sycophantic class.
+    """
+    import copy
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Using device: {device}, batch_size: {batch_size}")
 
-    hidden_dim = train_X[0].shape[1]
-    max_seq_len = max(
-        max(x.shape[0] for x in train_X),
-        max(x.shape[0] for x in test_X),
-    )
-    n_samples = len(train_X)
+    # ── Val split from train (by anecdote) ────────────────────────────
+    rng = np.random.default_rng(SEED)
+    if train_anecdote_ids is not None:
+        unique_aids = sorted(set(train_anecdote_ids))
+        rng.shuffle(unique_aids)
+        n_val_anecdotes = max(1, int(len(unique_aids) * VAL_SPLIT))
+        val_anecdote_set = set(unique_aids[:n_val_anecdotes])
+        val_idx = [i for i, a in enumerate(train_anecdote_ids) if a in val_anecdote_set]
+        tr_idx = [i for i, a in enumerate(train_anecdote_ids) if a not in val_anecdote_set]
+    else:
+        n_total = len(train_X)
+        perm = rng.permutation(n_total)
+        n_val = max(1, int(n_total * VAL_SPLIT))
+        val_idx = perm[:n_val].tolist()
+        tr_idx = perm[n_val:].tolist()
 
-    # Compute class weights (inverse frequency)
-    class_counts = np.bincount(train_y, minlength=NUM_CLASSES)
+    val_X = [train_X[i] for i in val_idx]
+    val_y = train_y[val_idx]
+    actual_train_X = [train_X[i] for i in tr_idx]
+    actual_train_y = train_y[tr_idx]
+    n_samples = len(actual_train_X)
+    print(f"  Train: {n_samples}, Val: {len(val_X)}, Test: {len(test_X)}")
+
+    hidden_dim = actual_train_X[0].shape[1]
+    all_X = actual_train_X + val_X + test_X
+    max_seq_len = max(x.shape[0] for x in all_X) if all_X else 1
+
+    class_counts = np.bincount(actual_train_y, minlength=NUM_CLASSES)
     class_weights = n_samples / (NUM_CLASSES * class_counts + 1e-6)
     class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
     print(f"  Class counts: {class_counts.tolist()}, weights: {class_weights.tolist()}")
@@ -218,8 +272,17 @@ def train_and_evaluate(
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
     loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
-    probe.train()
+    # Track metrics for plotting
+    history = {"epoch": [], "train_f1": [], "test_f1": []}
+
+    # F1-based early stopping
+    best_val_f1 = -1.0
+    best_epoch = 0
+    best_state = None
+    no_improve = 0
+
     for epoch in range(epochs):
+        probe.train()
         perm = np.random.permutation(n_samples)
         epoch_loss = 0.0
         n_batches = 0
@@ -228,8 +291,8 @@ def train_and_evaluate(
             end = min(start + batch_size, n_samples)
             batch_idx = perm[start:end]
 
-            batch_X = [train_X[i] for i in batch_idx]
-            batch_y = train_y[batch_idx]
+            batch_X = [actual_train_X[i] for i in batch_idx]
+            batch_y = actual_train_y[batch_idx]
             batch_max_len = max(x.shape[0] for x in batch_X)
 
             X_pad = torch.zeros(len(batch_X), batch_max_len, hidden_dim, device=device)
@@ -251,7 +314,41 @@ def train_and_evaluate(
             n_batches += 1
 
         if (epoch + 1) % 5 == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}, loss: {epoch_loss / n_batches:.4f}")
+            # Compute val F1 for early stopping every 5 epochs
+            val_preds = _predict_labels(probe, val_X, device)
+            val_f1 = _compute_f1(val_y, val_preds)
+
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                best_epoch = epoch + 1
+                best_state = copy.deepcopy(probe.state_dict())
+                no_improve = 0
+            else:
+                no_improve += 5  # we check every 5 epochs
+
+            print(
+                f"  Epoch {epoch + 1}/{epochs}, loss: {epoch_loss / n_batches:.4f}, "
+                f"val_F1: {val_f1:.3f}, best: {best_val_f1:.3f} (ep {best_epoch})"
+            )
+
+            if no_improve >= PATIENCE:
+                print(f"  Early stopping at epoch {epoch + 1} (no val F1 improvement for {PATIENCE} epochs)")
+                break
+
+        if (epoch + 1) % 10 == 0:
+            train_preds = _predict_labels(probe, actual_train_X, device)
+            test_preds_tmp = _predict_labels(probe, test_X, device)
+            train_f1 = _compute_f1(actual_train_y, train_preds)
+            test_f1 = _compute_f1(test_y, test_preds_tmp)
+            history["epoch"].append(epoch + 1)
+            history["train_f1"].append(train_f1)
+            history["test_f1"].append(test_f1)
+            print(f"    F1: train={train_f1:.3f}, test={test_f1:.3f}")
+
+    # Restore best model by val F1
+    if best_state is not None:
+        probe.load_state_dict(best_state)
+        print(f"  Restored best model from epoch {best_epoch} (val_F1={best_val_f1:.3f})")
 
     # Evaluate
     probe.eval()
@@ -272,6 +369,9 @@ def train_and_evaluate(
         "probabilities": np.array(test_probs),
         "true_labels": test_y,
         "final_train_loss": float(epoch_loss / n_batches),
+        "best_val_f1": best_val_f1,
+        "best_epoch": best_epoch,
+        "history": history,
     }
 
 
@@ -388,12 +488,21 @@ def main():
         switch_threshold=SWITCH_THRESHOLD,
     )
 
-    X_list = probe_data["X_list"]
-    y = probe_data["y"]
-    anecdote_ids = probe_data["anecdote_ids"]
-    metadata = probe_data["metadata"]
+    X_list_all = probe_data["X_list"]
+    y_all = probe_data["y"]
+    anecdote_ids_all = probe_data["anecdote_ids"]
+    metadata_all = probe_data["metadata"]
 
-    print(f"Loaded {len(X_list)} samples")
+    # ── Filter to intervention arm only (exclude control) ─────────────
+    # This gives ~50/50 sycophantic/non-sycophantic balance since control
+    # runs are always label=0 and dilute the non-sycophantic class.
+    intv_mask = [m["arm"] == "intervention" for m in metadata_all]
+    X_list = [x for x, keep in zip(X_list_all, intv_mask) if keep]
+    y = y_all[np.array(intv_mask)]
+    anecdote_ids = [a for a, keep in zip(anecdote_ids_all, intv_mask) if keep]
+    metadata = [m for m, keep in zip(metadata_all, intv_mask) if keep]
+
+    print(f"Loaded {len(X_list_all)} samples total, kept {len(X_list)} intervention-only")
     print(f"  Class 0 (non_sycophantic): {(y == 0).sum()} samples")
     print(f"  Class 1 (sycophantic):     {(y == 1).sum()} samples")
     print(f"  Unique anecdotes: {len(set(anecdote_ids))}")
@@ -426,12 +535,13 @@ def main():
     print_dataset_statistics(split["test_metadata"], split["test_y"])
 
     # ── Step 5: Train and evaluate ────────────────────────────────────
-    print("Training sycophancy attention probe...")
+    print("Training sycophancy attention probe (F1-based early stopping)...")
     results = train_and_evaluate(
         train_X=split["train_X"],
         train_y=split["train_y"],
         test_X=split["test_X"],
         test_y=split["test_y"],
+        train_anecdote_ids=split["train_anecdote_ids"],
     )
 
     # ── Step 6: Compute and print metrics ─────────────────────────────
@@ -466,6 +576,16 @@ def main():
         json.dump(output, f, indent=2)
 
     print(f"\nResults saved to {output_dir / 'results.json'}")
+
+    # Plot training curves
+    if results.get("history") and results["history"]["epoch"]:
+        from src2.utils.plotting import plot_training_curves
+        plot_training_curves(
+            results["history"],
+            metric_name="f1",
+            output_path=output_dir / "training_curves.png",
+            title="Sycophancy Probe: F1 vs Epoch",
+        )
 
 
 if __name__ == "__main__":

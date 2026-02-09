@@ -451,6 +451,9 @@ def train_and_evaluate(
     best_state = None
     epochs_without_improvement = 0
 
+    # Track metrics for plotting
+    history = {"epoch": [], "train_accuracy": [], "val_accuracy": []}
+
     for epoch in range(epochs):
         # ── Train ──
         probe.train()
@@ -517,6 +520,11 @@ def train_and_evaluate(
                 f"lr: {current_lr:.2e}"
             )
 
+            if (epoch + 1) % 10 == 0:
+                history["epoch"].append(epoch + 1)
+                history["train_accuracy"].append(train_acc)
+                history["val_accuracy"].append(val_acc)
+
         if epochs_without_improvement >= PATIENCE:
             print(f"  Early stopping at epoch {epoch + 1} (no val improvement for {PATIENCE} epochs)")
             break
@@ -535,6 +543,7 @@ def train_and_evaluate(
         "best_val_loss": best_val_loss,
         "best_epoch": best_epoch,
         "total_epochs": epoch + 1,
+        "history": history,
     }
 
 
@@ -890,6 +899,16 @@ def main():
         json.dump(output, f, indent=2, cls=_NumpyEncoder)
 
     print(f"\nResults saved to {output_dir / 'results.json'}")
+
+    # Plot training curves
+    if results.get("history") and results["history"]["epoch"]:
+        from src2.utils.plotting import plot_training_curves
+        plot_training_curves(
+            results["history"],
+            metric_name="accuracy",
+            output_path=output_dir / "training_curves.png",
+            title="Answer Probe: Accuracy vs Epoch",
+        )
 
 
 if __name__ == "__main__":

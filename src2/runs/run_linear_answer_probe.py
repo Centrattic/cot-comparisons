@@ -265,6 +265,8 @@ def main():
     best_state = None
     no_improve = 0
 
+    history = {"epoch": [], "train_accuracy": [], "val_accuracy": []}
+
     for epoch in range(EPOCHS):
         # Train
         probe.train()
@@ -297,6 +299,9 @@ def main():
                 f"val: {val_loss:.4f} (acc {val_acc:.3f})  "
                 f"best: {best_val_loss:.4f} (ep {best_epoch})"
             )
+            history["epoch"].append(epoch + 1)
+            history["train_accuracy"].append(train_acc)
+            history["val_accuracy"].append(val_acc)
 
         if no_improve >= PATIENCE:
             print(f"  Early stopping at epoch {epoch+1}")
@@ -355,6 +360,16 @@ def main():
     with open(output_dir / "results.json", "w") as f:
         json.dump(output, f, indent=2, cls=_Enc)
     print(f"\nResults saved to {output_dir / 'results.json'}")
+
+    # Plot training curves
+    if history["epoch"]:
+        from src2.utils.plotting import plot_training_curves
+        plot_training_curves(
+            history,
+            metric_name="accuracy",
+            output_path=output_dir / "training_curves.png",
+            title="Linear Answer Probe: Accuracy vs Epoch",
+        )
 
 
 if __name__ == "__main__":
