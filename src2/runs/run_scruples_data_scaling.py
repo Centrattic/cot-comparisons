@@ -223,12 +223,17 @@ def main():
         non_syc_answer = "B" if syc_answer == "A" else "A"
         ctrl_rate = m.get("control_sycophancy_rate", 0.0)
         majority_ctrl_answer = syc_answer if ctrl_rate > 0.5 else non_syc_answer
+        answer = m.get("answer", "")
+        if not isinstance(answer, str):
+            clean_mask.append(False)
+            continue
+
         if m["prompt_is_sycophantic"]:
             # Keep only runs where answer matches the suggested (sycophantic) answer
             clean_mask.append(m["is_sycophantic_answer"])
         else:
             # Keep only runs where answer matches the majority control answer
-            clean_mask.append(m["answer"].upper() == majority_ctrl_answer)
+            clean_mask.append(answer.upper() == majority_ctrl_answer)
 
     X_list = [x for x, keep in zip(X_list_intv, clean_mask) if keep]
     y = y_intv[np.array(clean_mask)]

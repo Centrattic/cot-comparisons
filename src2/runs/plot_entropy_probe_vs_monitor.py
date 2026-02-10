@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bar chart comparing entropy probe vs LLM monitor vs predict-mean baseline.
+Grouped bar chart comparing entropy probe vs LLM monitor vs predict-mean baseline.
 
 Usage:
     python -m src2.runs.plot_entropy_probe_vs_monitor
@@ -29,63 +29,47 @@ def main():
 
     # ── Data ──────────────────────────────────────────────────────────
     methods = ["Predict Mean\n(baseline)", "LLM Monitor\n(GPT-5.2)", "Entropy Probe\n(layer 32)"]
-    colors = ["#9e9e9e", "#5c6bc0", "#43a047"]
 
-    r2_vals = [0.0, monitor_eval["r2"], probe_eval["r2"]]
-    mse_vals = [probe_eval["baseline_mse"], monitor_eval["mse"], probe_eval["mse"]]
-    pearson_vals = [0.0, monitor_eval["pearson_r"], probe_eval["pearson_r"]]
+    metrics = {
+        "R²":                    [0.0, monitor_eval["r2"], probe_eval["r2"]],
+        "MSE (lower is better)": [probe_eval["baseline_mse"], monitor_eval["mse"], probe_eval["mse"]],
+        "Pearson r":             [0.0, monitor_eval["pearson_r"], probe_eval["pearson_r"]],
+    }
+    metric_colors = {"R²": "#5c6bc0", "MSE (lower is better)": "#ef5350", "Pearson r": "#43a047"}
 
     # ── Figure ────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
-    fig.suptitle("Predicting Forced Answer Entropy: Probe vs Monitor vs Baseline", fontsize=14, fontweight="bold", y=1.02)
+    fig, ax = plt.subplots(figsize=(10, 5.5))
 
     x = np.arange(len(methods))
-    bar_width = 0.55
+    n_metrics = len(metrics)
+    bar_width = 0.22
+    offsets = np.linspace(-(n_metrics - 1) / 2 * bar_width,
+                          (n_metrics - 1) / 2 * bar_width, n_metrics)
 
-    # R²
-    ax = axes[0]
-    bars = ax.bar(x, r2_vals, bar_width, color=colors, edgecolor="white", linewidth=0.5)
-    ax.set_ylabel("R²", fontsize=12)
-    ax.set_title("R² (higher is better)", fontsize=11)
+    for offset, (metric_name, vals) in zip(offsets, metrics.items()):
+        bars = ax.bar(x + offset, vals, bar_width,
+                      label=metric_name, color=metric_colors[metric_name],
+                      edgecolor="white", linewidth=0.5)
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.01,
+                    f"{val:.3f}", ha="center", va="bottom",
+                    fontsize=8.5, fontweight="bold")
+
     ax.set_xticks(x)
-    ax.set_xticklabels(methods, fontsize=9)
-    ax.set_ylim(-0.05, 0.55)
-    ax.axhline(y=0, color="black", linewidth=0.5, linestyle="-")
-    for bar, val in zip(bars, r2_vals):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                f"{val:.3f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+    ax.set_xticklabels(methods, fontsize=11)
+    ax.set_ylim(-0.02, 0.78)
+    ax.axhline(y=0, color="black", linewidth=0.5)
+    ax.set_ylabel("Metric value", fontsize=11)
+    ax.set_title("Predicting Forced Answer Entropy\nProbe  vs  Monitor  vs  Baseline",
+                 fontsize=13, pad=14)
+    ax.legend(fontsize=10, loc="upper left")
 
-    # MSE
-    ax = axes[1]
-    bars = ax.bar(x, mse_vals, bar_width, color=colors, edgecolor="white", linewidth=0.5)
-    ax.set_ylabel("MSE", fontsize=12)
-    ax.set_title("MSE (lower is better)", fontsize=11)
-    ax.set_xticks(x)
-    ax.set_xticklabels(methods, fontsize=9)
-    ax.set_ylim(0, 0.25)
-    for bar, val in zip(bars, mse_vals):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003,
-                f"{val:.3f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
-
-    # Pearson r
-    ax = axes[2]
-    bars = ax.bar(x, pearson_vals, bar_width, color=colors, edgecolor="white", linewidth=0.5)
-    ax.set_ylabel("Pearson r", fontsize=12)
-    ax.set_title("Pearson r (higher is better)", fontsize=11)
-    ax.set_xticks(x)
-    ax.set_xticklabels(methods, fontsize=9)
-    ax.set_ylim(-0.05, 0.85)
-    ax.axhline(y=0, color="black", linewidth=0.5, linestyle="-")
-    for bar, val in zip(bars, pearson_vals):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                f"{val:.3f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
-
-    # Annotation with sample counts
-    fig.text(0.5, -0.04,
+    fig.text(0.5, -0.02,
              f"Eval set: {probe_eval['n_samples']} samples (probe), "
              f"{monitor_eval['n_samples']} samples (monitor) | "
-             f"12 held-out questions | Target: Shannon entropy of forced answer distribution",
-             ha="center", fontsize=9, color="#666666")
+             f"12 held-out questions | R² & Pearson r: higher is better, MSE: lower is better",
+             ha="center", fontsize=8.5, color="#666666")
 
     plt.tight_layout()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

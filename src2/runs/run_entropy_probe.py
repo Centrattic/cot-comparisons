@@ -1035,6 +1035,7 @@ def main():
         "best_epoch": results["best_epoch"],
         "total_epochs": results["total_epochs"],
         "final_train_loss": results["final_train_loss"],
+        "history": results.get("history", {}),
     }
 
     class _NumpyEncoder(json.JSONEncoder):

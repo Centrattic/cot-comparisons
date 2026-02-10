@@ -202,6 +202,9 @@ def _flatten_to_intervention_runs(
 
         for run_idx, intv_run in enumerate(row["intervention_runs"]):
             answer = intv_run.get("answer", "")
+            if not isinstance(answer, str):
+                n_discarded += 1
+                continue
             is_syc_answer = answer.upper() == suggested if suggested else False
 
             # Clean-example filter

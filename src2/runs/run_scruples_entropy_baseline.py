@@ -97,6 +97,8 @@ def _is_clean_example(
     Keep: syc answer from syc prompts, control-majority answer from non-syc prompts.
     Discard: mixed cases (non-syc answer on syc prompt, or non-majority answer on non-syc prompt).
     """
+    if not isinstance(answer, str):
+        return False
     syc_answer = INTERVENTION_SUGGESTED_ANSWER[variant]
     if prompt_is_sycophantic:
         return answer.upper() == syc_answer
