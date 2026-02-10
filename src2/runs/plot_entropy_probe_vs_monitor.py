@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Grouped bar chart comparing entropy probe vs LLM monitor vs predict-mean baseline.
+Horizontal bar chart: R² for predicting forced answer entropy.
 
 Usage:
     python -m src2.runs.plot_entropy_probe_vs_monitor
@@ -15,6 +15,7 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PROBE_RESULTS = PROJECT_ROOT / "data" / "forced_response" / "entropy_probe" / "latest" / "results.json"
 MONITOR_RESULTS = PROJECT_ROOT / "data" / "forced_response" / "monitor_eval" / "forcing_monitor_results.json"
+LOGIT_LENS_RESULTS = PROJECT_ROOT / "data" / "forced_response" / "monitor_eval" / "logit_lens_results.json"
 OUTPUT_DIR = PROJECT_ROOT / "plots" / "forced_response"
 
 
@@ -27,54 +28,68 @@ def main():
     probe_eval = probe["eval_metrics"]
     monitor_eval = monitor["metrics"]
 
-    # ── Data ──────────────────────────────────────────────────────────
-    methods = ["Predict Mean\n(baseline)", "LLM Monitor\n(GPT-5.2)", "Entropy Probe\n(layer 32)"]
+    has_logit_lens = LOGIT_LENS_RESULTS.exists()
+    if has_logit_lens:
+        with open(LOGIT_LENS_RESULTS) as f:
+            logit_lens_eval = json.load(f)["metrics"]
+    else:
+        print(f"Warning: logit lens results not found at {LOGIT_LENS_RESULTS}")
+        print("  Run: python -m src2.runs.run_logit_lens_baseline")
 
-    metrics = {
-        "R²":                    [0.0, monitor_eval["r2"], probe_eval["r2"]],
-        "MSE (lower is better)": [probe_eval["baseline_mse"], monitor_eval["mse"], probe_eval["mse"]],
-        "Pearson r":             [0.0, monitor_eval["pearson_r"], probe_eval["pearson_r"]],
-    }
-    metric_colors = {"R²": "#5c6bc0", "MSE (lower is better)": "#ef5350", "Pearson r": "#43a047"}
+    # ── Data (ordered worst → best, bottom → top) ────────────────────
+    methods = []
+    r2_vals = []
+    r_vals = []
+    colors = []
+
+    if has_logit_lens:
+        methods.append("Logit Lens (layer 32)")
+        r2_vals.append(logit_lens_eval["r2"])
+        r_vals.append(logit_lens_eval["pearson_r"])
+        colors.append("#bdbdbd")
+
+    methods += ["Predict Mean", "LLM Monitor (GPT-5.2)", "Entropy Probe (layer 32)"]
+    r2_vals += [0.0, monitor_eval["r2"], probe_eval["r2"]]
+    r_vals += [0.0, monitor_eval["pearson_r"], probe_eval["pearson_r"]]
+    colors += ["#e0e0e0", "#78909c", "#5c6bc0"]
 
     # ── Figure ────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(10, 5.5))
+    fig, ax = plt.subplots(figsize=(7, 2.8))
 
-    x = np.arange(len(methods))
-    n_metrics = len(metrics)
-    bar_width = 0.22
-    offsets = np.linspace(-(n_metrics - 1) / 2 * bar_width,
-                          (n_metrics - 1) / 2 * bar_width, n_metrics)
+    y = np.arange(len(methods))
+    bars = ax.barh(y, r2_vals, height=0.55, color=colors, edgecolor="white", linewidth=0.8)
 
-    for offset, (metric_name, vals) in zip(offsets, metrics.items()):
-        bars = ax.bar(x + offset, vals, bar_width,
-                      label=metric_name, color=metric_colors[metric_name],
-                      edgecolor="white", linewidth=0.5)
-        for bar, val in zip(bars, vals):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.01,
-                    f"{val:.3f}", ha="center", va="bottom",
-                    fontsize=8.5, fontweight="bold")
+    # Labels on bars
+    for bar, r2, r in zip(bars, r2_vals, r_vals):
+        w = bar.get_width()
+        if r2 < 0:
+            # Negative bars: label to the right of zero
+            ax.text(0.02, bar.get_y() + bar.get_height() / 2,
+                    f"R² = {r2:.2f}   r = {r:.2f}",
+                    ha="left", va="center", fontsize=9, color="#666")
+        else:
+            ax.text(max(w, 0) + 0.02, bar.get_y() + bar.get_height() / 2,
+                    f"R² = {r2:.2f}   r = {r:.2f}",
+                    ha="left", va="center", fontsize=9,
+                    color="#333", fontweight="medium")
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(methods, fontsize=11)
-    ax.set_ylim(-0.02, 0.78)
-    ax.axhline(y=0, color="black", linewidth=0.5)
-    ax.set_ylabel("Metric value", fontsize=11)
-    ax.set_title("Predicting Forced Answer Entropy\nProbe  vs  Monitor  vs  Baseline",
-                 fontsize=13, pad=14)
-    ax.legend(fontsize=10, loc="upper left")
+    ax.set_yticks(y)
+    ax.set_yticklabels(methods, fontsize=10)
+    ax.set_xlabel("R²  (higher is better)", fontsize=10)
+    ax.axvline(x=0, color="#333", linewidth=0.6)
+    ax.set_xlim(min(min(r2_vals) - 0.15, -0.15), max(r2_vals) + 0.28)
+    ax.set_title("Predicting Forced Answer Entropy (eval set, 12 held-out questions)",
+                 fontsize=11, pad=10)
 
-    fig.text(0.5, -0.02,
-             f"Eval set: {probe_eval['n_samples']} samples (probe), "
-             f"{monitor_eval['n_samples']} samples (monitor) | "
-             f"12 held-out questions | R² & Pearson r: higher is better, MSE: lower is better",
-             ha="center", fontsize=8.5, color="#666666")
+    # Clean up
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(left=False)
 
     plt.tight_layout()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUTPUT_DIR / "entropy_probe_vs_monitor.png"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
     print(f"Saved to {out_path}")
     plt.close()
 

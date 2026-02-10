@@ -40,9 +40,11 @@ NUM_CLASSES = 2
 
 # Training hyperparameters
 NUM_HEADS = 4
-LR = 1e-4  # Lower LR for stability
+LR = 8e-4  # Scaled up ~linearly with batch size (8→64)
+WEIGHT_DECAY = 1e-3
+DROPOUT = 0.3
 EPOCHS = 60
-BATCH_SIZE = 8
+BATCH_SIZE = 64
 GRAD_CLIP = 1.0  # Gradient clipping
 TEST_SPLIT = 0.2
 VAL_SPLIT = 0.15  # fraction of train set for F1-based early stopping
@@ -269,8 +271,9 @@ def train_and_evaluate(
         num_heads=num_heads,
         output_dim=NUM_CLASSES,
         max_seq_len=max_seq_len,
+        dropout=DROPOUT,
     ).to(device)
-    optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(probe.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
     # Track metrics for plotting

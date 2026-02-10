@@ -2,7 +2,7 @@
 
 ## TLDR
 
-We trained a linear probe on Qwen3-32B's internal activations (layer 32) to predict how uncertain the model is at each point in its chain of thought — specifically, the Shannon entropy of the forced answer distribution over A/B/C/D. The probe achieves **R² = 0.40** on held-out questions. A black-box LLM monitor baseline (GPT-5.2 reading the same partial CoT as text) achieves **R² = 0.25** — meaningful but substantially worse. The probe's advantage comes from reading the model's internal state, not just the text it's produced so far.
+We trained a linear probe on Qwen3-32B's internal activations (layer 32) to predict how uncertain the model is at each point in its chain of thought — specifically, the Shannon entropy of the forced answer distribution over A/B/C/D. The probe achieves **R² = 0.40** on held-out questions. A black-box LLM monitor baseline (GPT-5.2 reading the same partial CoT as text) achieves **R² = 0.25** — meaningful but substantially worse. A logit lens baseline (projecting layer 32 activations through the model's own unembedding) achieves **R² = -0.70** — worse than predicting the mean, confirming that the answer distribution at the midpoint isn't decodable via the model's own vocabulary projection and that the trained probe is learning a genuinely non-trivial mapping.
 
 ![Comparison plot](plots/forced_response/entropy_probe_vs_monitor.png)
 
@@ -30,20 +30,24 @@ Collapsing the 4-class distribution to a single scalar — Shannon entropy H(p) 
 
 **LLM Monitor baseline:** GPT-5.2 (via OpenRouter) receives the question, choices, and partial CoT as text. It's asked to predict what fraction of independent continuations would arrive at each answer. We parse its predicted distribution and compute entropy.
 
+**Logit lens baseline:** Project layer 32 residual stream activations through the model's own final RMSNorm + lm_head (no training). For each sample, take the last-token hidden state, apply the unembedding, extract logits at the A/B/C/D token positions, softmax, and compute entropy. This tests whether the answer distribution is already linearly decodable at layer 32 via the model's own vocabulary projection.
+
 **Eval split:** 12 held-out questions (10 GPQA Diamond + 2 blackmail scenarios), ~50 sentence boundaries each, stratified by mean entropy to ensure the eval covers the full range.
 
 ---
 
 ## Results
 
-| Metric | Predict Mean (baseline) | LLM Monitor (GPT-5.2) | Entropy Probe (layer 32) |
-|--------|------------------------|----------------------|-------------------------|
-| **R²** | 0.000 | 0.250 | **0.397** |
-| **MSE** | 0.202 | 0.139 | **0.122** |
-| **Pearson r** | 0.000 | 0.505 | **0.654** |
-| N samples | 2,970 | 3,737 | 2,970 |
+| Metric | Predict Mean (baseline) | Logit Lens (layer 32) | LLM Monitor (GPT-5.2) | Entropy Probe (layer 32) |
+|--------|------------------------|----------------------|----------------------|-------------------------|
+| **R²** | 0.000 | -0.695 | 0.250 | **0.397** |
+| **MSE** | 0.202 | 0.342 | 0.139 | **0.122** |
+| **Pearson r** | 0.000 | -0.047 | 0.505 | **0.654** |
+| N samples | 2,970 | 2,970 | 3,737 | 2,970 |
 
-The probe explains ~40% of entropy variance on held-out questions, vs ~25% for the monitor. Both beat the predict-mean baseline substantially.
+The probe explains ~40% of entropy variance on held-out questions, vs ~25% for the monitor. Both beat the predict-mean baseline substantially. The logit lens fails entirely.
+
+**Why the logit lens fails:** The logit lens projects layer 32 activations through the model's own unembedding to read off A/B/C/D probabilities. At layer 32 (the midpoint of a 64-layer model), the residual stream hasn't yet been transformed into vocabulary space — it still encodes intermediate representations that the remaining 32 layers would process further. The result is near-zero correlation (r = -0.05) and predictions biased high (mean 0.95 vs true mean 0.71), meaning the unembedding sees a nearly uniform ABCD distribution at every point. This confirms the trained probe is learning a genuinely non-trivial mapping that the model's own vocabulary projection can't extract at this depth.
 
 **What the monitor gets right:** The monitor achieves r = 0.51, meaning it can read partial CoT text and make reasonable predictions about model uncertainty. This makes sense — if the CoT says "I'm not sure about this" or explores multiple approaches, an LLM can pick up on that.
 
