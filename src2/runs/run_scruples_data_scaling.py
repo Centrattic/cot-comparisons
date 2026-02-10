@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src2.methods.attention_probe import AttentionPoolingProbe
 from src2.tasks import ScruplesTask
@@ -68,12 +69,7 @@ def _compute_f1(y_true, y_pred):
 
 
 def prepad_to_gpu(X_list, device, target_max_len=None):
-    """Pad all variable-length sequences and transfer to GPU in one shot.
-
-    Returns a single [N, max_len, D] tensor and [N, max_len] bool mask,
-    both already on *device*. This avoids repeated numpy→GPU transfers
-    during training.
-    """
+    """Pad all variable-length sequences and transfer to GPU in one shot."""
     hidden_dim = X_list[0].shape[1]
     max_len = target_max_len or max(x.shape[0] for x in X_list)
     N = len(X_list)
@@ -88,53 +84,214 @@ def prepad_to_gpu(X_list, device, target_max_len=None):
     return X_pad, mask
 
 
-def train_and_evaluate_single(train_X_pad, train_mask, train_y_t,
-                               test_X_pad, test_mask, test_y_np,
-                               indices, device, max_seq_len):
-    """Train one probe on a subset (given by *indices*) of pre-padded GPU data."""
+# ── Batched attention probes ─────────────────────────────────────────
+
+
+class BatchedAttentionProbes(nn.Module):
+    """P attention-pooling probes trained simultaneously via batched einsum.
+
+    Mathematically equivalent to P independent ``AttentionPoolingProbe``s, but
+    all weights are stacked along a leading *probe* dimension so every training
+    step is a single set of fused matmuls.
+
+    Memory trick: because the value projection is linear, we can **pool first,
+    then project**.  Instead of materialising ``[B, P, S, V]`` (huge), we
+    compute the attention-weighted mean of the raw input ``[B, P, H, D]``
+    (small) and then apply the per-head value projection.  This saves ~100×
+    memory while giving identical results.
+    """
+
+    def __init__(self, n_probes, hidden_dim, num_heads, output_dim,
+                 max_seq_len, dropout):
+        super().__init__()
+        self.n_probes = n_probes
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.output_dim = output_dim
+
+        # query_proj  – Linear(D, H) per probe
+        self.query_w = nn.Parameter(torch.empty(n_probes, num_heads, hidden_dim))
+        self.query_b = nn.Parameter(torch.zeros(n_probes, num_heads))
+
+        # position bias per probe
+        self.pos_bias = nn.Parameter(torch.zeros(n_probes, num_heads, max_seq_len))
+
+        # value_proj  – stored as [P, H, head_dim, D] for the pool-first trick
+        self.value_w = nn.Parameter(
+            torch.empty(n_probes, num_heads, self.head_dim, hidden_dim))
+        self.value_b = nn.Parameter(
+            torch.zeros(n_probes, num_heads, self.head_dim))
+
+        # classifier  – Linear(H*head_dim, output_dim) per probe
+        self.class_w = nn.Parameter(
+            torch.empty(n_probes, output_dim, num_heads * self.head_dim))
+        self.class_b = nn.Parameter(torch.zeros(n_probes, output_dim))
+
+        self.dropout = nn.Dropout(dropout)
+        self._init_weights()
+
+    # ------------------------------------------------------------------ init
+    def _init_weights(self):
+        """Match ``nn.Linear`` default init for each probe independently."""
+        for p in range(self.n_probes):
+            # query_proj: weight [H, D], bias [H]
+            nn.init.kaiming_uniform_(self.query_w.data[p], a=5 ** 0.5)
+            bound = 1.0 / self.hidden_dim ** 0.5
+            nn.init.uniform_(self.query_b.data[p], -bound, bound)
+
+            # value_proj: logical weight is [H*hd, D]
+            w_flat = self.value_w.data[p].view(-1, self.hidden_dim)
+            nn.init.kaiming_uniform_(w_flat, a=5 ** 0.5)
+            # (view mutation writes through to self.value_w.data[p])
+            nn.init.uniform_(
+                self.value_b.data[p].view(-1),
+                -bound, bound,
+            )
+
+            # classifier: weight [O, V], bias [O]
+            nn.init.kaiming_uniform_(self.class_w.data[p], a=5 ** 0.5)
+            fan_in = self.num_heads * self.head_dim
+            bound_c = 1.0 / fan_in ** 0.5
+            nn.init.uniform_(self.class_b.data[p], -bound_c, bound_c)
+
+    # --------------------------------------------------------------- forward
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x:    [B, S, D]
+            mask: [B, S] boolean (True = valid)
+        Returns:
+            [B, P, output_dim]
+        """
+        B, S, D = x.shape
+        P = self.n_probes
+        H = self.num_heads
+        hd = self.head_dim
+
+        # 1) Attention logits  [B, P, S, H]
+        attn = (torch.einsum('bsd,phd->bpsh', x, self.query_w)
+                + self.query_b[None, :, None, :])
+
+        # position bias  [P, H, S] -> [1, P, S, H]
+        attn = attn + self.pos_bias[:, :, :S].permute(0, 2, 1).unsqueeze(0)
+
+        if mask is not None:
+            attn = attn.masked_fill(~mask[:, None, :, None], float('-inf'))
+
+        attn = torch.softmax(attn, dim=2)               # [B, P, S, H]
+
+        # 2) Attention-weighted mean of x  (pool BEFORE value proj – saves mem)
+        #    [B,P,S,H] × [B,S,D] -> [B, P, H, D]
+        weighted_x = torch.einsum('bpsh,bsd->bphd', attn, x)
+
+        # 3) Per-head value projection  [B, P, H, D] × [P, H, hd, D] -> [B, P, H, hd]
+        head_out = (torch.einsum('bphd,phkd->bphk', weighted_x, self.value_w)
+                    + self.value_b[None, :, :, :])
+
+        # 4) Concat heads -> dropout -> classify
+        pooled = head_out.reshape(B, P, H * hd)          # [B, P, V]
+        pooled = self.dropout(pooled)
+
+        logits = (torch.einsum('bpv,pov->bpo', pooled, self.class_w)
+                  + self.class_b[None, :, :])
+        return logits                                     # [B, P, output_dim]
+
+
+# ── Batched training ─────────────────────────────────────────────────
+
+
+def train_all_probes_batched(train_X_pad, train_mask, train_y_t,
+                              test_X_pad, test_mask, test_y_np,
+                              data_fractions, n_repeats, seed,
+                              device, max_seq_len):
+    """Train all data-scaling probes *simultaneously*.
+
+    All P = len(data_fractions) * n_repeats probes share a single batched
+    forward pass.  A boolean membership mask routes different data subsets
+    to different probes.
+    """
     hidden_dim = train_X_pad.shape[2]
-    indices_t = torch.tensor(indices, dtype=torch.long, device=device)
-    n_samples = len(indices)
+    N_train = train_X_pad.shape[0]
+    n_probes = len(data_fractions) * n_repeats
 
-    sub_y = train_y_t[indices_t]
-    class_counts = torch.bincount(sub_y, minlength=NUM_CLASSES).float()
-    class_weights = n_samples / (NUM_CLASSES * class_counts.clamp(min=1))
+    # ── Build membership masks: [P, N_train] ─────────────────────────
+    membership = torch.zeros(n_probes, N_train, dtype=torch.bool, device=device)
+    idx = 0
+    for frac in data_fractions:
+        n_sub = max(2, int(N_train * frac))
+        for rep in range(n_repeats):
+            rng = np.random.default_rng(seed + rep)
+            indices = rng.choice(N_train, n_sub, replace=False)
+            membership[idx, indices] = True
+            idx += 1
 
-    probe = AttentionPoolingProbe(
+    # Per-probe class weights: [P, C]
+    class_weights_all = torch.zeros(n_probes, NUM_CLASSES, device=device)
+    for p in range(n_probes):
+        sub_y = train_y_t[membership[p]]
+        counts = torch.bincount(sub_y, minlength=NUM_CLASSES).float().clamp(min=1)
+        n = membership[p].sum().float()
+        class_weights_all[p] = n / (NUM_CLASSES * counts)
+
+    # ── Create batched probes ─────────────────────────────────────────
+    probes = BatchedAttentionProbes(
+        n_probes=n_probes,
         hidden_dim=hidden_dim,
         num_heads=NUM_HEADS,
         output_dim=NUM_CLASSES,
         max_seq_len=max_seq_len,
         dropout=DROPOUT,
     ).to(device)
-    optimizer = torch.optim.Adam(probe.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
-    probe.train()
+    optimizer = torch.optim.Adam(probes.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
     for epoch in range(EPOCHS):
-        perm = torch.randperm(n_samples, device=device)
-        for start in range(0, n_samples, BATCH_SIZE):
-            end = min(start + BATCH_SIZE, n_samples)
-            idx = indices_t[perm[start:end]]
+        probes.train()
+        perm = torch.randperm(N_train, device=device)
 
-            X_batch = train_X_pad[idx]      # already on GPU, already padded
-            m_batch = train_mask[idx]
-            y_batch = train_y_t[idx]
+        for start in range(0, N_train, BATCH_SIZE):
+            end = min(start + BATCH_SIZE, N_train)
+            b_idx = perm[start:end]
+
+            x_batch = train_X_pad[b_idx]        # [B, S, D]
+            m_batch = train_mask[b_idx]          # [B, S]
+            y_batch = train_y_t[b_idx]           # [B]
+
+            # Forward: [B, P, C]
+            logits = probes(x_batch, m_batch)
+
+            # Per-sample per-probe NLL: [B, P]
+            log_probs = F.log_softmax(logits, dim=-1)
+            targets_exp = y_batch[:, None, None].expand(-1, n_probes, 1)
+            nll = -log_probs.gather(dim=-1, index=targets_exp).squeeze(-1)
+
+            # Apply per-probe class weighting
+            sample_w = class_weights_all[:, y_batch].T     # [B, P]
+            weighted_nll = nll * sample_w
+
+            # Membership mask
+            batch_member = membership[:, b_idx].T.float()   # [B, P]
+            counts = batch_member.sum(dim=0).clamp(min=1)
+            per_probe_loss = (weighted_nll * batch_member).sum(dim=0) / counts
+            loss = per_probe_loss.sum()
 
             optimizer.zero_grad()
-            pred = probe(X_batch, m_batch)
-            loss = loss_fn(pred, y_batch)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(probe.parameters(), GRAD_CLIP)
+            torch.nn.utils.clip_grad_norm_(probes.parameters(), GRAD_CLIP)
             optimizer.step()
 
-    # Evaluate (batched, all at once)
-    probe.eval()
+    # ── Evaluate ──────────────────────────────────────────────────────
+    probes.eval()
     with torch.no_grad():
-        logits = probe(test_X_pad, test_mask)
-        preds = logits.argmax(dim=-1).cpu().numpy()
+        test_logits = probes(test_X_pad, test_mask)         # [N_test, P, C]
+        test_preds = test_logits.argmax(dim=-1).cpu().numpy()  # [N_test, P]
 
-    return _compute_f1(test_y_np, preds)
+    f1_list = []
+    for p in range(n_probes):
+        f1_list.append(_compute_f1(test_y_np, test_preds[:, p]))
+
+    return f1_list
 
 
 def train_test_split_by_anecdote(X_list, y, anecdote_ids, metadata,
@@ -281,27 +438,24 @@ def main():
     test_y_np = test_y  # keep numpy for F1 computation
     print(f"  Train: {train_X_pad.shape}, Test: {test_X_pad.shape}")
 
-    # ── Data scaling ──────────────────────────────────────────────────
-    print("\nRunning data scaling analysis...")
+    # ── Train all probes simultaneously ───────────────────────────────
+    n_probes = len(DATA_FRACTIONS) * N_REPEATS
+    print(f"\nTraining {n_probes} probes simultaneously ({N_REPEATS} repeats × {len(DATA_FRACTIONS)} fractions)...")
+    f1_all = train_all_probes_batched(
+        train_X_pad, train_mask, train_y_t,
+        test_X_pad, test_mask, test_y_np,
+        DATA_FRACTIONS, N_REPEATS, SEED,
+        device, max_seq_len,
+    )
+
+    # ── Reshape results ───────────────────────────────────────────────
     sizes = []
     mean_f1s = []
     std_f1s = []
 
-    for frac in DATA_FRACTIONS:
+    for i, frac in enumerate(DATA_FRACTIONS):
         n_subset = max(2, int(n_train * frac))
-        f1_scores = []
-
-        for rep in range(N_REPEATS):
-            rng = np.random.default_rng(SEED + rep)
-            indices = rng.choice(n_train, n_subset, replace=False)
-
-            f1 = train_and_evaluate_single(
-                train_X_pad, train_mask, train_y_t,
-                test_X_pad, test_mask, test_y_np,
-                indices, device, max_seq_len,
-            )
-            f1_scores.append(f1)
-
+        f1_scores = f1_all[i * N_REPEATS : (i + 1) * N_REPEATS]
         mean_f1 = float(np.mean(f1_scores))
         std_f1 = float(np.std(f1_scores))
         sizes.append(n_subset)

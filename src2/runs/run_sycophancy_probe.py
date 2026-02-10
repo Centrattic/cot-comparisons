@@ -570,7 +570,9 @@ def main():
     print("  Test set breakdown:")
     print_dataset_statistics(split["test_metadata"], split["test_y"])
 
-    # ── Step 5: Hyperparameter sweep ─────────────────────────────────
+    # ── Step 5: Parallel hyperparameter sweep ────────────────────────
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     SWEEP_CONFIGS = [
         {"weight_decay": 0.0,   "dropout": 0.0},
         {"weight_decay": 0.0,   "dropout": 0.1},
@@ -587,18 +589,9 @@ def main():
     output_dir = DATA_DIR / "sycophancy_probe"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    sweep_results = []
-    best_test_f1 = -1.0
-    best_config = None
-    best_results = None
-
-    for i, cfg in enumerate(SWEEP_CONFIGS):
-        wd = cfg["weight_decay"]
-        do = cfg["dropout"]
-        print(f"\n{'='*60}")
-        print(f"  Sweep {i+1}/{len(SWEEP_CONFIGS)}: weight_decay={wd}, dropout={do}")
-        print(f"{'='*60}")
-
+    def _run_one(cfg):
+        """Train a single probe config and return summary."""
+        wd, do = cfg["weight_decay"], cfg["dropout"]
         results = train_and_evaluate(
             train_X=split["train_X"],
             train_y=split["train_y"],
@@ -608,43 +601,57 @@ def main():
             weight_decay=wd,
             dropout=do,
         )
-
         metrics = compute_metrics(results["true_labels"], results["predictions"])
         test_f1 = metrics["per_class"]["sycophantic"]["f1"]
-        print_results(metrics, label=f"wd={wd}, do={do}")
-
-        sweep_results.append({
+        return {
             "weight_decay": wd,
             "dropout": do,
             "test_f1_syc": test_f1,
             "test_accuracy": metrics["accuracy"],
             "best_val_f1": results["best_val_f1"],
             "best_epoch": results["best_epoch"],
-        })
+            "metrics": metrics,
+            "results": results,
+        }
 
-        if test_f1 > best_test_f1:
-            best_test_f1 = test_f1
-            best_config = cfg
-            best_results = results
-            best_metrics = metrics
+    print(f"\nLaunching {len(SWEEP_CONFIGS)} probe configs in parallel...")
+    sweep_results = []
+    with ThreadPoolExecutor(max_workers=len(SWEEP_CONFIGS)) as pool:
+        futures = {pool.submit(_run_one, cfg): cfg for cfg in SWEEP_CONFIGS}
+        for fut in as_completed(futures):
+            r = fut.result()
+            sweep_results.append(r)
+            print(f"  Done: wd={r['weight_decay']:.0e} do={r['dropout']:.1f} → "
+                  f"val_F1={r['best_val_f1']:.3f}  test_F1={r['test_f1_syc']:.3f}  "
+                  f"acc={r['test_accuracy']:.3f}  ep={r['best_epoch']}")
+
+    # Sort by test F1 descending
+    sweep_results.sort(key=lambda r: r["test_f1_syc"], reverse=True)
+    best = sweep_results[0]
 
     # ── Summary table ─────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print("  SWEEP SUMMARY")
+    print("  SWEEP SUMMARY (sorted by test F1)")
     print(f"{'='*60}")
     print(f"  {'weight_decay':>12s}  {'dropout':>7s}  {'val_F1':>6s}  {'test_F1':>7s}  {'acc':>5s}  {'ep':>3s}")
     for r in sweep_results:
-        marker = " <-- best" if r["weight_decay"] == best_config["weight_decay"] and r["dropout"] == best_config["dropout"] else ""
+        marker = " <-- best" if r is best else ""
         print(f"  {r['weight_decay']:12.1e}  {r['dropout']:7.1f}  {r['best_val_f1']:6.3f}  {r['test_f1_syc']:7.3f}  {r['test_accuracy']:5.3f}  {r['best_epoch']:3d}{marker}")
 
-    print(f"\n  Best config: weight_decay={best_config['weight_decay']}, dropout={best_config['dropout']}")
-    print(f"  Best test F1 (sycophantic): {best_test_f1:.3f}")
+    print(f"\n  Best config: weight_decay={best['weight_decay']}, dropout={best['dropout']}")
+    print(f"  Best test F1 (sycophantic): {best['test_f1_syc']:.3f}")
+
+    # Print full metrics for the best
+    print_results(best["metrics"], label="Best Config Results")
 
     # ── Save results ──────────────────────────────────────────────────
     output = {
-        "sweep_results": sweep_results,
-        "best_config": best_config,
-        "best_test_metrics": best_metrics,
+        "sweep_results": [
+            {k: v for k, v in r.items() if k not in ("metrics", "results")}
+            for r in sweep_results
+        ],
+        "best_config": {"weight_decay": best["weight_decay"], "dropout": best["dropout"]},
+        "best_test_metrics": best["metrics"],
         "config": {
             "variants": VARIANTS,
             "layer": LAYER,
@@ -668,13 +675,14 @@ def main():
     print(f"\nSweep results saved to {output_dir / 'sweep_results.json'}")
 
     # Plot training curves for the best config
-    if best_results.get("history") and best_results["history"]["epoch"]:
+    best_history = best["results"].get("history", {})
+    if best_history and best_history.get("epoch"):
         from src2.utils.plotting import plot_training_curves
         plot_training_curves(
-            best_results["history"],
+            best_history,
             metric_name="f1",
             output_path=output_dir / "training_curves.png",
-            title=f"Best Probe (wd={best_config['weight_decay']}, do={best_config['dropout']}): F1 vs Epoch",
+            title=f"Best Probe (wd={best['weight_decay']}, do={best['dropout']}): F1 vs Epoch",
         )
 
 
