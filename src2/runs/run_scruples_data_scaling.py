@@ -68,22 +68,6 @@ def _compute_f1(y_true, y_pred):
     return 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
 
-def prepad_to_gpu(X_list, device, target_max_len=None):
-    """Pad all variable-length sequences and transfer to GPU in one shot."""
-    hidden_dim = X_list[0].shape[1]
-    max_len = target_max_len or max(x.shape[0] for x in X_list)
-    N = len(X_list)
-
-    X_pad = torch.zeros(N, max_len, hidden_dim, device=device)
-    mask = torch.zeros(N, max_len, dtype=torch.bool, device=device)
-    for i, x in enumerate(X_list):
-        sl = x.shape[0]
-        X_pad[i, :sl] = torch.from_numpy(x).to(device)
-        mask[i, :sl] = True
-
-    return X_pad, mask
-
-
 # ── Batched attention probes ─────────────────────────────────────────
 
 
@@ -201,19 +185,37 @@ class BatchedAttentionProbes(nn.Module):
 # ── Batched training ─────────────────────────────────────────────────
 
 
-def train_all_probes_batched(train_X_pad, train_mask, train_y_t,
-                              test_X_pad, test_mask, test_y_np,
+def _pad_batch(X_list, indices, device):
+    """Pad a batch of variable-length sequences and move to GPU."""
+    batch = [X_list[i] for i in indices]
+    hidden_dim = batch[0].shape[1]
+    max_len = max(x.shape[0] for x in batch)
+    B = len(batch)
+    X_pad = torch.zeros(B, max_len, hidden_dim, device=device)
+    mask = torch.zeros(B, max_len, dtype=torch.bool, device=device)
+    for i, x in enumerate(batch):
+        sl = x.shape[0]
+        X_pad[i, :sl] = torch.from_numpy(x).to(device)
+        mask[i, :sl] = True
+    return X_pad, mask
+
+
+def train_all_probes_batched(train_X_list, train_y,
+                              test_X_list, test_y_np,
                               data_fractions, n_repeats, seed,
                               device, max_seq_len):
     """Train all data-scaling probes *simultaneously*.
 
     All P = len(data_fractions) * n_repeats probes share a single batched
     forward pass.  A boolean membership mask routes different data subsets
-    to different probes.
+    to different probes.  Data stays on CPU and is padded per-batch to
+    avoid OOM.
     """
-    hidden_dim = train_X_pad.shape[2]
-    N_train = train_X_pad.shape[0]
+    hidden_dim = train_X_list[0].shape[1]
+    N_train = len(train_X_list)
     n_probes = len(data_fractions) * n_repeats
+
+    train_y_t = torch.from_numpy(train_y).long().to(device)
 
     # ── Build membership masks: [P, N_train] ─────────────────────────
     membership = torch.zeros(n_probes, N_train, dtype=torch.bool, device=device)
@@ -248,15 +250,14 @@ def train_all_probes_batched(train_X_pad, train_mask, train_y_t,
 
     for epoch in range(EPOCHS):
         probes.train()
-        perm = torch.randperm(N_train, device=device)
+        perm = np.random.permutation(N_train)
 
         for start in range(0, N_train, BATCH_SIZE):
             end = min(start + BATCH_SIZE, N_train)
             b_idx = perm[start:end]
 
-            x_batch = train_X_pad[b_idx]        # [B, S, D]
-            m_batch = train_mask[b_idx]          # [B, S]
-            y_batch = train_y_t[b_idx]           # [B]
+            x_batch, m_batch = _pad_batch(train_X_list, b_idx, device)
+            y_batch = train_y_t[b_idx]
 
             # Forward: [B, P, C]
             logits = probes(x_batch, m_batch)
@@ -271,7 +272,8 @@ def train_all_probes_batched(train_X_pad, train_mask, train_y_t,
             weighted_nll = nll * sample_w
 
             # Membership mask
-            batch_member = membership[:, b_idx].T.float()   # [B, P]
+            b_idx_t = torch.from_numpy(b_idx).long().to(device)
+            batch_member = membership[:, b_idx_t].T.float()   # [B, P]
             counts = batch_member.sum(dim=0).clamp(min=1)
             per_probe_loss = (weighted_nll * batch_member).sum(dim=0) / counts
             loss = per_probe_loss.sum()
@@ -281,11 +283,21 @@ def train_all_probes_batched(train_X_pad, train_mask, train_y_t,
             torch.nn.utils.clip_grad_norm_(probes.parameters(), GRAD_CLIP)
             optimizer.step()
 
-    # ── Evaluate ──────────────────────────────────────────────────────
+        if (epoch + 1) % 10 == 0:
+            print(f"  Epoch {epoch + 1}/{EPOCHS}")
+
+    # ── Evaluate (batched to avoid OOM) ───────────────────────────────
     probes.eval()
+    N_test = len(test_X_list)
+    all_preds = []
     with torch.no_grad():
-        test_logits = probes(test_X_pad, test_mask)         # [N_test, P, C]
-        test_preds = test_logits.argmax(dim=-1).cpu().numpy()  # [N_test, P]
+        for start in range(0, N_test, BATCH_SIZE):
+            end = min(start + BATCH_SIZE, N_test)
+            b_idx = list(range(start, end))
+            x_batch, m_batch = _pad_batch(test_X_list, b_idx, device)
+            logits = probes(x_batch, m_batch)  # [B, P, C]
+            all_preds.append(logits.argmax(dim=-1).cpu().numpy())
+    test_preds = np.concatenate(all_preds, axis=0)  # [N_test, P]
 
     f1_list = []
     for p in range(n_probes):
@@ -425,25 +437,19 @@ def main():
     n_train = len(full_train_X)
     print(f"Train: {n_train}, Test: {len(test_X)}")
 
-    # ── Pre-pad and transfer all data to GPU once ─────────────────────
+    # ── Train all probes simultaneously ───────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     max_seq_len = max(
         max(x.shape[0] for x in full_train_X),
         max(x.shape[0] for x in test_X),
     )
-    print(f"\nPre-padding and transferring data to {device} (max_seq_len={max_seq_len})...")
-    train_X_pad, train_mask = prepad_to_gpu(full_train_X, device)
-    test_X_pad, test_mask = prepad_to_gpu(test_X, device)
-    train_y_t = torch.from_numpy(full_train_y).long().to(device)
-    test_y_np = test_y  # keep numpy for F1 computation
-    print(f"  Train: {train_X_pad.shape}, Test: {test_X_pad.shape}")
-
-    # ── Train all probes simultaneously ───────────────────────────────
     n_probes = len(DATA_FRACTIONS) * N_REPEATS
-    print(f"\nTraining {n_probes} probes simultaneously ({N_REPEATS} repeats × {len(DATA_FRACTIONS)} fractions)...")
+    print(f"\nTraining {n_probes} probes simultaneously on {device} "
+          f"({N_REPEATS} repeats × {len(DATA_FRACTIONS)} fractions, "
+          f"max_seq_len={max_seq_len})...")
     f1_all = train_all_probes_batched(
-        train_X_pad, train_mask, train_y_t,
-        test_X_pad, test_mask, test_y_np,
+        full_train_X, full_train_y,
+        test_X, test_y,
         DATA_FRACTIONS, N_REPEATS, SEED,
         device, max_seq_len,
     )

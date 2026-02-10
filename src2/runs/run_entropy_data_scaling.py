@@ -66,19 +66,18 @@ N_REPEATS = 3
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
-def prepad_to_gpu(X_list, device, target_max_len=None):
-    """Pad all variable-length sequences and transfer to GPU in one shot."""
-    hidden_dim = X_list[0].shape[1]
-    max_len = target_max_len or max(x.shape[0] for x in X_list)
-    N = len(X_list)
-
-    X_pad = torch.zeros(N, max_len, hidden_dim, device=device)
-    mask = torch.zeros(N, max_len, dtype=torch.bool, device=device)
-    for i, x in enumerate(X_list):
+def _pad_batch(X_list, indices, device):
+    """Pad a batch of variable-length sequences and move to GPU."""
+    batch = [X_list[i] for i in indices]
+    hidden_dim = batch[0].shape[1]
+    max_len = max(x.shape[0] for x in batch)
+    B = len(batch)
+    X_pad = torch.zeros(B, max_len, hidden_dim, device=device)
+    mask = torch.zeros(B, max_len, dtype=torch.bool, device=device)
+    for i, x in enumerate(batch):
         sl = x.shape[0]
         X_pad[i, :sl] = torch.from_numpy(x).to(device)
         mask[i, :sl] = True
-
     return X_pad, mask
 
 
@@ -210,8 +209,8 @@ class BatchedBottleneckAttentionProbes(nn.Module):
 # ── Batched training ─────────────────────────────────────────────────
 
 
-def train_all_probes_batched(train_X_pad, train_mask, train_y_t,
-                              test_X_pad, test_mask, test_y_np,
+def train_all_probes_batched(train_X_list, train_y,
+                              test_X_list, test_y_np,
                               data_fractions, n_repeats, seed,
                               device, max_seq_len):
     """Train all data-scaling probes *simultaneously*.
@@ -219,10 +218,13 @@ def train_all_probes_batched(train_X_pad, train_mask, train_y_t,
     All P = len(data_fractions) * n_repeats BottleneckAttentionProbes share
     a single batched forward/backward pass.  A boolean membership mask routes
     different data subsets to different probes, with per-probe early stopping.
+    Data stays on CPU and is padded per-batch to avoid OOM.
     """
-    input_dim = train_X_pad.shape[2]
-    N_train = train_X_pad.shape[0]
+    input_dim = train_X_list[0].shape[1]
+    N_train = len(train_X_list)
     n_probes = len(data_fractions) * n_repeats
+
+    train_y_t = torch.from_numpy(train_y).float().to(device)
 
     # ── Build membership masks: [P, N_train] ─────────────────────────
     membership = torch.zeros(n_probes, N_train, dtype=torch.bool, device=device)
@@ -259,17 +261,16 @@ def train_all_probes_batched(train_X_pad, train_mask, train_y_t,
 
     for epoch in range(EPOCHS):
         probes.train()
-        perm = torch.randperm(N_train, device=device)
+        perm = np.random.permutation(N_train)
         epoch_loss_sum = torch.zeros(n_probes, device=device)
         epoch_count = torch.zeros(n_probes, device=device)
 
         for start in range(0, N_train, BATCH_SIZE):
             end = min(start + BATCH_SIZE, N_train)
-            idx = perm[start:end]
+            b_idx = perm[start:end]
 
-            x_batch = train_X_pad[idx]              # [B, S, D]
-            m_batch = train_mask[idx]                # [B, S]
-            y_batch = train_y_t[idx]                 # [B]
+            x_batch, m_batch = _pad_batch(train_X_list, b_idx, device)
+            y_batch = train_y_t[b_idx]
 
             # Forward: [B, P]
             preds = probes(x_batch, m_batch)
@@ -278,7 +279,8 @@ def train_all_probes_batched(train_X_pad, train_mask, train_y_t,
             sq_err = (preds - y_batch.unsqueeze(1)) ** 2
 
             # Membership + active mask
-            batch_member = membership[:, idx].T.float()     # [B, P]
+            b_idx_t = torch.from_numpy(b_idx).long().to(device)
+            batch_member = membership[:, b_idx_t].T.float()     # [B, P]
             batch_mask = batch_member * active_dev.unsqueeze(0).float()
 
             counts = batch_mask.sum(dim=0).clamp(min=1)
@@ -333,22 +335,55 @@ def train_all_probes_batched(train_X_pad, train_mask, train_y_t,
         if not active.any():
             break
 
+        if (epoch + 1) % 50 == 0:
+            n_active = int(active.sum())
+            print(f"  Epoch {epoch + 1}/{EPOCHS}, {n_active}/{n_probes} probes still active")
+
     # ── Restore best weights & evaluate ───────────────────────────────
     with torch.no_grad():
         for name, param in probes.named_parameters():
             param.data.copy_(best_state[name].to(device))
 
     probes.eval()
-    with torch.no_grad():
-        test_preds = probes(test_X_pad, test_mask).cpu().numpy()  # [N_test, P]
+    train_y_np = train_y_t.cpu().numpy()
+    N_test = len(test_X_list)
 
+    # Batched eval to avoid OOM
+    test_preds_parts = []
+    with torch.no_grad():
+        for start in range(0, N_test, BATCH_SIZE):
+            end = min(start + BATCH_SIZE, N_test)
+            x_b, m_b = _pad_batch(test_X_list, list(range(start, end)), device)
+            test_preds_parts.append(probes(x_b, m_b).cpu().numpy())
+    test_preds = np.concatenate(test_preds_parts, axis=0)  # [N_test, P]
+
+    train_preds_parts = []
+    with torch.no_grad():
+        for start in range(0, N_train, BATCH_SIZE):
+            end = min(start + BATCH_SIZE, N_train)
+            x_b, m_b = _pad_batch(train_X_list, list(range(start, end)), device)
+            train_preds_parts.append(probes(x_b, m_b).cpu().numpy())
+    train_preds = np.concatenate(train_preds_parts, axis=0)  # [N_train, P]
+
+    # Test R²
     ss_tot = np.sum((test_y_np - test_y_np.mean()) ** 2)
     r2_list = []
     for j in range(n_probes):
         ss_res = np.sum((test_y_np - test_preds[:, j]) ** 2)
         r2_list.append(float(1 - ss_res / max(ss_tot, 1e-8)))
 
-    return r2_list
+    # Train R² (each probe evaluated on its own training subset)
+    membership_np = membership.cpu().numpy()
+    train_r2_list = []
+    for j in range(n_probes):
+        member_idx = membership_np[j]
+        y_sub = train_y_np[member_idx]
+        pred_sub = train_preds[member_idx, j]
+        ss_tot_tr = np.sum((y_sub - y_sub.mean()) ** 2)
+        ss_res_tr = np.sum((y_sub - pred_sub) ** 2)
+        train_r2_list.append(float(1 - ss_res_tr / max(ss_tot_tr, 1e-8)))
+
+    return r2_list, train_r2_list
 
 
 def main():
@@ -416,25 +451,19 @@ def main():
     test_y = eval_data["y_entropy"]
     n_train = len(full_train_X)
 
-    # ── Pre-pad and transfer all data to GPU once ─────────────────────
+    # ── Train all probes simultaneously ──────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     max_seq_len = max(
         max(x.shape[0] for x in full_train_X),
         max(x.shape[0] for x in test_X),
     )
-    print(f"\nPre-padding and transferring data to {device} (max_seq_len={max_seq_len})...")
-    train_X_pad, train_mask = prepad_to_gpu(full_train_X, device)
-    test_X_pad, test_mask = prepad_to_gpu(test_X, device)
-    train_y_t = torch.from_numpy(full_train_y).float().to(device)
-    test_y_np = test_y
-    print(f"  Train: {train_X_pad.shape}, Test: {test_X_pad.shape}")
-
-    # ── Train all probes simultaneously ──────────────────────────────
     n_probes = len(DATA_FRACTIONS) * N_REPEATS
-    print(f"\nTraining {n_probes} probes simultaneously ({N_REPEATS} repeats × {len(DATA_FRACTIONS)} fractions)...")
-    r2_all = train_all_probes_batched(
-        train_X_pad, train_mask, train_y_t,
-        test_X_pad, test_mask, test_y_np,
+    print(f"\nTraining {n_probes} probes simultaneously on {device} "
+          f"({N_REPEATS} repeats × {len(DATA_FRACTIONS)} fractions, "
+          f"max_seq_len={max_seq_len})...")
+    r2_all, train_r2_all = train_all_probes_batched(
+        full_train_X, full_train_y,
+        test_X, test_y,
         DATA_FRACTIONS, N_REPEATS, SEED,
         device, max_seq_len,
     )
@@ -443,16 +472,23 @@ def main():
     sizes = []
     mean_r2s = []
     std_r2s = []
+    mean_train_r2s = []
+    std_train_r2s = []
 
     for i, frac in enumerate(DATA_FRACTIONS):
         n_subset = max(5, int(n_train * frac))
         r2_scores = r2_all[i * N_REPEATS : (i + 1) * N_REPEATS]
+        train_r2_scores = train_r2_all[i * N_REPEATS : (i + 1) * N_REPEATS]
         mean_r2 = float(np.mean(r2_scores))
         std_r2 = float(np.std(r2_scores))
+        mean_tr = float(np.mean(train_r2_scores))
+        std_tr = float(np.std(train_r2_scores))
         sizes.append(n_subset)
         mean_r2s.append(mean_r2)
         std_r2s.append(std_r2)
-        print(f"  {frac*100:5.1f}% ({n_subset:4d} samples): R² = {mean_r2:.3f} ± {std_r2:.3f}")
+        mean_train_r2s.append(mean_tr)
+        std_train_r2s.append(std_tr)
+        print(f"  {frac*100:5.1f}% ({n_subset:4d} samples): Test R² = {mean_r2:.3f} ± {std_r2:.3f}  Train R² = {mean_tr:.3f} ± {std_tr:.3f}")
 
     # ── Save results ──────────────────────────────────────────────────
     output_dir = DATA_DIR / "data_scaling"
@@ -463,6 +499,8 @@ def main():
         "sizes": sizes,
         "mean_r2": mean_r2s,
         "std_r2": std_r2s,
+        "mean_train_r2": mean_train_r2s,
+        "std_train_r2": std_train_r2s,
         "n_repeats": N_REPEATS,
         "n_train_full": n_train,
         "n_test": len(test_X),
@@ -471,14 +509,29 @@ def main():
         json.dump(results, f, indent=2)
 
     # ── Plot ──────────────────────────────────────────────────────────
-    from src2.utils.plotting import plot_data_scaling
-    plot_data_scaling(
-        sizes=sizes,
-        scores=mean_r2s,
-        metric_name="r2",
-        output_path=output_dir / "entropy_data_scaling.png",
-        title="Entropy Probe: Test R² vs Training Data Size",
-    )
+    import matplotlib.pyplot as plt
+    sizes_arr = np.array(sizes)
+    test_mean = np.array(mean_r2s)
+    test_std = np.array(std_r2s)
+    train_mean = np.array(mean_train_r2s)
+    train_std = np.array(std_train_r2s)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(sizes_arr, train_mean, "r-o", markersize=5, label="Train R²")
+    ax.fill_between(sizes_arr, train_mean - train_std, train_mean + train_std,
+                    color="red", alpha=0.15)
+    ax.plot(sizes_arr, test_mean, "b-o", markersize=5, label="Test R²")
+    ax.fill_between(sizes_arr, test_mean - test_std, test_mean + test_std,
+                    color="blue", alpha=0.15)
+    ax.set_xlabel("Training set size")
+    ax.set_ylabel("R²")
+    ax.set_title("Entropy Probe: R² vs Training Data Size")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_dir / "entropy_data_scaling.png", dpi=150)
+    plt.close(fig)
+    print(f"  Plot saved to {output_dir / 'entropy_data_scaling.png'}")
 
     print(f"\nResults saved to {output_dir}")
 
