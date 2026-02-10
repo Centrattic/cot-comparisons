@@ -43,7 +43,9 @@ LAYER = 32
 MAX_SENTENCES_PER_QUESTION_TRAIN = 50
 MAX_SENTENCES_PER_QUESTION_EVAL = 50
 
-# Training hyperparameters
+# Training hyperparameters  (must match run_entropy_probe.py)
+BOTTLENECK_DIM = 8
+NUM_HEADS = 1
 DROPOUT = 0.5
 LR = 1e-3
 EPOCHS = 500
@@ -52,7 +54,7 @@ GRAD_CLIP = 1.0
 WEIGHT_DECAY = 0.05
 PATIENCE = 50
 MIN_DELTA = 0.001
-MEAN_SUBTRACT = True
+MEAN_SUBTRACT = False
 TRIM_TO_COT = True
 SEED = 42
 
@@ -61,58 +63,168 @@ DATA_FRACTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 N_REPEATS = 3
 
 
-# ── Training helper ──────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────
 
 
-def precompute_pooled_features(X_list, device, batch_size=128):
-    """Mean-pool variable-length sequences into a dense [N, D] tensor on GPU.
-
-    This is the key optimisation: mean-pooling has no learnable parameters, so
-    we do the expensive pad-and-transfer step exactly once for the entire
-    dataset instead of once per batch per epoch per probe.
-    """
+def prepad_to_gpu(X_list, device, target_max_len=None):
+    """Pad all variable-length sequences and transfer to GPU in one shot."""
     hidden_dim = X_list[0].shape[1]
+    max_len = target_max_len or max(x.shape[0] for x in X_list)
     N = len(X_list)
-    pooled = torch.zeros(N, hidden_dim, device=device)
 
-    for start in range(0, N, batch_size):
-        end = min(start + batch_size, N)
-        batch = X_list[start:end]
-        max_len = max(x.shape[0] for x in batch)
+    X_pad = torch.zeros(N, max_len, hidden_dim, device=device)
+    mask = torch.zeros(N, max_len, dtype=torch.bool, device=device)
+    for i, x in enumerate(X_list):
+        sl = x.shape[0]
+        X_pad[i, :sl] = torch.from_numpy(x).to(device)
+        mask[i, :sl] = True
 
-        X_pad = torch.zeros(len(batch), max_len, hidden_dim, device=device)
-        mask = torch.zeros(len(batch), max_len, dtype=torch.bool, device=device)
-        for i, x in enumerate(batch):
-            sl = x.shape[0]
-            X_pad[i, :sl] = torch.from_numpy(x).to(device)
-            mask[i, :sl] = True
-
-        lengths = mask.sum(dim=1, keepdim=True).float().clamp(min=1)
-        pooled[start:end] = (X_pad * mask.unsqueeze(-1).float()).sum(dim=1) / lengths
-
-    return pooled
+    return X_pad, mask
 
 
-def train_all_probes_batched(train_pooled, train_y, test_pooled, test_y,
-                              data_fractions, n_repeats, seed):
+# ── Batched bottleneck attention probes ──────────────────────────────
+
+
+class BatchedBottleneckAttentionProbes(nn.Module):
+    """P BottleneckAttentionProbes trained simultaneously via batched einsum.
+
+    Each probe is: Linear(D, bottleneck) → LayerNorm → GELU → Dropout
+                   → AttentionPooling(bottleneck, num_heads) → scalar
+
+    All weights are stacked along a leading *probe* dimension.  The attention
+    part uses the pool-first-then-project trick (value projection is linear,
+    so sum(attn * (x @ W)) == (sum(attn * x)) @ W) to avoid materialising
+    a large ``[B, P, S, V]`` tensor.
+    """
+
+    def __init__(self, n_probes, input_dim, bottleneck_dim, num_heads,
+                 max_seq_len, dropout):
+        super().__init__()
+        self.n_probes = n_probes
+        self.input_dim = input_dim
+        self.bottleneck_dim = bottleneck_dim
+        self.num_heads = num_heads
+        self.head_dim = bottleneck_dim // num_heads
+        self.eps = 1e-5  # LayerNorm epsilon
+
+        # ── Bottleneck projection: Linear(D, bd) + LayerNorm(bd) ─────
+        self.proj_w = nn.Parameter(torch.empty(n_probes, bottleneck_dim, input_dim))
+        self.proj_b = nn.Parameter(torch.zeros(n_probes, bottleneck_dim))
+        self.ln_w = nn.Parameter(torch.ones(n_probes, bottleneck_dim))
+        self.ln_b = nn.Parameter(torch.zeros(n_probes, bottleneck_dim))
+
+        # ── Attention: query_proj, position_bias, value_proj ─────────
+        self.query_w = nn.Parameter(torch.empty(n_probes, num_heads, bottleneck_dim))
+        self.query_b = nn.Parameter(torch.zeros(n_probes, num_heads))
+        self.pos_bias = nn.Parameter(torch.zeros(n_probes, num_heads, max_seq_len))
+        self.value_w = nn.Parameter(
+            torch.empty(n_probes, num_heads, self.head_dim, bottleneck_dim))
+        self.value_b = nn.Parameter(
+            torch.zeros(n_probes, num_heads, self.head_dim))
+
+        # ── Classifier: dropout → Linear(bd, 1) → scalar ────────────
+        self.class_w = nn.Parameter(
+            torch.empty(n_probes, 1, num_heads * self.head_dim))
+        self.class_b = nn.Parameter(torch.zeros(n_probes, 1))
+
+        self.dropout = nn.Dropout(dropout)
+        self._init_weights()
+
+    def _init_weights(self):
+        """Match nn.Linear / nn.LayerNorm defaults per probe."""
+        for p in range(self.n_probes):
+            # Bottleneck projection
+            nn.init.kaiming_uniform_(self.proj_w.data[p], a=5 ** 0.5)
+            bound = 1.0 / self.input_dim ** 0.5
+            nn.init.uniform_(self.proj_b.data[p], -bound, bound)
+            # ln_w=1, ln_b=0 already set by default
+
+            # Query projection
+            nn.init.kaiming_uniform_(self.query_w.data[p], a=5 ** 0.5)
+            bound_q = 1.0 / self.bottleneck_dim ** 0.5
+            nn.init.uniform_(self.query_b.data[p], -bound_q, bound_q)
+
+            # Value projection
+            w_flat = self.value_w.data[p].view(-1, self.bottleneck_dim)
+            nn.init.kaiming_uniform_(w_flat, a=5 ** 0.5)
+            nn.init.uniform_(self.value_b.data[p].view(-1), -bound_q, bound_q)
+
+            # Classifier
+            nn.init.kaiming_uniform_(self.class_w.data[p], a=5 ** 0.5)
+            fan_in = self.num_heads * self.head_dim
+            nn.init.uniform_(self.class_b.data[p], -1.0 / fan_in ** 0.5,
+                             1.0 / fan_in ** 0.5)
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x:    [B, S, D]
+            mask: [B, S] boolean
+        Returns:
+            [B, P]  (scalar entropy prediction per probe)
+        """
+        B, S, D = x.shape
+        P = self.n_probes
+        H = self.num_heads
+        hd = self.head_dim
+        bd = self.bottleneck_dim
+
+        # ── 1) Bottleneck projection: [B, S, D] → [B, P, S, bd] ─────
+        h = (torch.einsum('bsd,pnd->bpsn', x, self.proj_w)
+             + self.proj_b[None, :, None, :])
+
+        # Manual LayerNorm over last dim (bd)
+        mu = h.mean(dim=-1, keepdim=True)
+        var = h.var(dim=-1, keepdim=True, correction=0)
+        h = (h - mu) / (var + self.eps).sqrt()
+        h = h * self.ln_w[None, :, None, :] + self.ln_b[None, :, None, :]
+
+        # GELU + Dropout
+        h = F.gelu(h)
+        h = self.dropout(h)
+
+        # ── 2) Attention logits: [B, P, S, H] ───────────────────────
+        attn = (torch.einsum('bpsn,phn->bpsh', h, self.query_w)
+                + self.query_b[None, :, None, :])
+        attn = attn + self.pos_bias[:, :, :S].permute(0, 2, 1).unsqueeze(0)
+
+        if mask is not None:
+            attn = attn.masked_fill(~mask[:, None, :, None], float('-inf'))
+
+        attn = torch.softmax(attn, dim=2)                # [B, P, S, H]
+
+        # ── 3) Pool first, then value-project (memory trick) ────────
+        weighted_h = torch.einsum('bpsh,bpsn->bphn', attn, h)  # [B, P, H, bd]
+        head_out = (torch.einsum('bphn,phkn->bphk', weighted_h, self.value_w)
+                    + self.value_b[None, :, :, :])        # [B, P, H, hd]
+
+        # ── 4) Concat heads → dropout → classify → scalar ───────────
+        pooled = head_out.reshape(B, P, H * hd)
+        pooled = self.dropout(pooled)
+
+        out = (torch.einsum('bpv,pov->bpo', pooled, self.class_w)
+               + self.class_b[None, :, :])                # [B, P, 1]
+        return out.squeeze(-1)                             # [B, P]
+
+
+# ── Batched training ─────────────────────────────────────────────────
+
+
+def train_all_probes_batched(train_X_pad, train_mask, train_y_t,
+                              test_X_pad, test_mask, test_y_np,
+                              data_fractions, n_repeats, seed,
+                              device, max_seq_len):
     """Train all data-scaling probes *simultaneously*.
 
-    All probes are stacked into a single weight matrix [n_probes, D] so each
-    training step is one batched matmul. A boolean membership mask assigns
-    different data subsets to different probes, and per-probe early stopping
-    freezes converged probes while the rest keep training.
+    All P = len(data_fractions) * n_repeats BottleneckAttentionProbes share
+    a single batched forward/backward pass.  A boolean membership mask routes
+    different data subsets to different probes, with per-probe early stopping.
     """
-    device = train_pooled.device
-    D = train_pooled.shape[1]
-    N_train = train_pooled.shape[0]
+    input_dim = train_X_pad.shape[2]
+    N_train = train_X_pad.shape[0]
     n_probes = len(data_fractions) * n_repeats
 
-    # Targets as GPU tensors
-    train_y_t = (torch.from_numpy(train_y).float().to(device)
-                 if isinstance(train_y, np.ndarray) else train_y.float().to(device))
-    test_y_np = test_y if isinstance(test_y, np.ndarray) else test_y.cpu().numpy()
-
-    # ── Build membership masks: [n_probes, N_train] ──────────────────
+    # ── Build membership masks: [P, N_train] ─────────────────────────
     membership = torch.zeros(n_probes, N_train, dtype=torch.bool, device=device)
     probe_idx = 0
     for frac in data_fractions:
@@ -123,26 +235,30 @@ def train_all_probes_batched(train_pooled, train_y, test_pooled, test_y,
             membership[probe_idx, indices] = True
             probe_idx += 1
 
-    # ── Initialise all probes as a single weight matrix ──────────────
-    W = nn.Parameter(torch.empty(n_probes, D, device=device))
-    b = nn.Parameter(torch.zeros(n_probes, device=device))
-    # Match nn.Linear default init (kaiming_uniform with a=sqrt(5))
-    nn.init.kaiming_uniform_(W, a=5 ** 0.5)
+    # ── Create batched probes ─────────────────────────────────────────
+    probes = BatchedBottleneckAttentionProbes(
+        n_probes=n_probes,
+        input_dim=input_dim,
+        bottleneck_dim=BOTTLENECK_DIM,
+        num_heads=NUM_HEADS,
+        max_seq_len=max_seq_len,
+        dropout=DROPOUT,
+    ).to(device)
 
-    optimizer = torch.optim.AdamW([W, b], lr=LR, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(probes.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=EPOCHS, eta_min=1e-6,
     )
 
     # Per-probe early stopping state
     best_loss = torch.full((n_probes,), float("inf"))
-    best_W = W.data.clone()
-    best_b = b.data.clone()
+    best_state = {n: p.data.clone() for n, p in probes.named_parameters()}
     no_improve = torch.zeros(n_probes, dtype=torch.long)
-    active = torch.ones(n_probes, dtype=torch.bool)        # CPU
+    active = torch.ones(n_probes, dtype=torch.bool)          # CPU
     active_dev = active.to(device)
 
     for epoch in range(EPOCHS):
+        probes.train()
         perm = torch.randperm(N_train, device=device)
         epoch_loss_sum = torch.zeros(n_probes, device=device)
         epoch_count = torch.zeros(n_probes, device=device)
@@ -151,20 +267,18 @@ def train_all_probes_batched(train_pooled, train_y, test_pooled, test_y,
             end = min(start + BATCH_SIZE, N_train)
             idx = perm[start:end]
 
-            x_batch = train_pooled[idx]             # [B, D]
-            y_batch = train_y_t[idx]                # [B]
+            x_batch = train_X_pad[idx]              # [B, S, D]
+            m_batch = train_mask[idx]                # [B, S]
+            y_batch = train_y_t[idx]                 # [B]
 
-            # Dropout (shared mask across probes – fine for linear probes)
-            x_drop = F.dropout(x_batch, p=DROPOUT, training=True)
+            # Forward: [B, P]
+            preds = probes(x_batch, m_batch)
 
-            # Forward: [B, D] @ [D, n_probes] + [n_probes] → [B, n_probes]
-            preds = x_drop @ W.T + b
-
-            # Per-element squared error
-            sq_err = (preds - y_batch.unsqueeze(1)) ** 2   # [B, n_probes]
+            # Per-element squared error: [B, P]
+            sq_err = (preds - y_batch.unsqueeze(1)) ** 2
 
             # Membership + active mask
-            batch_member = membership[:, idx].T.float()     # [B, n_probes]
+            batch_member = membership[:, idx].T.float()     # [B, P]
             batch_mask = batch_member * active_dev.unsqueeze(0).float()
 
             counts = batch_mask.sum(dim=0).clamp(min=1)
@@ -174,23 +288,24 @@ def train_all_probes_batched(train_pooled, train_y, test_pooled, test_y,
             optimizer.zero_grad()
             loss.backward()
 
-            # Zero grads for frozen probes (prevent weight-decay drift)
+            # Zero grads for frozen probes
             with torch.no_grad():
                 inactive = ~active_dev
                 if inactive.any():
-                    W.grad[inactive] = 0
-                    b.grad[inactive] = 0
+                    for _, param in probes.named_parameters():
+                        if param.grad is not None:
+                            param.grad[inactive] = 0
 
-            torch.nn.utils.clip_grad_norm_([W, b], GRAD_CLIP)
+            torch.nn.utils.clip_grad_norm_(probes.parameters(), GRAD_CLIP)
             optimizer.step()
 
-            # Restore frozen probes (counteract any residual optimizer state)
+            # Restore frozen probes (counteract weight-decay drift)
             with torch.no_grad():
                 if inactive.any():
-                    W.data[inactive] = best_W[inactive].to(device)
-                    b.data[inactive] = best_b[inactive].to(device)
+                    for name, param in probes.named_parameters():
+                        param.data[inactive] = best_state[name][inactive].to(device)
 
-            # Accumulate epoch loss for early stopping
+            # Accumulate epoch loss
             with torch.no_grad():
                 epoch_loss_sum += (sq_err.detach() * batch_member).sum(dim=0)
                 epoch_count += batch_member.sum(dim=0)
@@ -204,26 +319,28 @@ def train_all_probes_batched(train_pooled, train_y, test_pooled, test_y,
                 continue
             if avg_loss[j].item() < best_loss[j].item() - MIN_DELTA:
                 best_loss[j] = avg_loss[j]
-                best_W[j] = W.data[j].clone()
-                best_b[j] = b.data[j].clone()
+                for name, param in probes.named_parameters():
+                    best_state[name][j] = param.data[j].clone()
                 no_improve[j] = 0
             else:
                 no_improve[j] += 1
             if no_improve[j] >= PATIENCE:
                 active[j] = False
-                W.data[j] = best_W[j].to(device)
-                b.data[j] = best_b[j].to(device)
+                for name, param in probes.named_parameters():
+                    param.data[j] = best_state[name][j].to(device)
 
         active_dev = active.to(device)
         if not active.any():
             break
 
-    # ── Restore all best weights & evaluate ──────────────────────────
-    W.data.copy_(best_W.to(device))
-    b.data.copy_(best_b.to(device))
-
+    # ── Restore best weights & evaluate ───────────────────────────────
     with torch.no_grad():
-        test_preds = (test_pooled @ W.T + b).cpu().numpy()  # [N_test, n_probes]
+        for name, param in probes.named_parameters():
+            param.data.copy_(best_state[name].to(device))
+
+    probes.eval()
+    with torch.no_grad():
+        test_preds = probes(test_X_pad, test_mask).cpu().numpy()  # [N_test, P]
 
     ss_tot = np.sum((test_y_np - test_y_np.mean()) ** 2)
     r2_list = []
@@ -299,19 +416,27 @@ def main():
     test_y = eval_data["y_entropy"]
     n_train = len(full_train_X)
 
-    # ── Pre-compute mean-pooled features (once) ──────────────────────
+    # ── Pre-pad and transfer all data to GPU once ─────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nPre-computing pooled features on {device}...")
-    train_pooled = precompute_pooled_features(full_train_X, device)
-    test_pooled = precompute_pooled_features(test_X, device)
-    print(f"  Train: {train_pooled.shape}, Test: {test_pooled.shape}")
+    max_seq_len = max(
+        max(x.shape[0] for x in full_train_X),
+        max(x.shape[0] for x in test_X),
+    )
+    print(f"\nPre-padding and transferring data to {device} (max_seq_len={max_seq_len})...")
+    train_X_pad, train_mask = prepad_to_gpu(full_train_X, device)
+    test_X_pad, test_mask = prepad_to_gpu(test_X, device)
+    train_y_t = torch.from_numpy(full_train_y).float().to(device)
+    test_y_np = test_y
+    print(f"  Train: {train_X_pad.shape}, Test: {test_X_pad.shape}")
 
     # ── Train all probes simultaneously ──────────────────────────────
     n_probes = len(DATA_FRACTIONS) * N_REPEATS
     print(f"\nTraining {n_probes} probes simultaneously ({N_REPEATS} repeats × {len(DATA_FRACTIONS)} fractions)...")
     r2_all = train_all_probes_batched(
-        train_pooled, full_train_y, test_pooled, test_y,
+        train_X_pad, train_mask, train_y_t,
+        test_X_pad, test_mask, test_y_np,
         DATA_FRACTIONS, N_REPEATS, SEED,
+        device, max_seq_len,
     )
 
     # ── Reshape results ──────────────────────────────────────────────
