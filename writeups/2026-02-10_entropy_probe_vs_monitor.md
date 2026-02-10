@@ -32,7 +32,11 @@ Collapsing the 4-class distribution to a single scalar — Shannon entropy H(p) 
 
 **Logit lens baseline:** Project layer 32 residual stream activations through the model's own final RMSNorm + lm_head (no training). For each sample, take the last-token hidden state, apply the unembedding, extract logits at the A/B/C/D token positions, softmax, and compute entropy. This tests whether the answer distribution is already linearly decodable at layer 32 via the model's own vocabulary projection.
 
-**Eval split:** 12 held-out questions (10 GPQA Diamond + 2 blackmail scenarios), ~50 sentence boundaries each, stratified by mean entropy to ensure the eval covers the full range.
+**Data splits:** All splits are stratified by mean entropy to ensure they cover the full range.
+
+- **Train:** 12,198 samples from 43 questions (40 GPQA Diamond + 3 custom)
+- **Val:** 2,909 samples from 10 GPQA Diamond questions (used for early stopping)
+- **Test:** 2,970 samples from 10 held-out GPQA Diamond questions, ~50 sentence boundaries each (2 blackmail scenarios are configured as eval questions but lack extracted activations, so the probe currently can't evaluate on them)
 
 ---
 
