@@ -19,6 +19,7 @@ import torch.nn as nn
 
 from src2.methods.attention_probe import AttentionPoolingProbe
 from src2.tasks import ScruplesTask
+from src2.tasks.scruples.prompts import INTERVENTION_SUGGESTED_ANSWER
 
 # ── Configuration (mirrors run_sycophancy_probe.py) ──────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -206,12 +207,35 @@ def main():
 
     # Filter to intervention arm only (exclude control)
     intv_mask = [m["arm"] == "intervention" for m in metadata_all]
-    X_list = [x for x, keep in zip(X_list_all, intv_mask) if keep]
-    y = y_all[np.array(intv_mask)]
-    anecdote_ids = [a for a, keep in zip(anecdote_ids_all, intv_mask) if keep]
-    metadata = [m for m, keep in zip(metadata_all, intv_mask) if keep]
+    X_list_intv = [x for x, keep in zip(X_list_all, intv_mask) if keep]
+    y_intv = y_all[np.array(intv_mask)]
+    anecdote_ids_intv = [a for a, keep in zip(anecdote_ids_all, intv_mask) if keep]
+    metadata_intv = [m for m, keep in zip(metadata_all, intv_mask) if keep]
 
-    print(f"Loaded {len(X_list_all)} total, kept {len(X_list)} intervention-only")
+    print(f"Loaded {len(X_list_all)} total, kept {len(X_list_intv)} intervention-only")
+
+    # Clean-example filter: keep only sycophantic runs from sycophantic
+    # prompts, and control-majority-matching runs from non-sycophantic prompts
+    clean_mask = []
+    for m in metadata_intv:
+        variant = m["variant"]
+        syc_answer = INTERVENTION_SUGGESTED_ANSWER[variant]
+        non_syc_answer = "B" if syc_answer == "A" else "A"
+        ctrl_rate = m.get("control_sycophancy_rate", 0.0)
+        majority_ctrl_answer = syc_answer if ctrl_rate > 0.5 else non_syc_answer
+        if m["prompt_is_sycophantic"]:
+            # Keep only runs where answer matches the suggested (sycophantic) answer
+            clean_mask.append(m["is_sycophantic_answer"])
+        else:
+            # Keep only runs where answer matches the majority control answer
+            clean_mask.append(m["answer"].upper() == majority_ctrl_answer)
+
+    X_list = [x for x, keep in zip(X_list_intv, clean_mask) if keep]
+    y = y_intv[np.array(clean_mask)]
+    anecdote_ids = [a for a, keep in zip(anecdote_ids_intv, clean_mask) if keep]
+    metadata = [m for m, keep in zip(metadata_intv, clean_mask) if keep]
+
+    print(f"  After clean-example filter: {len(X_list)} (discarded {len(X_list_intv) - len(X_list)})")
     print(f"  Class 0 (non_sycophantic): {(y == 0).sum()}")
     print(f"  Class 1 (sycophantic):     {(y == 1).sum()}")
 

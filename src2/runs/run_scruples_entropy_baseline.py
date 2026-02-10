@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 
 from src2.tasks import ScruplesTask
+from src2.tasks.scruples.prompts import INTERVENTION_SUGGESTED_ANSWER
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -83,6 +84,26 @@ def _shannon_entropy(probs: Dict[str, float]) -> float:
         if p > 0:
             entropy -= p * math.log2(p)
     return entropy
+
+
+def _is_clean_example(
+    answer: str,
+    variant: str,
+    prompt_is_sycophantic: bool,
+    control_sycophancy_rate: float,
+) -> bool:
+    """Check if an intervention run is a clean example for training.
+
+    Keep: syc answer from syc prompts, control-majority answer from non-syc prompts.
+    Discard: mixed cases (non-syc answer on syc prompt, or non-majority answer on non-syc prompt).
+    """
+    syc_answer = INTERVENTION_SUGGESTED_ANSWER[variant]
+    if prompt_is_sycophantic:
+        return answer.upper() == syc_answer
+    else:
+        non_syc_answer = "B" if syc_answer == "A" else "A"
+        majority_ctrl_answer = syc_answer if control_sycophancy_rate > 0.5 else non_syc_answer
+        return answer.upper() == majority_ctrl_answer
 
 
 # ── Phase 1: Generate forcing data ───────────────────────────────────
@@ -194,8 +215,23 @@ def generate_forcing_data():
     print(f"Target anecdotes: {len(target_anecdotes)} "
           f"({len(split_info['syc_ids'])} syc, {len(split_info['non_syc_ids'])} non-syc)")
 
+    # ── Build per-anecdote lookups for clean-example filtering ─────────
+    syc_anecdotes = set(split_info["syc_ids"])
+    switch_rates = {}
+    ctrl_rates = {}
+    for variant in VARIANTS:
+        prompts_path = DATA_DIR / f"prompts_{variant}.csv"
+        if prompts_path.exists():
+            pdf = pd.read_csv(prompts_path)
+            for _, pr in pdf.iterrows():
+                aid = pr["anecdote_id"]
+                if aid in target_anecdotes:
+                    switch_rates.setdefault(aid, {})[variant] = pr.get("switch_rate", 0.0)
+                    ctrl_rates.setdefault(aid, {})[variant] = pr.get("control_sycophancy_rate", 0.0)
+
     # ── Load intervention rollouts from results CSVs ──────────────────
     all_rollouts = []
+    n_discarded = 0
     for variant in VARIANTS:
         csv_path = DATA_DIR / f"results_{variant}.csv"
         if not csv_path.exists():
@@ -206,7 +242,19 @@ def generate_forcing_data():
 
         for aid in sorted(target_anecdotes):
             aid_rows = intv[intv["anecdote_id"] == aid].head(MAX_ROLLOUTS_PER_ANECDOTE)
+            sr = switch_rates.get(aid, {}).get(variant, 0.0)
+            cr = ctrl_rates.get(aid, {}).get(variant, 0.0)
+            prompt_is_syc = sr > SWITCH_THRESHOLD
+
             for _, row in aid_rows.iterrows():
+                answer = row["answer"]
+
+                # Clean-example filter: keep syc answers from syc prompts,
+                # control-majority answers from non-syc prompts
+                if not _is_clean_example(answer, variant, prompt_is_syc, cr):
+                    n_discarded += 1
+                    continue
+
                 run_path = DATA_DIR / row["run_path"]
                 if not run_path.exists():
                     continue
@@ -219,13 +267,13 @@ def generate_forcing_data():
                     "anecdote_id": aid,
                     "variant": variant,
                     "run_idx": int(row["run_idx"]),
-                    "answer": row["answer"],
+                    "answer": answer,
                     "is_sycophantic": bool(row["is_sycophantic"]),
                     "user_msg": run_data["prompt"],
                     "thinking": thinking,
                 })
 
-    print(f"Loaded {len(all_rollouts)} intervention rollouts to force")
+    print(f"Loaded {len(all_rollouts)} clean intervention rollouts ({n_discarded} discarded)")
     syc_count = sum(1 for r in all_rollouts if r["is_sycophantic"])
     print(f"  Sycophantic: {syc_count}, Non-sycophantic: {len(all_rollouts) - syc_count}")
 
@@ -331,33 +379,40 @@ def train_baseline():
     rollouts = data["rollouts"]
     print(f"Loaded {len(rollouts)} forced rollouts")
 
-    # ── Get switch rates for labeling ─────────────────────────────────
-    # Load prompts CSVs to get per-anecdote switch_rate
-    switch_rates = {}
+    # ── Get switch rates + control rates for labeling/filtering ────────
+    switch_rates = {}   # (aid, variant) -> switch_rate
+    ctrl_rates = {}     # (aid, variant) -> control_sycophancy_rate
     for variant in VARIANTS:
         csv_path = DATA_DIR / f"prompts_{variant}.csv"
         if csv_path.exists():
             df = pd.read_csv(csv_path)
             for _, row in df.iterrows():
                 aid = row["anecdote_id"]
-                sr = row.get("switch_rate", 0.0)
-                # Keep max switch_rate across variants
-                if aid not in switch_rates or sr > switch_rates[aid]:
-                    switch_rates[aid] = sr
+                switch_rates[(aid, variant)] = row.get("switch_rate", 0.0)
+                ctrl_rates[(aid, variant)] = row.get("control_sycophancy_rate", 0.0)
 
-    # ── Extract features and labels ───────────────────────────────────
+    # ── Extract features and labels (clean examples only) ──────────────
     X_list = []
     y_list = []
     anecdote_ids = []
     metadata = []
+    n_discarded = 0
 
     for rollout in rollouts:
         aid = rollout["anecdote_id"]
+        variant = rollout["variant"]
+        answer = rollout["answer"]
         is_syc_answer = rollout["is_sycophantic"]
-        sr = switch_rates.get(aid, 0.0)
+        sr = switch_rates.get((aid, variant), 0.0)
+        cr = ctrl_rates.get((aid, variant), 0.0)
         prompt_is_syc = sr > SWITCH_THRESHOLD
 
-        # Label: sycophantic answer AND high-switch-rate anecdote
+        # Clean-example filter: keep syc answers from syc prompts,
+        # control-majority answers from non-syc prompts
+        if not _is_clean_example(answer, variant, prompt_is_syc, cr):
+            n_discarded += 1
+            continue
+
         label = 1 if (is_syc_answer and prompt_is_syc) else 0
 
         features = _extract_entropy_features(rollout["results"])
@@ -366,7 +421,7 @@ def train_baseline():
         anecdote_ids.append(aid)
         metadata.append({
             "anecdote_id": aid,
-            "variant": rollout["variant"],
+            "variant": variant,
             "run_idx": rollout["run_idx"],
             "is_sycophantic": is_syc_answer,
             "switch_rate": sr,
@@ -374,7 +429,8 @@ def train_baseline():
 
     X = np.stack(X_list)
     y = np.array(y_list)
-    print(f"Samples: {len(y)}, Class 0: {(y == 0).sum()}, Class 1: {(y == 1).sum()}")
+    print(f"Clean samples: {len(y)} ({n_discarded} discarded)")
+    print(f"  Class 0: {(y == 0).sum()}, Class 1: {(y == 1).sum()}")
 
     # ── Train/test split by anecdote ──────────────────────────────────
     rng = np.random.default_rng(SEED)

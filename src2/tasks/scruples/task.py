@@ -737,8 +737,13 @@ class ScruplesTask(BaseTask):
             prompts_df = pd.read_csv(prompts_csv)
             runs_df = runs_df[runs_df["anecdote_id"].apply(data_slice.matches_id)]
 
-            # Build switch_rate lookup for this variant
+            # Build per-anecdote lookups for this variant
             switch_lookup = dict(zip(prompts_df["anecdote_id"], prompts_df["switch_rate"]))
+            ctrl_rate_lookup = (
+                dict(zip(prompts_df["anecdote_id"], prompts_df["control_sycophancy_rate"]))
+                if "control_sycophancy_rate" in prompts_df.columns
+                else {}
+            )
 
             for _, row in runs_df.iterrows():
                 run_path = self.data_dir / row["run_path"]
@@ -799,6 +804,7 @@ class ScruplesTask(BaseTask):
                     "is_sycophantic_answer": is_syco_answer,
                     "switch_rate": switch_rate,
                     "prompt_is_sycophantic": prompt_is_sycophantic,
+                    "control_sycophancy_rate": ctrl_rate_lookup.get(aid, 0.0),
                 })
 
         return {
@@ -1008,8 +1014,17 @@ class ScruplesTask(BaseTask):
                     elif aid in sampled_non_set:
                         non_syc_control_rates.append(cr)
 
-        # Top up if cross-variant dedup reduced counts below target
+        # Resolve any overlaps: if an anecdote ended up in both syc and non_syc
+        # across variants, keep it in the syc group
+        all_syc_ids = all_syc_high_ids | all_syc_low_ids
+        overlap = all_syc_ids & all_non_syc_ids
+        if overlap:
+            all_non_syc_ids -= overlap
+            print(f"  Removed {len(overlap)} overlapping anecdotes from non_syc")
+
+        # Top up if cross-variant dedup or overlap resolution reduced counts
         n_variants = len(variants)
+        all_taken = all_syc_high_ids | all_syc_low_ids | all_non_syc_ids
         for label, sampled, pool, n_per in [
             ("syc_high", all_syc_high_ids, full_syc_high_pool, n_syc_high_per_variant),
             ("syc_low", all_syc_low_ids, full_syc_low_pool, n_syc_low_per_variant),
@@ -1017,20 +1032,15 @@ class ScruplesTask(BaseTask):
         ]:
             target = n_per * n_variants
             if len(sampled) < target:
-                remaining = sorted(pool - sampled)
+                remaining = sorted(pool - all_taken)
                 needed = target - len(sampled)
                 if remaining and needed > 0:
                     topup = rng.choice(
                         remaining, size=min(needed, len(remaining)), replace=False
                     ).tolist()
                     sampled.update(topup)
+                    all_taken.update(topup)
                     print(f"  Top-up {label}: added {len(topup)} to reach {len(sampled)}/{target}")
-
-        # Resolve any overlaps: if an anecdote ended up in both syc and non_syc
-        # across variants, keep it in the syc group
-        all_syc_ids = all_syc_high_ids | all_syc_low_ids
-        overlap = all_syc_ids & all_non_syc_ids
-        all_non_syc_ids -= overlap
 
         syc_ids = sorted(all_syc_ids)
         non_syc_ids = sorted(all_non_syc_ids)

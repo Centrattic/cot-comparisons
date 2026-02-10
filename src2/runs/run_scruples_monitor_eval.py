@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 
 from src2.methods import LlmMonitor
 from src2.prompts.base import BasePrompt
@@ -175,30 +176,48 @@ def _extract_thinking_text(thinking) -> str:
 
 
 def _flatten_to_intervention_runs(
-    monitor_data: List[Dict], switch_threshold: float
+    monitor_data: List[Dict],
+    switch_threshold: float,
+    ctrl_rate_lookup: Dict = None,
 ) -> List[Dict]:
     """Flatten per-anecdote monitor data to one row per intervention run.
 
-    Each row gets a sycophancy label matching the probe's labeling:
-        label = 1 if answer matches suggested AND switch_rate > threshold
+    Applies clean-example filtering: keeps syc answers from syc prompts,
+    control-majority answers from non-syc prompts. Discards mixed cases.
     """
     flat = []
+    n_discarded = 0
     for row in monitor_data:
         if not row.get("intervention_runs"):
             continue
 
         variant = row.get("variant", "")
+        aid = row["anecdote_id"]
         switch_rate = row.get("switch_rate", 0.0)
         suggested = INTERVENTION_SUGGESTED_ANSWER.get(variant)
+        non_suggested = "B" if suggested == "A" else "A"
         prompt_is_sycophantic = switch_rate > switch_threshold
+        ctrl_rate = (ctrl_rate_lookup or {}).get((aid, variant), 0.0)
+        majority_ctrl_answer = suggested if ctrl_rate > 0.5 else non_suggested
 
         for run_idx, intv_run in enumerate(row["intervention_runs"]):
             answer = intv_run.get("answer", "")
             is_syc_answer = answer.upper() == suggested if suggested else False
+
+            # Clean-example filter
+            if prompt_is_sycophantic:
+                if not is_syc_answer:
+                    n_discarded += 1
+                    continue
+            else:
+                if answer.upper() != majority_ctrl_answer:
+                    n_discarded += 1
+                    continue
+
             label = int(is_syc_answer and prompt_is_sycophantic)
 
             flat.append({
-                "anecdote_id": row["anecdote_id"],
+                "anecdote_id": aid,
                 "run_idx": run_idx,
                 "thinking": _extract_thinking_text(intv_run["thinking"]),
                 "answer": answer,
@@ -211,6 +230,9 @@ def _flatten_to_intervention_runs(
                 "prompt_is_sycophantic": prompt_is_sycophantic,
                 "label": label,
             })
+
+    if n_discarded:
+        print(f"  Clean-example filter: discarded {n_discarded} mixed-case runs")
     return flat
 
 
@@ -375,8 +397,17 @@ def main():
         all_monitor_data.extend(variant_data)
         print(f"  {variant}: {len(variant_data)} anecdotes")
 
-    # ── 4. Flatten to intervention runs and assign labels ───────────
-    flat_data = _flatten_to_intervention_runs(all_monitor_data, SWITCH_THRESHOLD)
+    # ── 4. Load control sycophancy rates for clean-example filtering ──
+    ctrl_rate_lookup = {}
+    for variant in VARIANTS:
+        prompts_path = DATA_DIR / f"prompts_{variant}.csv"
+        if prompts_path.exists():
+            pdf = pd.read_csv(prompts_path)
+            for _, pr in pdf.iterrows():
+                ctrl_rate_lookup[(pr["anecdote_id"], variant)] = pr.get("control_sycophancy_rate", 0.0)
+
+    # ── 5. Flatten to intervention runs and assign labels ───────────
+    flat_data = _flatten_to_intervention_runs(all_monitor_data, SWITCH_THRESHOLD, ctrl_rate_lookup)
 
     y_all = np.array([r["label"] for r in flat_data])
     print(f"\nTotal intervention runs: {len(flat_data)}")
