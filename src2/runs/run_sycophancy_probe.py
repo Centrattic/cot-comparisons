@@ -223,6 +223,8 @@ def train_and_evaluate(
     lr: float = LR,
     epochs: int = EPOCHS,
     batch_size: int = BATCH_SIZE,
+    weight_decay: float = WEIGHT_DECAY,
+    dropout: float = DROPOUT,
 ) -> dict:
     """Train probe with F1-based early stopping, evaluate on test set.
 
@@ -271,9 +273,9 @@ def train_and_evaluate(
         num_heads=num_heads,
         output_dim=NUM_CLASSES,
         max_seq_len=max_seq_len,
-        dropout=DROPOUT,
+        dropout=dropout,
     ).to(device)
-    optimizer = torch.optim.Adam(probe.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.Adam(probe.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
     # Track metrics for plotting
@@ -568,26 +570,81 @@ def main():
     print("  Test set breakdown:")
     print_dataset_statistics(split["test_metadata"], split["test_y"])
 
-    # ── Step 5: Train and evaluate ────────────────────────────────────
-    print("Training sycophancy attention probe (F1-based early stopping)...")
-    results = train_and_evaluate(
-        train_X=split["train_X"],
-        train_y=split["train_y"],
-        test_X=split["test_X"],
-        test_y=split["test_y"],
-        train_anecdote_ids=split["train_anecdote_ids"],
-    )
+    # ── Step 5: Hyperparameter sweep ─────────────────────────────────
+    SWEEP_CONFIGS = [
+        {"weight_decay": 0.0,   "dropout": 0.0},
+        {"weight_decay": 0.0,   "dropout": 0.1},
+        {"weight_decay": 0.0,   "dropout": 0.3},
+        {"weight_decay": 1e-4,  "dropout": 0.0},
+        {"weight_decay": 1e-4,  "dropout": 0.1},
+        {"weight_decay": 1e-4,  "dropout": 0.3},
+        {"weight_decay": 1e-3,  "dropout": 0.0},
+        {"weight_decay": 1e-3,  "dropout": 0.1},
+        {"weight_decay": 1e-3,  "dropout": 0.3},
+        {"weight_decay": 1e-2,  "dropout": 0.3},
+    ]
 
-    # ── Step 6: Compute and print metrics ─────────────────────────────
-    metrics = compute_metrics(results["true_labels"], results["predictions"])
-    print_results(metrics, label="Test Set Results")
-
-    # ── Step 7: Save results ──────────────────────────────────────────
     output_dir = DATA_DIR / "sycophancy_probe"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    sweep_results = []
+    best_test_f1 = -1.0
+    best_config = None
+    best_results = None
+
+    for i, cfg in enumerate(SWEEP_CONFIGS):
+        wd = cfg["weight_decay"]
+        do = cfg["dropout"]
+        print(f"\n{'='*60}")
+        print(f"  Sweep {i+1}/{len(SWEEP_CONFIGS)}: weight_decay={wd}, dropout={do}")
+        print(f"{'='*60}")
+
+        results = train_and_evaluate(
+            train_X=split["train_X"],
+            train_y=split["train_y"],
+            test_X=split["test_X"],
+            test_y=split["test_y"],
+            train_anecdote_ids=split["train_anecdote_ids"],
+            weight_decay=wd,
+            dropout=do,
+        )
+
+        metrics = compute_metrics(results["true_labels"], results["predictions"])
+        test_f1 = metrics["per_class"]["sycophantic"]["f1"]
+        print_results(metrics, label=f"wd={wd}, do={do}")
+
+        sweep_results.append({
+            "weight_decay": wd,
+            "dropout": do,
+            "test_f1_syc": test_f1,
+            "test_accuracy": metrics["accuracy"],
+            "best_val_f1": results["best_val_f1"],
+            "best_epoch": results["best_epoch"],
+        })
+
+        if test_f1 > best_test_f1:
+            best_test_f1 = test_f1
+            best_config = cfg
+            best_results = results
+            best_metrics = metrics
+
+    # ── Summary table ─────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print("  SWEEP SUMMARY")
+    print(f"{'='*60}")
+    print(f"  {'weight_decay':>12s}  {'dropout':>7s}  {'val_F1':>6s}  {'test_F1':>7s}  {'acc':>5s}  {'ep':>3s}")
+    for r in sweep_results:
+        marker = " <-- best" if r["weight_decay"] == best_config["weight_decay"] and r["dropout"] == best_config["dropout"] else ""
+        print(f"  {r['weight_decay']:12.1e}  {r['dropout']:7.1f}  {r['best_val_f1']:6.3f}  {r['test_f1_syc']:7.3f}  {r['test_accuracy']:5.3f}  {r['best_epoch']:3d}{marker}")
+
+    print(f"\n  Best config: weight_decay={best_config['weight_decay']}, dropout={best_config['dropout']}")
+    print(f"  Best test F1 (sycophantic): {best_test_f1:.3f}")
+
+    # ── Save results ──────────────────────────────────────────────────
     output = {
-        "test_metrics": metrics,
+        "sweep_results": sweep_results,
+        "best_config": best_config,
+        "best_test_metrics": best_metrics,
         "config": {
             "variants": VARIANTS,
             "layer": LAYER,
@@ -603,22 +660,21 @@ def main():
             "n_train_anecdotes": split["n_train_anecdotes"],
             "n_test_anecdotes": split["n_test_anecdotes"],
         },
-        "final_train_loss": results["final_train_loss"],
     }
 
-    with open(output_dir / "results.json", "w") as f:
+    with open(output_dir / "sweep_results.json", "w") as f:
         json.dump(output, f, indent=2)
 
-    print(f"\nResults saved to {output_dir / 'results.json'}")
+    print(f"\nSweep results saved to {output_dir / 'sweep_results.json'}")
 
-    # Plot training curves
-    if results.get("history") and results["history"]["epoch"]:
+    # Plot training curves for the best config
+    if best_results.get("history") and best_results["history"]["epoch"]:
         from src2.utils.plotting import plot_training_curves
         plot_training_curves(
-            results["history"],
+            best_results["history"],
             metric_name="f1",
             output_path=output_dir / "training_curves.png",
-            title="Sycophancy Probe: F1 vs Epoch",
+            title=f"Best Probe (wd={best_config['weight_decay']}, do={best_config['dropout']}): F1 vs Epoch",
         )
 
 

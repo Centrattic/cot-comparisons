@@ -67,20 +67,38 @@ def _compute_f1(y_true, y_pred):
     return 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
 
-def train_and_evaluate_single(train_X, train_y, test_X, test_y):
-    """Train probe and return test F1."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def prepad_to_gpu(X_list, device, target_max_len=None):
+    """Pad all variable-length sequences and transfer to GPU in one shot.
 
-    hidden_dim = train_X[0].shape[1]
-    max_seq_len = max(
-        max(x.shape[0] for x in train_X),
-        max(x.shape[0] for x in test_X),
-    )
-    n_samples = len(train_X)
+    Returns a single [N, max_len, D] tensor and [N, max_len] bool mask,
+    both already on *device*. This avoids repeated numpy→GPU transfers
+    during training.
+    """
+    hidden_dim = X_list[0].shape[1]
+    max_len = target_max_len or max(x.shape[0] for x in X_list)
+    N = len(X_list)
 
-    class_counts = np.bincount(train_y, minlength=NUM_CLASSES)
-    class_weights = n_samples / (NUM_CLASSES * class_counts + 1e-6)
-    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+    X_pad = torch.zeros(N, max_len, hidden_dim, device=device)
+    mask = torch.zeros(N, max_len, dtype=torch.bool, device=device)
+    for i, x in enumerate(X_list):
+        sl = x.shape[0]
+        X_pad[i, :sl] = torch.from_numpy(x).to(device)
+        mask[i, :sl] = True
+
+    return X_pad, mask
+
+
+def train_and_evaluate_single(train_X_pad, train_mask, train_y_t,
+                               test_X_pad, test_mask, test_y_np,
+                               indices, device, max_seq_len):
+    """Train one probe on a subset (given by *indices*) of pre-padded GPU data."""
+    hidden_dim = train_X_pad.shape[2]
+    indices_t = torch.tensor(indices, dtype=torch.long, device=device)
+    n_samples = len(indices)
+
+    sub_y = train_y_t[indices_t]
+    class_counts = torch.bincount(sub_y, minlength=NUM_CLASSES).float()
+    class_weights = n_samples / (NUM_CLASSES * class_counts.clamp(min=1))
 
     probe = AttentionPoolingProbe(
         hidden_dim=hidden_dim,
@@ -94,42 +112,29 @@ def train_and_evaluate_single(train_X, train_y, test_X, test_y):
 
     probe.train()
     for epoch in range(EPOCHS):
-        perm = np.random.permutation(n_samples)
+        perm = torch.randperm(n_samples, device=device)
         for start in range(0, n_samples, BATCH_SIZE):
             end = min(start + BATCH_SIZE, n_samples)
-            batch_idx = perm[start:end]
-            batch_X = [train_X[i] for i in batch_idx]
-            batch_y = train_y[batch_idx]
-            batch_max_len = max(x.shape[0] for x in batch_X)
+            idx = indices_t[perm[start:end]]
 
-            X_pad = torch.zeros(len(batch_X), batch_max_len, hidden_dim, device=device)
-            mask = torch.zeros(len(batch_X), batch_max_len, dtype=torch.bool, device=device)
-            for i, x in enumerate(batch_X):
-                sl = x.shape[0]
-                X_pad[i, :sl, :] = torch.from_numpy(x).to(device)
-                mask[i, :sl] = True
-            y_t = torch.tensor(batch_y, dtype=torch.long, device=device)
+            X_batch = train_X_pad[idx]      # already on GPU, already padded
+            m_batch = train_mask[idx]
+            y_batch = train_y_t[idx]
 
             optimizer.zero_grad()
-            pred = probe(X_pad, mask)
-            loss = loss_fn(pred, y_t)
+            pred = probe(X_batch, m_batch)
+            loss = loss_fn(pred, y_batch)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(probe.parameters(), GRAD_CLIP)
             optimizer.step()
 
-    # Evaluate
+    # Evaluate (batched, all at once)
     probe.eval()
-    preds = []
-    for x in test_X:
-        seq_len = x.shape[0]
-        x_t = torch.from_numpy(x).float().unsqueeze(0).to(device)
-        m = torch.ones(1, seq_len, dtype=torch.bool, device=device)
-        with torch.no_grad():
-            logits = probe(x_t, m)
-        preds.append(int(logits.argmax(dim=-1).item()))
-    preds = np.array(preds)
+    with torch.no_grad():
+        logits = probe(test_X_pad, test_mask)
+        preds = logits.argmax(dim=-1).cpu().numpy()
 
-    return _compute_f1(test_y, preds)
+    return _compute_f1(test_y_np, preds)
 
 
 def train_test_split_by_anecdote(X_list, y, anecdote_ids, metadata,
@@ -263,6 +268,19 @@ def main():
     n_train = len(full_train_X)
     print(f"Train: {n_train}, Test: {len(test_X)}")
 
+    # ── Pre-pad and transfer all data to GPU once ─────────────────────
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    max_seq_len = max(
+        max(x.shape[0] for x in full_train_X),
+        max(x.shape[0] for x in test_X),
+    )
+    print(f"\nPre-padding and transferring data to {device} (max_seq_len={max_seq_len})...")
+    train_X_pad, train_mask = prepad_to_gpu(full_train_X, device)
+    test_X_pad, test_mask = prepad_to_gpu(test_X, device)
+    train_y_t = torch.from_numpy(full_train_y).long().to(device)
+    test_y_np = test_y  # keep numpy for F1 computation
+    print(f"  Train: {train_X_pad.shape}, Test: {test_X_pad.shape}")
+
     # ── Data scaling ──────────────────────────────────────────────────
     print("\nRunning data scaling analysis...")
     sizes = []
@@ -276,10 +294,12 @@ def main():
         for rep in range(N_REPEATS):
             rng = np.random.default_rng(SEED + rep)
             indices = rng.choice(n_train, n_subset, replace=False)
-            sub_X = [full_train_X[i] for i in indices]
-            sub_y = full_train_y[indices]
 
-            f1 = train_and_evaluate_single(sub_X, sub_y, test_X, test_y)
+            f1 = train_and_evaluate_single(
+                train_X_pad, train_mask, train_y_t,
+                test_X_pad, test_mask, test_y_np,
+                indices, device, max_seq_len,
+            )
             f1_scores.append(f1)
 
         mean_f1 = float(np.mean(f1_scores))
