@@ -365,25 +365,31 @@ def train_all_probes_batched(train_X_list, train_y,
             train_preds_parts.append(probes(x_b, m_b).cpu().numpy())
     train_preds = np.concatenate(train_preds_parts, axis=0)  # [N_train, P]
 
-    # Test R²
+    # Test R² and MSE
     ss_tot = np.sum((test_y_np - test_y_np.mean()) ** 2)
     r2_list = []
+    test_mse_list = []
     for j in range(n_probes):
-        ss_res = np.sum((test_y_np - test_preds[:, j]) ** 2)
+        residuals = test_y_np - test_preds[:, j]
+        ss_res = np.sum(residuals ** 2)
         r2_list.append(float(1 - ss_res / max(ss_tot, 1e-8)))
+        test_mse_list.append(float(np.mean(residuals ** 2)))
 
-    # Train R² (each probe evaluated on its own training subset)
+    # Train R² and MSE (each probe evaluated on its own training subset)
     membership_np = membership.cpu().numpy()
     train_r2_list = []
+    train_mse_list = []
     for j in range(n_probes):
         member_idx = membership_np[j]
         y_sub = train_y_np[member_idx]
         pred_sub = train_preds[member_idx, j]
+        residuals_tr = y_sub - pred_sub
         ss_tot_tr = np.sum((y_sub - y_sub.mean()) ** 2)
-        ss_res_tr = np.sum((y_sub - pred_sub) ** 2)
+        ss_res_tr = np.sum(residuals_tr ** 2)
         train_r2_list.append(float(1 - ss_res_tr / max(ss_tot_tr, 1e-8)))
+        train_mse_list.append(float(np.mean(residuals_tr ** 2)))
 
-    return r2_list, train_r2_list
+    return r2_list, train_r2_list, test_mse_list, train_mse_list
 
 
 def main():
@@ -461,7 +467,7 @@ def main():
     print(f"\nTraining {n_probes} probes simultaneously on {device} "
           f"({N_REPEATS} repeats × {len(DATA_FRACTIONS)} fractions, "
           f"max_seq_len={max_seq_len})...")
-    r2_all, train_r2_all = train_all_probes_batched(
+    r2_all, train_r2_all, test_mse_all, train_mse_all = train_all_probes_batched(
         full_train_X, full_train_y,
         test_X, test_y,
         DATA_FRACTIONS, N_REPEATS, SEED,
@@ -470,25 +476,33 @@ def main():
 
     # ── Reshape results ──────────────────────────────────────────────
     sizes = []
-    mean_r2s = []
-    std_r2s = []
-    mean_train_r2s = []
-    std_train_r2s = []
+    mean_r2s, std_r2s = [], []
+    mean_train_r2s, std_train_r2s = [], []
+    mean_test_mses, std_test_mses = [], []
+    mean_train_mses, std_train_mses = [], []
 
     for i, frac in enumerate(DATA_FRACTIONS):
         n_subset = max(5, int(n_train * frac))
-        r2_scores = r2_all[i * N_REPEATS : (i + 1) * N_REPEATS]
-        train_r2_scores = train_r2_all[i * N_REPEATS : (i + 1) * N_REPEATS]
-        mean_r2 = float(np.mean(r2_scores))
-        std_r2 = float(np.std(r2_scores))
-        mean_tr = float(np.mean(train_r2_scores))
-        std_tr = float(np.std(train_r2_scores))
+        sl = slice(i * N_REPEATS, (i + 1) * N_REPEATS)
+        r2_scores = r2_all[sl]
+        train_r2_scores = train_r2_all[sl]
+        test_mse_scores = test_mse_all[sl]
+        train_mse_scores = train_mse_all[sl]
+
         sizes.append(n_subset)
-        mean_r2s.append(mean_r2)
-        std_r2s.append(std_r2)
-        mean_train_r2s.append(mean_tr)
-        std_train_r2s.append(std_tr)
-        print(f"  {frac*100:5.1f}% ({n_subset:4d} samples): Test R² = {mean_r2:.3f} ± {std_r2:.3f}  Train R² = {mean_tr:.3f} ± {std_tr:.3f}")
+        mean_r2s.append(float(np.mean(r2_scores)))
+        std_r2s.append(float(np.std(r2_scores)))
+        mean_train_r2s.append(float(np.mean(train_r2_scores)))
+        std_train_r2s.append(float(np.std(train_r2_scores)))
+        mean_test_mses.append(float(np.mean(test_mse_scores)))
+        std_test_mses.append(float(np.std(test_mse_scores)))
+        mean_train_mses.append(float(np.mean(train_mse_scores)))
+        std_train_mses.append(float(np.std(train_mse_scores)))
+
+        print(f"  {frac*100:5.1f}% ({n_subset:4d} samples): "
+              f"Test R²={mean_r2s[-1]:.3f}±{std_r2s[-1]:.3f}  "
+              f"Train R²={mean_train_r2s[-1]:.3f}±{std_train_r2s[-1]:.3f}  "
+              f"Test MSE={mean_test_mses[-1]:.4f}  Train MSE={mean_train_mses[-1]:.4f}")
 
     # ── Save results ──────────────────────────────────────────────────
     output_dir = DATA_DIR / "data_scaling"
@@ -501,6 +515,10 @@ def main():
         "std_r2": std_r2s,
         "mean_train_r2": mean_train_r2s,
         "std_train_r2": std_train_r2s,
+        "mean_test_mse": mean_test_mses,
+        "std_test_mse": std_test_mses,
+        "mean_train_mse": mean_train_mses,
+        "std_train_mse": std_train_mses,
         "n_repeats": N_REPEATS,
         "n_train_full": n_train,
         "n_test": len(test_X),
@@ -511,23 +529,41 @@ def main():
     # ── Plot ──────────────────────────────────────────────────────────
     import matplotlib.pyplot as plt
     sizes_arr = np.array(sizes)
-    test_mean = np.array(mean_r2s)
-    test_std = np.array(std_r2s)
-    train_mean = np.array(mean_train_r2s)
-    train_std = np.array(std_train_r2s)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(sizes_arr, train_mean, "r-o", markersize=5, label="Train R²")
-    ax.fill_between(sizes_arr, train_mean - train_std, train_mean + train_std,
-                    color="red", alpha=0.15)
-    ax.plot(sizes_arr, test_mean, "b-o", markersize=5, label="Test R²")
-    ax.fill_between(sizes_arr, test_mean - test_std, test_mean + test_std,
-                    color="blue", alpha=0.15)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # R² subplot
+    ax = axes[0]
+    tr_r2 = np.array(mean_train_r2s)
+    tr_r2_s = np.array(std_train_r2s)
+    te_r2 = np.array(mean_r2s)
+    te_r2_s = np.array(std_r2s)
+    ax.plot(sizes_arr, tr_r2, "r-o", markersize=5, label="Train R²")
+    ax.fill_between(sizes_arr, tr_r2 - tr_r2_s, tr_r2 + tr_r2_s, color="red", alpha=0.15)
+    ax.plot(sizes_arr, te_r2, "b-o", markersize=5, label="Test R²")
+    ax.fill_between(sizes_arr, te_r2 - te_r2_s, te_r2 + te_r2_s, color="blue", alpha=0.15)
     ax.set_xlabel("Training set size")
     ax.set_ylabel("R²")
     ax.set_title("Entropy Probe: R² vs Training Data Size")
     ax.legend()
     ax.grid(True, alpha=0.3)
+
+    # MSE subplot
+    ax = axes[1]
+    tr_mse = np.array(mean_train_mses)
+    tr_mse_s = np.array(std_train_mses)
+    te_mse = np.array(mean_test_mses)
+    te_mse_s = np.array(std_test_mses)
+    ax.plot(sizes_arr, tr_mse, "r-o", markersize=5, label="Train MSE")
+    ax.fill_between(sizes_arr, tr_mse - tr_mse_s, tr_mse + tr_mse_s, color="red", alpha=0.15)
+    ax.plot(sizes_arr, te_mse, "b-o", markersize=5, label="Test MSE")
+    ax.fill_between(sizes_arr, te_mse - te_mse_s, te_mse + te_mse_s, color="blue", alpha=0.15)
+    ax.set_xlabel("Training set size")
+    ax.set_ylabel("MSE")
+    ax.set_title("Entropy Probe: MSE vs Training Data Size")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
     fig.tight_layout()
     fig.savefig(output_dir / "entropy_data_scaling.png", dpi=150)
     plt.close(fig)

@@ -961,7 +961,12 @@ def main():
 
     # Update "latest" symlink
     latest_link = base_dir / "latest"
-    if latest_link.is_symlink() or latest_link.exists():
+    if latest_link.is_symlink():
+        latest_link.unlink()
+    elif latest_link.is_dir():
+        import shutil
+        shutil.rmtree(latest_link)
+    elif latest_link.exists():
         latest_link.unlink()
     latest_link.symlink_to(timestamp)
 

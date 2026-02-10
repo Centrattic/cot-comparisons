@@ -289,21 +289,46 @@ def train_all_probes_batched(train_X_list, train_y,
     # ── Evaluate (batched to avoid OOM) ───────────────────────────────
     probes.eval()
     N_test = len(test_X_list)
-    all_preds = []
+    test_pred_parts = []
     with torch.no_grad():
         for start in range(0, N_test, BATCH_SIZE):
             end = min(start + BATCH_SIZE, N_test)
             b_idx = list(range(start, end))
             x_batch, m_batch = _pad_batch(test_X_list, b_idx, device)
             logits = probes(x_batch, m_batch)  # [B, P, C]
-            all_preds.append(logits.argmax(dim=-1).cpu().numpy())
-    test_preds = np.concatenate(all_preds, axis=0)  # [N_test, P]
+            test_pred_parts.append(logits.argmax(dim=-1).cpu().numpy())
+    test_preds = np.concatenate(test_pred_parts, axis=0)  # [N_test, P]
 
-    f1_list = []
+    train_pred_parts = []
+    with torch.no_grad():
+        for start in range(0, N_train, BATCH_SIZE):
+            end = min(start + BATCH_SIZE, N_train)
+            b_idx = list(range(start, end))
+            x_batch, m_batch = _pad_batch(train_X_list, b_idx, device)
+            logits = probes(x_batch, m_batch)
+            train_pred_parts.append(logits.argmax(dim=-1).cpu().numpy())
+    train_preds = np.concatenate(train_pred_parts, axis=0)  # [N_train, P]
+
+    # Test metrics
+    test_f1_list = []
+    test_acc_list = []
     for p in range(n_probes):
-        f1_list.append(_compute_f1(test_y_np, test_preds[:, p]))
+        test_f1_list.append(_compute_f1(test_y_np, test_preds[:, p]))
+        test_acc_list.append(float((test_y_np == test_preds[:, p]).mean()))
 
-    return f1_list
+    # Train metrics (each probe on its own subset)
+    membership_np = membership.cpu().numpy()
+    train_y_np = train_y
+    train_f1_list = []
+    train_acc_list = []
+    for p in range(n_probes):
+        member_idx = membership_np[p]
+        y_sub = train_y_np[member_idx]
+        pred_sub = train_preds[member_idx, p]
+        train_f1_list.append(_compute_f1(y_sub, pred_sub))
+        train_acc_list.append(float((y_sub == pred_sub).mean()))
+
+    return test_f1_list, train_f1_list, test_acc_list, train_acc_list
 
 
 def train_test_split_by_anecdote(X_list, y, anecdote_ids, metadata,
@@ -447,7 +472,7 @@ def main():
     print(f"\nTraining {n_probes} probes simultaneously on {device} "
           f"({N_REPEATS} repeats × {len(DATA_FRACTIONS)} fractions, "
           f"max_seq_len={max_seq_len})...")
-    f1_all = train_all_probes_batched(
+    test_f1_all, train_f1_all, test_acc_all, train_acc_all = train_all_probes_batched(
         full_train_X, full_train_y,
         test_X, test_y,
         DATA_FRACTIONS, N_REPEATS, SEED,
@@ -456,18 +481,29 @@ def main():
 
     # ── Reshape results ───────────────────────────────────────────────
     sizes = []
-    mean_f1s = []
-    std_f1s = []
+    mean_f1s, std_f1s = [], []
+    mean_train_f1s, std_train_f1s = [], []
+    mean_test_accs, std_test_accs = [], []
+    mean_train_accs, std_train_accs = [], []
 
     for i, frac in enumerate(DATA_FRACTIONS):
         n_subset = max(2, int(n_train * frac))
-        f1_scores = f1_all[i * N_REPEATS : (i + 1) * N_REPEATS]
-        mean_f1 = float(np.mean(f1_scores))
-        std_f1 = float(np.std(f1_scores))
+        sl = slice(i * N_REPEATS, (i + 1) * N_REPEATS)
+
         sizes.append(n_subset)
-        mean_f1s.append(mean_f1)
-        std_f1s.append(std_f1)
-        print(f"  {frac*100:5.1f}% ({n_subset:4d} samples): F1 = {mean_f1:.3f} ± {std_f1:.3f}")
+        mean_f1s.append(float(np.mean(test_f1_all[sl])))
+        std_f1s.append(float(np.std(test_f1_all[sl])))
+        mean_train_f1s.append(float(np.mean(train_f1_all[sl])))
+        std_train_f1s.append(float(np.std(train_f1_all[sl])))
+        mean_test_accs.append(float(np.mean(test_acc_all[sl])))
+        std_test_accs.append(float(np.std(test_acc_all[sl])))
+        mean_train_accs.append(float(np.mean(train_acc_all[sl])))
+        std_train_accs.append(float(np.std(train_acc_all[sl])))
+
+        print(f"  {frac*100:5.1f}% ({n_subset:4d} samples): "
+              f"Test F1={mean_f1s[-1]:.3f}±{std_f1s[-1]:.3f}  "
+              f"Train F1={mean_train_f1s[-1]:.3f}±{std_train_f1s[-1]:.3f}  "
+              f"Test Acc={mean_test_accs[-1]:.3f}  Train Acc={mean_train_accs[-1]:.3f}")
 
     # ── Save results ──────────────────────────────────────────────────
     output_dir = DATA_DIR / "data_scaling"
@@ -478,6 +514,12 @@ def main():
         "sizes": sizes,
         "mean_f1": mean_f1s,
         "std_f1": std_f1s,
+        "mean_train_f1": mean_train_f1s,
+        "std_train_f1": std_train_f1s,
+        "mean_test_acc": mean_test_accs,
+        "std_test_acc": std_test_accs,
+        "mean_train_acc": mean_train_accs,
+        "std_train_acc": std_train_accs,
         "n_repeats": N_REPEATS,
         "n_train_full": n_train,
         "n_test": len(test_X),
@@ -486,14 +528,47 @@ def main():
         json.dump(results, f, indent=2)
 
     # ── Plot ──────────────────────────────────────────────────────────
-    from src2.utils.plotting import plot_data_scaling
-    plot_data_scaling(
-        sizes=sizes,
-        scores=mean_f1s,
-        metric_name="f1",
-        output_path=output_dir / "scruples_data_scaling.png",
-        title="Sycophancy Probe: Test F1 vs Training Data Size",
-    )
+    import matplotlib.pyplot as plt
+    sizes_arr = np.array(sizes)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # F1 subplot
+    ax = axes[0]
+    tr_f1 = np.array(mean_train_f1s)
+    tr_f1_s = np.array(std_train_f1s)
+    te_f1 = np.array(mean_f1s)
+    te_f1_s = np.array(std_f1s)
+    ax.plot(sizes_arr, tr_f1, "r-o", markersize=5, label="Train F1")
+    ax.fill_between(sizes_arr, tr_f1 - tr_f1_s, tr_f1 + tr_f1_s, color="red", alpha=0.15)
+    ax.plot(sizes_arr, te_f1, "b-o", markersize=5, label="Test F1")
+    ax.fill_between(sizes_arr, te_f1 - te_f1_s, te_f1 + te_f1_s, color="blue", alpha=0.15)
+    ax.set_xlabel("Training set size")
+    ax.set_ylabel("F1")
+    ax.set_title("Sycophancy Probe: F1 vs Training Data Size")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Accuracy subplot
+    ax = axes[1]
+    tr_acc = np.array(mean_train_accs)
+    tr_acc_s = np.array(std_train_accs)
+    te_acc = np.array(mean_test_accs)
+    te_acc_s = np.array(std_test_accs)
+    ax.plot(sizes_arr, tr_acc, "r-o", markersize=5, label="Train Accuracy")
+    ax.fill_between(sizes_arr, tr_acc - tr_acc_s, tr_acc + tr_acc_s, color="red", alpha=0.15)
+    ax.plot(sizes_arr, te_acc, "b-o", markersize=5, label="Test Accuracy")
+    ax.fill_between(sizes_arr, te_acc - te_acc_s, te_acc + te_acc_s, color="blue", alpha=0.15)
+    ax.set_xlabel("Training set size")
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Sycophancy Probe: Accuracy vs Training Data Size")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(output_dir / "scruples_data_scaling.png", dpi=150)
+    plt.close(fig)
+    print(f"  Plot saved to {output_dir / 'scruples_data_scaling.png'}")
 
     print(f"\nResults saved to {output_dir}")
 
