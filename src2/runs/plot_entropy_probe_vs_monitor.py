@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Horizontal bar chart: R² for predicting forced answer entropy.
+Horizontal bar charts: R² and MSE for predicting forced answer entropy.
 
 Usage:
     python -m src2.runs.plot_entropy_probe_vs_monitor
@@ -39,52 +39,60 @@ def main():
     # ── Data (ordered worst → best, bottom → top) ────────────────────
     methods = []
     r2_vals = []
-    r_vals = []
+    mse_vals = []
     colors = []
 
     if has_logit_lens:
         methods.append("Logit Lens (layer 32)")
         r2_vals.append(logit_lens_eval["r2"])
-        r_vals.append(logit_lens_eval["pearson_r"])
+        mse_vals.append(logit_lens_eval["mse"])
         colors.append("#bdbdbd")
 
     methods += ["Predict Mean", "LLM Monitor (GPT-5.2)", "Entropy Probe (layer 32)"]
     r2_vals += [0.0, monitor_eval["r2"], probe_eval["r2"]]
-    r_vals += [0.0, monitor_eval["pearson_r"], probe_eval["pearson_r"]]
+    mse_vals += [probe_eval["baseline_mse"], monitor_eval["mse"], probe_eval["mse"]]
     colors += ["#e0e0e0", "#78909c", "#5c6bc0"]
 
-    # ── Figure ────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(7, 2.8))
+    # ── Figure: two panels ────────────────────────────────────────────
+    fig, (ax_r2, ax_mse) = plt.subplots(1, 2, figsize=(11, 2.8), sharey=True)
 
     y = np.arange(len(methods))
-    bars = ax.barh(y, r2_vals, height=0.55, color=colors, edgecolor="white", linewidth=0.8)
+    bar_h = 0.55
 
-    # Labels on bars
-    for bar, r2, r in zip(bars, r2_vals, r_vals):
-        w = bar.get_width()
-        if r2 < 0:
-            # Negative bars: label to the right of zero
-            ax.text(0.02, bar.get_y() + bar.get_height() / 2,
-                    f"R² = {r2:.2f}   r = {r:.2f}",
-                    ha="left", va="center", fontsize=9, color="#666")
-        else:
-            ax.text(max(w, 0) + 0.02, bar.get_y() + bar.get_height() / 2,
-                    f"R² = {r2:.2f}   r = {r:.2f}",
-                    ha="left", va="center", fontsize=9,
+    # ── Left panel: R² (higher is better) ─────────────────────────────
+    bars_r2 = ax_r2.barh(y, r2_vals, height=bar_h, color=colors,
+                         edgecolor="white", linewidth=0.8)
+    for bar, r2 in zip(bars_r2, r2_vals):
+        x_pos = max(bar.get_width(), 0) + 0.02 if r2 >= 0 else 0.02
+        ax_r2.text(x_pos, bar.get_y() + bar.get_height() / 2,
+                   f"{r2:.2f}", ha="left", va="center", fontsize=9.5,
+                   color="#666" if r2 < 0 else "#333", fontweight="medium")
+
+    ax_r2.set_yticks(y)
+    ax_r2.set_yticklabels(methods, fontsize=10)
+    ax_r2.set_xlabel("R²  (higher is better)", fontsize=10)
+    ax_r2.axvline(x=0, color="#333", linewidth=0.6)
+    ax_r2.set_xlim(min(min(r2_vals) - 0.12, -0.12), max(r2_vals) + 0.18)
+    ax_r2.spines["top"].set_visible(False)
+    ax_r2.spines["right"].set_visible(False)
+    ax_r2.tick_params(left=False)
+
+    # ── Right panel: MSE (lower is better) ────────────────────────────
+    bars_mse = ax_mse.barh(y, mse_vals, height=bar_h, color=colors,
+                           edgecolor="white", linewidth=0.8)
+    for bar, mse in zip(bars_mse, mse_vals):
+        ax_mse.text(bar.get_width() + 0.008, bar.get_y() + bar.get_height() / 2,
+                    f"{mse:.3f}", ha="left", va="center", fontsize=9.5,
                     color="#333", fontweight="medium")
 
-    ax.set_yticks(y)
-    ax.set_yticklabels(methods, fontsize=10)
-    ax.set_xlabel("R²  (higher is better)", fontsize=10)
-    ax.axvline(x=0, color="#333", linewidth=0.6)
-    ax.set_xlim(min(min(r2_vals) - 0.15, -0.15), max(r2_vals) + 0.28)
-    ax.set_title("Predicting Forced Answer Entropy (eval set, 12 held-out questions)",
-                 fontsize=11, pad=10)
+    ax_mse.set_xlabel("MSE  (lower is better)", fontsize=10)
+    ax_mse.set_xlim(0, max(mse_vals) + 0.09)
+    ax_mse.spines["top"].set_visible(False)
+    ax_mse.spines["right"].set_visible(False)
+    ax_mse.tick_params(left=False)
 
-    # Clean up
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.tick_params(left=False)
+    fig.suptitle("Predicting Forced Answer Entropy (eval set, 12 held-out questions)",
+                 fontsize=11, y=1.02)
 
     plt.tight_layout()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src2.data_slice import DataSlice
 from src2.tasks.forced_response.task import ForcingTask
@@ -63,100 +64,174 @@ N_REPEATS = 3
 # ── Training helper ──────────────────────────────────────────────────
 
 
-def _eval_r2(probe, X_list, y, device, batch_size=64):
-    """Compute R² on a dataset."""
-    probe.eval()
+def precompute_pooled_features(X_list, device, batch_size=128):
+    """Mean-pool variable-length sequences into a dense [N, D] tensor on GPU.
+
+    This is the key optimisation: mean-pooling has no learnable parameters, so
+    we do the expensive pad-and-transfer step exactly once for the entire
+    dataset instead of once per batch per epoch per probe.
+    """
     hidden_dim = X_list[0].shape[1]
-    all_preds = []
+    N = len(X_list)
+    pooled = torch.zeros(N, hidden_dim, device=device)
 
-    for start in range(0, len(X_list), batch_size):
-        end = min(start + batch_size, len(X_list))
-        batch_X = X_list[start:end]
-        batch_max_len = max(x.shape[0] for x in batch_X)
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        batch = X_list[start:end]
+        max_len = max(x.shape[0] for x in batch)
 
-        X_pad = torch.zeros(len(batch_X), batch_max_len, hidden_dim, device=device)
-        mask = torch.zeros(len(batch_X), batch_max_len, dtype=torch.bool, device=device)
-        for i, x in enumerate(batch_X):
+        X_pad = torch.zeros(len(batch), max_len, hidden_dim, device=device)
+        mask = torch.zeros(len(batch), max_len, dtype=torch.bool, device=device)
+        for i, x in enumerate(batch):
             sl = x.shape[0]
-            X_pad[i, :sl, :] = torch.from_numpy(x).to(device)
+            X_pad[i, :sl] = torch.from_numpy(x).to(device)
             mask[i, :sl] = True
 
-        with torch.no_grad():
-            pred = probe(X_pad, mask)
-        all_preds.append(pred.cpu().numpy())
+        lengths = mask.sum(dim=1, keepdim=True).float().clamp(min=1)
+        pooled[start:end] = (X_pad * mask.unsqueeze(-1).float()).sum(dim=1) / lengths
 
-    preds = np.concatenate(all_preds)
-    ss_res = np.sum((y - preds) ** 2)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    return float(1 - ss_res / max(ss_tot, 1e-8))
+    return pooled
 
 
-def train_and_get_r2(train_X, train_y, test_X, test_y):
-    """Train entropy probe on given data and return test R²."""
-    import copy
+def train_all_probes_batched(train_pooled, train_y, test_pooled, test_y,
+                              data_fractions, n_repeats, seed):
+    """Train all data-scaling probes *simultaneously*.
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    hidden_dim = train_X[0].shape[1]
-    n_samples = len(train_X)
+    All probes are stacked into a single weight matrix [n_probes, D] so each
+    training step is one batched matmul. A boolean membership mask assigns
+    different data subsets to different probes, and per-probe early stopping
+    freezes converged probes while the rest keep training.
+    """
+    device = train_pooled.device
+    D = train_pooled.shape[1]
+    N_train = train_pooled.shape[0]
+    n_probes = len(data_fractions) * n_repeats
 
-    probe = MeanPoolLinearProbe(input_dim=hidden_dim, dropout=DROPOUT).to(device)
-    optimizer = torch.optim.AdamW(probe.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
-    loss_fn = nn.MSELoss()
+    # Targets as GPU tensors
+    train_y_t = (torch.from_numpy(train_y).float().to(device)
+                 if isinstance(train_y, np.ndarray) else train_y.float().to(device))
+    test_y_np = test_y if isinstance(test_y, np.ndarray) else test_y.cpu().numpy()
 
-    best_val_loss = float("inf")
-    best_state = None
-    no_improve = 0
+    # ── Build membership masks: [n_probes, N_train] ──────────────────
+    membership = torch.zeros(n_probes, N_train, dtype=torch.bool, device=device)
+    probe_idx = 0
+    for frac in data_fractions:
+        n_subset = max(5, int(N_train * frac))
+        for rep in range(n_repeats):
+            rng = np.random.default_rng(seed + rep)
+            indices = rng.choice(N_train, n_subset, replace=False)
+            membership[probe_idx, indices] = True
+            probe_idx += 1
+
+    # ── Initialise all probes as a single weight matrix ──────────────
+    W = nn.Parameter(torch.empty(n_probes, D, device=device))
+    b = nn.Parameter(torch.zeros(n_probes, device=device))
+    # Match nn.Linear default init (kaiming_uniform with a=sqrt(5))
+    nn.init.kaiming_uniform_(W, a=5 ** 0.5)
+
+    optimizer = torch.optim.AdamW([W, b], lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS, eta_min=1e-6,
+    )
+
+    # Per-probe early stopping state
+    best_loss = torch.full((n_probes,), float("inf"))
+    best_W = W.data.clone()
+    best_b = b.data.clone()
+    no_improve = torch.zeros(n_probes, dtype=torch.long)
+    active = torch.ones(n_probes, dtype=torch.bool)        # CPU
+    active_dev = active.to(device)
 
     for epoch in range(EPOCHS):
-        probe.train()
-        perm = np.random.permutation(n_samples)
-        epoch_loss = 0.0
-        n_batches = 0
+        perm = torch.randperm(N_train, device=device)
+        epoch_loss_sum = torch.zeros(n_probes, device=device)
+        epoch_count = torch.zeros(n_probes, device=device)
 
-        for start in range(0, n_samples, BATCH_SIZE):
-            end = min(start + BATCH_SIZE, n_samples)
-            batch_idx = perm[start:end]
-            batch_X = [train_X[i] for i in batch_idx]
-            batch_y = train_y[batch_idx]
-            batch_max_len = max(x.shape[0] for x in batch_X)
+        for start in range(0, N_train, BATCH_SIZE):
+            end = min(start + BATCH_SIZE, N_train)
+            idx = perm[start:end]
 
-            X_pad = torch.zeros(len(batch_X), batch_max_len, hidden_dim, device=device)
-            mask = torch.zeros(len(batch_X), batch_max_len, dtype=torch.bool, device=device)
-            for i, x in enumerate(batch_X):
-                sl = x.shape[0]
-                X_pad[i, :sl, :] = torch.from_numpy(x).to(device)
-                mask[i, :sl] = True
-            y_t = torch.from_numpy(batch_y).float().to(device)
+            x_batch = train_pooled[idx]             # [B, D]
+            y_batch = train_y_t[idx]                # [B]
+
+            # Dropout (shared mask across probes – fine for linear probes)
+            x_drop = F.dropout(x_batch, p=DROPOUT, training=True)
+
+            # Forward: [B, D] @ [D, n_probes] + [n_probes] → [B, n_probes]
+            preds = x_drop @ W.T + b
+
+            # Per-element squared error
+            sq_err = (preds - y_batch.unsqueeze(1)) ** 2   # [B, n_probes]
+
+            # Membership + active mask
+            batch_member = membership[:, idx].T.float()     # [B, n_probes]
+            batch_mask = batch_member * active_dev.unsqueeze(0).float()
+
+            counts = batch_mask.sum(dim=0).clamp(min=1)
+            per_probe_loss = (sq_err * batch_mask).sum(dim=0) / counts
+            loss = per_probe_loss.sum()
 
             optimizer.zero_grad()
-            pred = probe(X_pad, mask)
-            loss = loss_fn(pred, y_t)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(probe.parameters(), GRAD_CLIP)
+
+            # Zero grads for frozen probes (prevent weight-decay drift)
+            with torch.no_grad():
+                inactive = ~active_dev
+                if inactive.any():
+                    W.grad[inactive] = 0
+                    b.grad[inactive] = 0
+
+            torch.nn.utils.clip_grad_norm_([W, b], GRAD_CLIP)
             optimizer.step()
 
-            epoch_loss += loss.item()
-            n_batches += 1
+            # Restore frozen probes (counteract any residual optimizer state)
+            with torch.no_grad():
+                if inactive.any():
+                    W.data[inactive] = best_W[inactive].to(device)
+                    b.data[inactive] = best_b[inactive].to(device)
+
+            # Accumulate epoch loss for early stopping
+            with torch.no_grad():
+                epoch_loss_sum += (sq_err.detach() * batch_member).sum(dim=0)
+                epoch_count += batch_member.sum(dim=0)
 
         scheduler.step()
 
-        # Simple early stopping on training loss (no separate val split here)
-        avg_loss = epoch_loss / max(n_batches, 1)
-        if avg_loss < best_val_loss - MIN_DELTA:
-            best_val_loss = avg_loss
-            best_state = copy.deepcopy(probe.state_dict())
-            no_improve = 0
-        else:
-            no_improve += 1
+        # ── Per-probe early stopping ──────────────────────────────────
+        avg_loss = (epoch_loss_sum / epoch_count.clamp(min=1)).cpu()
+        for j in range(n_probes):
+            if not active[j]:
+                continue
+            if avg_loss[j].item() < best_loss[j].item() - MIN_DELTA:
+                best_loss[j] = avg_loss[j]
+                best_W[j] = W.data[j].clone()
+                best_b[j] = b.data[j].clone()
+                no_improve[j] = 0
+            else:
+                no_improve[j] += 1
+            if no_improve[j] >= PATIENCE:
+                active[j] = False
+                W.data[j] = best_W[j].to(device)
+                b.data[j] = best_b[j].to(device)
 
-        if no_improve >= PATIENCE:
+        active_dev = active.to(device)
+        if not active.any():
             break
 
-    if best_state is not None:
-        probe.load_state_dict(best_state)
+    # ── Restore all best weights & evaluate ──────────────────────────
+    W.data.copy_(best_W.to(device))
+    b.data.copy_(best_b.to(device))
 
-    return _eval_r2(probe, test_X, test_y, device)
+    with torch.no_grad():
+        test_preds = (test_pooled @ W.T + b).cpu().numpy()  # [N_test, n_probes]
+
+    ss_tot = np.sum((test_y_np - test_y_np.mean()) ** 2)
+    r2_list = []
+    for j in range(n_probes):
+        ss_res = np.sum((test_y_np - test_preds[:, j]) ** 2)
+        r2_list.append(float(1 - ss_res / max(ss_tot, 1e-8)))
+
+    return r2_list
 
 
 def main():
@@ -224,25 +299,29 @@ def main():
     test_y = eval_data["y_entropy"]
     n_train = len(full_train_X)
 
-    # ── Data scaling ──────────────────────────────────────────────────
-    print(f"\nRunning data scaling analysis ({N_REPEATS} repeats per fraction)...")
+    # ── Pre-compute mean-pooled features (once) ──────────────────────
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nPre-computing pooled features on {device}...")
+    train_pooled = precompute_pooled_features(full_train_X, device)
+    test_pooled = precompute_pooled_features(test_X, device)
+    print(f"  Train: {train_pooled.shape}, Test: {test_pooled.shape}")
+
+    # ── Train all probes simultaneously ──────────────────────────────
+    n_probes = len(DATA_FRACTIONS) * N_REPEATS
+    print(f"\nTraining {n_probes} probes simultaneously ({N_REPEATS} repeats × {len(DATA_FRACTIONS)} fractions)...")
+    r2_all = train_all_probes_batched(
+        train_pooled, full_train_y, test_pooled, test_y,
+        DATA_FRACTIONS, N_REPEATS, SEED,
+    )
+
+    # ── Reshape results ──────────────────────────────────────────────
     sizes = []
     mean_r2s = []
     std_r2s = []
 
-    for frac in DATA_FRACTIONS:
+    for i, frac in enumerate(DATA_FRACTIONS):
         n_subset = max(5, int(n_train * frac))
-        r2_scores = []
-
-        for rep in range(N_REPEATS):
-            rng = np.random.default_rng(SEED + rep)
-            indices = rng.choice(n_train, n_subset, replace=False)
-            sub_X = [full_train_X[i] for i in indices]
-            sub_y = full_train_y[indices]
-
-            r2 = train_and_get_r2(sub_X, sub_y, test_X, test_y)
-            r2_scores.append(r2)
-
+        r2_scores = r2_all[i * N_REPEATS : (i + 1) * N_REPEATS]
         mean_r2 = float(np.mean(r2_scores))
         std_r2 = float(np.std(r2_scores))
         sizes.append(n_subset)
