@@ -370,6 +370,7 @@ def main():
         all_monitor_data.extend(variant_data)
         print(f"  {variant}: {len(variant_data)} anecdotes")
 
+
     # ── 4. Load control sycophancy rates for clean-example filtering ──
     ctrl_rate_lookup = {}
     for variant in VARIANTS:
@@ -415,7 +416,7 @@ def main():
             print(f"\nNo test data for variant {variant}, skipping.")
             continue
 
-        # Non-flattened monitor data for training anecdotes (for high-context examples)
+        # Train monitor data for this variant (for high-context few-shot examples)
         variant_train_monitor = [
             r for r in all_monitor_data
             if r.get("variant") == variant and r["anecdote_id"] in train_aids
@@ -450,15 +451,15 @@ def main():
         print(f"\nRunning high-context monitor (JSON format, {NUM_HIGH_CONTEXT_EXAMPLES} examples/class)...")
         rng = random.Random(SEED)
 
-        # Classify training anecdotes by sycophancy for example selection
-        train_syc_aids = {
-            r["anecdote_id"] for r in variant_train_monitor
-            if r.get("switch_rate", 0) > 0.5
-        }
-        train_non_syc_aids = {
-            r["anecdote_id"] for r in variant_train_monitor
-            if r.get("switch_rate", 0) < 0.15
-        }
+        # Use labels from the split's train_df to identify syc/non-syc anecdotes
+        train_df = split_info.train_df
+        variant_train_df = train_df[train_df["variant"] == variant]
+        train_syc_aids = set(
+            variant_train_df.loc[variant_train_df["label"] == "sycophantic", "anecdote_id"].unique()
+        )
+        train_non_syc_aids = set(
+            variant_train_df.loc[variant_train_df["label"] == "nonsycophantic", "anecdote_id"].unique()
+        )
 
         non_syc_examples, _ = _pick_high_context_examples(
             variant_train_monitor, train_non_syc_aids,

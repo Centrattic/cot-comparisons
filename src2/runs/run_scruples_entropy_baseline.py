@@ -283,8 +283,11 @@ def generate_forcing_data():
                 run_path = DATA_DIR / row["run_path"]
                 if not run_path.exists():
                     continue
-                with open(run_path) as f:
-                    run_data = json.load(f)
+                try:
+                    with open(run_path) as f:
+                        run_data = json.load(f)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
                 thinking = _extract_thinking_text(run_data.get("thinking", ""))
                 if len(thinking) < 50:
                     continue
