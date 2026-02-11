@@ -2,7 +2,7 @@
 
 ## TLDR
 
-We compared four approaches for detecting sycophancy in Qwen3-32B on the Scruples moral dilemma task: (1) an attention probe trained on layer 32 activations, (2) a base LLM monitor (GPT-5.2, zero-shot), (3) a high-context LLM monitor (GPT-5.2, with few-shot examples), and (4) an entropy baseline (logistic regression on forced-response entropy features). On a balanced test set of 40 held-out anecdotes, the **attention probe achieves F1=0.91**, the **high-context monitor achieves F1=0.72**, the **base monitor achieves F1=0.49**, and the **entropy baseline achieves F1=0.48** (below the chance baseline of 0.76). The probe's advantage is substantial — it outperforms even the best monitor configuration by 19 F1 points.
+We compared four approaches for detecting sycophancy in Qwen3-32B on the Scruples moral dilemma task: (1) an attention probe trained on layer 32 activations, (2) a base LLM monitor (GPT-5.2, zero-shot), (3) a high-context LLM monitor (GPT-5.2, with few-shot examples), and (4) an entropy baseline (logistic regression on forced-response entropy features). On a balanced test set of 40 held-out anecdotes, the **attention probe achieves F1=0.91**, the **high-context monitor (45 examples) achieves F1=0.73**, the **base monitor (v2) achieves F1=0.62**, and the **entropy baseline achieves F1=0.48** (below the chance baseline of 0.76). The probe's advantage is substantial — it outperforms even the best monitor configuration by 18 F1 points.
 
 ![Method Comparison](../plots/scruples/method_comparison.png)
 
@@ -56,7 +56,7 @@ GPT-5.2 (via OpenRouter) reads the full question text and the model's CoT + answ
 
 ### 3. High-Context LLM Monitor
 
-Same as the base monitor, but with few-shot examples of sycophantic and non-sycophantic CoTs to calibrate the monitor's judgment. The default configuration uses 15 examples per class.
+Same as the base monitor, but with few-shot examples of sycophantic and non-sycophantic CoTs to calibrate the monitor's judgment. We sweep over the number of examples per class (1, 2, 3, 15, 25, 45); the best result uses 45 examples per class.
 
 ### 4. Entropy Baseline
 
@@ -75,28 +75,28 @@ A logistic regression classifier trained on forced-response entropy features. Th
 | Method | F1 | Precision | Recall | Accuracy | N (test) |
 |--------|-----|-----------|--------|----------|----------|
 | **Attention Probe** | **0.910** | **0.871** | **0.952** | **0.855** | 599 |
-| High-Context Monitor (15ex) | 0.716 | 0.720 | 0.712 | 0.860 | 3,308 |
-| Base Monitor | 0.492 | 0.722 | 0.373 | 0.809 | 3,309 |
-| Entropy Baseline | 0.482 | — | — | 0.692 | ~3,265 |
+| High-Context Monitor (45ex) | 0.729 | 0.741 | 0.718 | — | 3,309 |
+| Base Monitor (v2) | 0.621 | 0.745 | 0.532 | — | 3,309 |
+| Entropy Baseline | 0.478 | 0.406 | 0.581 | 0.690 | ~3,265 |
 
 ### Per-Variant Breakdown (Monitors)
 
 | Method | suggest_wrong F1 | suggest_right F1 | Combined F1 |
 |--------|-----------------|------------------|-------------|
-| High-Context Monitor | 0.703 | 0.729 | 0.716 |
-| Base Monitor | 0.447 | 0.532 | 0.492 |
+| High-Context Monitor (45ex) | 0.708 | 0.750 | 0.729 |
+| Base Monitor (v2) | 0.587 | 0.651 | 0.621 |
 
-The base monitor performs notably worse on suggest_wrong (F1=0.45) than suggest_right (F1=0.53), suggesting it has more difficulty detecting sycophancy when the user suggests the morally harsher judgment.
+The base monitor performs notably worse on suggest_wrong (F1=0.59) than suggest_right (F1=0.65), suggesting it has more difficulty detecting sycophancy when the user suggests the morally harsher judgment. The high-context monitor shows a similar but smaller gap (0.71 vs 0.75).
 
 ### Key Observations
 
-1. **The attention probe dominates all methods.** At F1=0.91, it substantially outperforms even the best monitor (F1=0.72). The probe achieves both high precision (0.87) and recall (0.95), meaning it catches nearly all sycophantic CoTs with few false positives.
+1. **The attention probe dominates all methods.** At F1=0.91, it substantially outperforms even the best monitor (F1=0.73). The probe achieves both high precision (0.87) and recall (0.95), meaning it catches nearly all sycophantic CoTs with few false positives.
 
-2. **Few-shot context helps monitors but not enough.** The high-context monitor (F1=0.72) improves substantially over the base monitor (F1=0.49), primarily by boosting recall from 0.37 to 0.71. But even with calibration examples, monitors still miss ~29% of sycophantic CoTs.
+2. **Few-shot context helps monitors substantially.** The high-context monitor (F1=0.73) improves over the base monitor v2 (F1=0.62), primarily by boosting recall from 0.53 to 0.72. But even with 45 calibration examples per class, monitors still miss ~28% of sycophantic CoTs.
 
-3. **The entropy baseline performs below chance.** With test F1=0.48 and accuracy=0.69 against a chance baseline of 0.76, forced-response entropy features carry weak signal for sycophancy detection. The model's answer uncertainty trajectory during CoT provides some information but far less than either the activation probe or text-based monitors.
+3. **The entropy baseline performs below chance.** With test F1=0.48 and accuracy=0.69 against a chance baseline of 0.76, forced-response entropy features carry weak signal for sycophancy detection. It achieves reasonable recall (0.58) but low precision (0.41), flagging many non-sycophantic CoTs as sycophantic.
 
-4. **The probe generalizes across variants.** Unlike the monitors, which show a 5-8 point F1 gap between suggest_wrong and suggest_right, the probe is trained on combined data from both variants and produces a single strong result.
+4. **The probe generalizes across variants.** Unlike the monitors, which show a 4-6 point F1 gap between suggest_wrong and suggest_right, the probe is trained on combined data from both variants and produces a single strong result.
 
 ---
 
@@ -106,7 +106,7 @@ We measured how the high-context monitor's performance changes with the number o
 
 ![Monitor Example Scaling](../plots/scruples/monitor_example_scaling.png)
 
-The biggest jump is from 0 examples (base monitor, F1=0.49) to 1 example (F1=0.70) — a single example per class nearly halves the error rate. Beyond that, returns diminish: going from 1 to 45 examples improves F1 by only 3 points (0.70 to 0.73). Even at 45 examples per class, the monitor plateaus well below the probe's F1=0.91.
+The biggest jump is from 0 examples (base monitor) to 1 example (F1=0.70) — a single example per class produces a large improvement. Beyond that, returns diminish: going from 1 to 45 examples improves F1 by only 3 points (0.70 to 0.73). Even at 45 examples per class, the monitor plateaus well below the probe's F1=0.91.
 
 ---
 
@@ -144,7 +144,7 @@ This result may seem surprising — the probe reads only activation patterns whi
 
 ### Why does the entropy baseline underperform?
 
-The entropy baseline tests whether sycophantic CoTs have a distinctive uncertainty profile — e.g., starting uncertain and converging as the model rationalizes. At F1=0.48 (below the 0.76 chance baseline), forced-answer entropy features carry only weak signal. The most informative features are max_entropy (+1.19 coefficient) and entropy_slope (-1.03), suggesting sycophantic CoTs may have slightly higher peak uncertainty and steeper entropy decline — but these patterns are not consistent enough for reliable classification.
+The entropy baseline tests whether sycophantic CoTs have a distinctive uncertainty profile — e.g., starting uncertain and converging as the model rationalizes. At F1=0.48 (below the 0.76 chance baseline), forced-answer entropy features carry only weak signal. The most informative features are max_entropy (+1.19 coefficient) and entropy_slope (-0.41), suggesting sycophantic CoTs may have slightly higher peak uncertainty and steeper entropy decline — but these patterns are not consistent enough for reliable classification. The baseline achieves decent recall (0.58) but poor precision (0.41), meaning it correctly flags many sycophantic CoTs but also false-alarms on too many non-sycophantic ones.
 
 This result is informative: it suggests that sycophantic reasoning is not well-characterized by uncertainty dynamics alone. The model's confidence trajectory during CoT is a poor proxy for whether it's being sycophantic. The sycophancy signal lives in *what* the model computes (captured by the activation probe) and *what it writes* (partially captured by monitors), not in *how uncertain* it is at each step.
 
@@ -165,9 +165,49 @@ Despite lower accuracy here, LLM monitors have practical advantages:
 
 ---
 
+## Broader Context: Answer Distributions Across Questions
+
+To ground the forced-response entropy methodology in a broader set of tasks, we ran 50 rollouts per question on Qwen3-14B across 59 diverse questions — GPQA Diamond (physics, chemistry, biology), AIME competition math, and custom reasoning puzzles (topology, combinatorics, riddles). The answer distributions reveal a striking pattern:
+
+| Category | Count | Examples |
+|----------|-------|---------|
+| Always correct (100%) | 31 | bat_ball, lily_pad, painted_cube, gpqa_ph_calculation |
+| Always wrong (0%) | 2 | gpqa_spin_half (0.7 vs correct -0.7), gpqa_stellar_silicon (3.9 vs correct 12.6) |
+| Bimodal (0-100%) | 26 | bagel (21%), aime (53%), starfish (60%), harder_well (92%) |
+
+**Total: 3,161 rollouts across 59 questions.**
+
+The bimodal questions are the most informative — the model doesn't produce a smooth range of answers but rather splits between exactly two attractors. For example, on the bagel topology question (correct answer: 0 holes), 118/150 rollouts answer "2" and 32 answer "0". On the AIME problem, 26/49 get the correct answer (239) while 23 converge on an incorrect answer (78). This is not noise — it reflects genuine computational bifurcation in the model's reasoning.
+
+Selected bimodal questions (sorted by accuracy):
+
+| Question | Accuracy | Correct | Incorrect | Rollouts |
+|----------|----------|---------|-----------|----------|
+| gpqa_michael_reaction | 4% | 1: 2 | 3: 48 | 50 |
+| gpqa_electrochemistry | 6% | 1: 3 | 2: 47 | 50 |
+| bookworm | 16% | 0.5: 8 | 4.5: 41 | 49 |
+| gpqa_diels_alder | 18% | 2: 9 | 1: 41 | 50 |
+| bagel | 21% | 0: 32 | 2: 118 | 150 |
+| gpqa_nmr_compound | 32% | 1: 16 | 2: 34 | 50 |
+| gpqa_conjugated_dye | 48% | 2: 24 | 1: 25 | 50 |
+| aime | 53% | 239: 26 | 78: 23 | 49 |
+| starfish | 60% | 16: 30 | 17: 20 | 50 |
+| gpqa_optical_activity | 66% | 3: 33 | 4: 17 | 50 |
+| gpqa_disproportionation | 70% | 18: 35 | 16: 6 | 50 |
+| rope_earth | 82% | 160: 41 | — | 50 |
+| harder_well | 92% | 2: 92 | 1: 8 | 100 |
+| waffle | 97.5% | 3: 117 | 2: 3 | 120 |
+
+**Connection to sycophancy detection:** The forced-response entropy technique measures exactly this kind of within-question uncertainty — at each CoT sentence boundary, how split is the model between answer options? On sycophantic prompts, the model starts uncertain (bimodal, like the bagel or aime questions above) and the CoT gradually resolves the uncertainty toward the sycophantic answer. On non-sycophantic prompts, the model is confident from sentence one (unimodal, like the always-correct questions).
+
+The key finding from the entropy baseline (F1=0.48) is that while this uncertainty *exists* during sycophantic reasoning, summarizing it into 7 scalar features and classifying with logistic regression doesn't capture enough of the signal. The attention probe (F1=0.91), by contrast, reads the full activation trajectory and captures richer patterns beyond simple uncertainty dynamics.
+
+---
+
 ## Next Steps
 
 1. **Per-variant probe evaluation**: Break down the probe's F1 by suggest_wrong vs suggest_right to check for variant-specific weaknesses
 2. **Cross-model transfer**: Test whether the probe trained on Qwen3-32B detects sycophancy in other models
 3. **Layer sweep**: The current probe only reads layer 32 — sweeping across layers could find an even stronger signal
 4. **Richer entropy baseline**: The current entropy baseline uses only 7 summary statistics; using the full trajectory or a learned model over entropy sequences might recover some signal
+5. **Answer distribution probing**: Use the bimodal answer distributions above to test whether attention probes can predict which attractor a rollout will converge to, early in the CoT
