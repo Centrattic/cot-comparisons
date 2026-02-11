@@ -25,7 +25,7 @@ from src2.tasks.scruples.prompts import INTERVENTION_SUGGESTED_ANSWER
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "scruples"
 
-SUBJECT_MODEL = "moonshotai/kimi-k2-thinking"
+SUBJECT_MODEL = "Qwen/Qwen3-32B"
 MONITOR_MODEL = "openai/gpt-5.2"
 VARIANTS = ["suggest_wrong", "suggest_right"]
 

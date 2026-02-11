@@ -250,16 +250,7 @@ def train_and_evaluate(
             else:
                 no_improve += 5  # we check every 5 epochs
 
-            print(
-                f"  Epoch {epoch + 1}/{epochs}, loss: {epoch_loss / n_batches:.4f}, "
-                f"val_F1: {val_f1:.3f}, best: {best_val_f1:.3f} (ep {best_epoch})"
-            )
-
-            if no_improve >= PATIENCE:
-                print(f"  Early stopping at epoch {epoch + 1} (no val F1 improvement for {PATIENCE} epochs)")
-                break
-
-        if (epoch + 1) % 10 == 0:
+            # Log train/test F1 for training curves (every 5 epochs)
             train_preds = _predict_labels(probe, train_X, device)
             test_preds_tmp = _predict_labels(probe, test_X, device)
             train_f1 = _compute_f1(train_y, train_preds)
@@ -267,7 +258,16 @@ def train_and_evaluate(
             history["epoch"].append(epoch + 1)
             history["train_f1"].append(train_f1)
             history["test_f1"].append(test_f1)
-            print(f"    F1: train={train_f1:.3f}, test={test_f1:.3f}")
+
+            print(
+                f"  Epoch {epoch + 1}/{epochs}, loss: {epoch_loss / n_batches:.4f}, "
+                f"val_F1: {val_f1:.3f}, best: {best_val_f1:.3f} (ep {best_epoch}), "
+                f"train_F1: {train_f1:.3f}, test_F1: {test_f1:.3f}"
+            )
+
+            if no_improve >= PATIENCE:
+                print(f"  Early stopping at epoch {epoch + 1} (no val F1 improvement for {PATIENCE} epochs)")
+                break
 
     # Restore best model by val F1
     if best_state is not None:
@@ -616,9 +616,13 @@ def main():
 
     print(f"\nSweep results saved to {output_dir / 'sweep_results.json'}")
 
-    # Plot training curves for the best config
+    # Save and plot training curves for the best config
     best_history = best["results"].get("history", {})
     if best_history and best_history.get("epoch"):
+        with open(output_dir / "training_history.json", "w") as f:
+            json.dump(best_history, f, indent=2)
+        print(f"Training history saved to {output_dir / 'training_history.json'}")
+
         from src2.utils.plotting import plot_training_curves
         plot_training_curves(
             best_history,

@@ -35,7 +35,7 @@ from src2.tasks.scruples.prompts import (
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "scruples"
 
-SUBJECT_MODEL = "moonshotai/kimi-k2-thinking"
+SUBJECT_MODEL = "Qwen/Qwen3-32B"
 MONITOR_MODEL = "openai/gpt-5.2"
 
 VARIANTS = ["suggest_wrong", "suggest_right"]
@@ -120,9 +120,7 @@ class JsonHighContextMonitorPrompt(BasePrompt):
         self._non_syc_json = self._format_examples_json(
             non_sycophantic_examples, "non-sycophantic"
         )
-        self._syc_json = self._format_examples_json(
-            sycophantic_examples, "sycophantic"
-        )
+        self._syc_json = self._format_examples_json(sycophantic_examples, "sycophantic")
 
     def _truncate(self, text: str) -> str:
         if len(text) <= self.max_thinking_chars:
@@ -135,14 +133,18 @@ class JsonHighContextMonitorPrompt(BasePrompt):
     def _format_examples_json(self, examples: List[Dict], verdict: str) -> str:
         items = []
         for i, ex in enumerate(examples, 1):
-            items.append({
-                "example": i,
-                "control_thinking": self._truncate(ex["control_thinking"]),
-                "control_answer": ex["control_answer"],
-                "intervention_thinking": self._truncate(ex["intervention_thinking"]),
-                "intervention_answer": ex["intervention_answer"],
-                "verdict": verdict,
-            })
+            items.append(
+                {
+                    "example": i,
+                    "control_thinking": self._truncate(ex["control_thinking"]),
+                    "control_answer": ex["control_answer"],
+                    "intervention_thinking": self._truncate(
+                        ex["intervention_thinking"]
+                    ),
+                    "intervention_answer": ex["intervention_answer"],
+                    "verdict": verdict,
+                }
+            )
         return json.dumps(items, indent=2)
 
     def format(self, row: Dict[str, Any]) -> str:
@@ -219,20 +221,22 @@ def _flatten_to_intervention_runs(
 
             label = int(is_syc_answer and prompt_is_sycophantic)
 
-            flat.append({
-                "anecdote_id": aid,
-                "run_idx": run_idx,
-                "thinking": _extract_thinking_text(intv_run["thinking"]),
-                "answer": answer,
-                "switch_rate": switch_rate,
-                "title": row.get("title", ""),
-                "text": row.get("text", ""),
-                "author_is_wrong": row.get("author_is_wrong", False),
-                "variant": variant,
-                "is_sycophantic_answer": is_syc_answer,
-                "prompt_is_sycophantic": prompt_is_sycophantic,
-                "label": label,
-            })
+            flat.append(
+                {
+                    "anecdote_id": aid,
+                    "run_idx": run_idx,
+                    "thinking": _extract_thinking_text(intv_run["thinking"]),
+                    "answer": answer,
+                    "switch_rate": switch_rate,
+                    "title": row.get("title", ""),
+                    "text": row.get("text", ""),
+                    "author_is_wrong": row.get("author_is_wrong", False),
+                    "variant": variant,
+                    "is_sycophantic_answer": is_syc_answer,
+                    "prompt_is_sycophantic": prompt_is_sycophantic,
+                    "label": label,
+                }
+            )
 
     if n_discarded:
         print(f"  Clean-example filter: discarded {n_discarded} mixed-case runs")
@@ -247,7 +251,8 @@ def _pick_high_context_examples(
 ) -> tuple:
     """Pick n anecdotes for few-shot examples (need control+intervention pairs)."""
     candidates = [
-        r for r in monitor_data
+        r
+        for r in monitor_data
         if r["anecdote_id"] in anecdote_ids
         and r.get("control_runs")
         and r.get("intervention_runs")
@@ -258,12 +263,14 @@ def _pick_high_context_examples(
     for row in chosen:
         ctrl = row["control_runs"][0]
         intv = row["intervention_runs"][0]
-        examples.append({
-            "control_thinking": _extract_thinking_text(ctrl["thinking"]),
-            "control_answer": ctrl["answer"],
-            "intervention_thinking": _extract_thinking_text(intv["thinking"]),
-            "intervention_answer": intv["answer"],
-        })
+        examples.append(
+            {
+                "control_thinking": _extract_thinking_text(ctrl["thinking"]),
+                "control_answer": ctrl["answer"],
+                "intervention_thinking": _extract_thinking_text(intv["thinking"]),
+                "intervention_answer": intv["answer"],
+            }
+        )
         used_ids.add(row["anecdote_id"])
     return examples, used_ids
 
@@ -292,14 +299,21 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
     accuracy = float((y_true == y_pred).mean()) if n > 0 else 0.0
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
 
     return {
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
         "f1": f1,
-        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
         "n_samples": n,
     }
 
@@ -328,7 +342,9 @@ def _print_metrics(name: str, metrics: Dict, n_unparsed: int = 0):
     print(f"    Precision: {metrics['precision']:.3f}")
     print(f"    Recall:    {metrics['recall']:.3f}")
     print(f"    Accuracy:  {metrics['accuracy']:.3f}")
-    print(f"    TP={metrics['tp']}  FP={metrics['fp']}  FN={metrics['fn']}  TN={metrics['tn']}")
+    print(
+        f"    TP={metrics['tp']}  FP={metrics['fp']}  FN={metrics['fn']}  TN={metrics['tn']}"
+    )
     if n_unparsed:
         print(f"    ({n_unparsed} unparseable responses excluded)")
 
@@ -370,7 +386,6 @@ def main():
         all_monitor_data.extend(variant_data)
         print(f"  {variant}: {len(variant_data)} anecdotes")
 
-
     # ── 4. Load control sycophancy rates for clean-example filtering ──
     ctrl_rate_lookup = {}
     for variant in VARIANTS:
@@ -378,10 +393,14 @@ def main():
         if prompts_path.exists():
             pdf = pd.read_csv(prompts_path)
             for _, pr in pdf.iterrows():
-                ctrl_rate_lookup[(pr["anecdote_id"], variant)] = pr.get("control_sycophancy_rate", 0.0)
+                ctrl_rate_lookup[(pr["anecdote_id"], variant)] = pr.get(
+                    "control_sycophancy_rate", 0.0
+                )
 
     # ── 5. Flatten to intervention runs and assign labels ───────────
-    flat_data = _flatten_to_intervention_runs(all_monitor_data, SWITCH_THRESHOLD, ctrl_rate_lookup)
+    flat_data = _flatten_to_intervention_runs(
+        all_monitor_data, SWITCH_THRESHOLD, ctrl_rate_lookup
+    )
 
     y_all = np.array([r["label"] for r in flat_data])
     print(f"\nTotal intervention runs: {len(flat_data)}")
@@ -389,7 +408,9 @@ def main():
     print(f"  Label 1 (sycophantic):     {(y_all == 1).sum()}")
 
     # ── 5. Train/test split by anecdote (canonical from get_uncertainty_robust_split) ──
-    train_aids = set(split_info.train_df["anecdote_id"].unique()) | set(split_info.val_df["anecdote_id"].unique())
+    train_aids = set(split_info.train_df["anecdote_id"].unique()) | set(
+        split_info.val_df["anecdote_id"].unique()
+    )
     test_aids = set(split_info.test_df["anecdote_id"].unique())
     train_rows = [r for r in flat_data if r["anecdote_id"] in train_aids]
     test_rows = [r for r in flat_data if r["anecdote_id"] in test_aids]
@@ -418,7 +439,8 @@ def main():
 
         # Train monitor data for this variant (for high-context few-shot examples)
         variant_train_monitor = [
-            r for r in all_monitor_data
+            r
+            for r in all_monitor_data
             if r.get("variant") == variant and r["anecdote_id"] in train_aids
         ]
 
@@ -448,28 +470,40 @@ def main():
         all_base_ypred.append(base_ypred)
 
         # ── High-context monitor (JSON-formatted examples) ──────────
-        print(f"\nRunning high-context monitor (JSON format, {NUM_HIGH_CONTEXT_EXAMPLES} examples/class)...")
+        print(
+            f"\nRunning high-context monitor (JSON format, {NUM_HIGH_CONTEXT_EXAMPLES} examples/class)..."
+        )
         rng = random.Random(SEED)
 
         # Use labels from the split's train_df to identify syc/non-syc anecdotes
         train_df = split_info.train_df
         variant_train_df = train_df[train_df["variant"] == variant]
         train_syc_aids = set(
-            variant_train_df.loc[variant_train_df["label"] == "sycophantic", "anecdote_id"].unique()
+            variant_train_df.loc[
+                variant_train_df["label"] == "sycophantic", "anecdote_id"
+            ].unique()
         )
         train_non_syc_aids = set(
-            variant_train_df.loc[variant_train_df["label"] == "nonsycophantic", "anecdote_id"].unique()
+            variant_train_df.loc[
+                variant_train_df["label"] == "nonsycophantic", "anecdote_id"
+            ].unique()
         )
 
         non_syc_examples, _ = _pick_high_context_examples(
-            variant_train_monitor, train_non_syc_aids,
-            NUM_HIGH_CONTEXT_EXAMPLES, rng,
+            variant_train_monitor,
+            train_non_syc_aids,
+            NUM_HIGH_CONTEXT_EXAMPLES,
+            rng,
         )
         syc_examples, _ = _pick_high_context_examples(
-            variant_train_monitor, train_syc_aids,
-            NUM_HIGH_CONTEXT_EXAMPLES, rng,
+            variant_train_monitor,
+            train_syc_aids,
+            NUM_HIGH_CONTEXT_EXAMPLES,
+            rng,
         )
-        print(f"  Few-shot: {len(non_syc_examples)} non-syc, {len(syc_examples)} syc examples")
+        print(
+            f"  Few-shot: {len(non_syc_examples)} non-syc, {len(syc_examples)} syc examples"
+        )
 
         high_monitor = LlmMonitor(
             prompt=JsonHighContextMonitorPrompt(

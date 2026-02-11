@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import math
+import os
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,18 @@ from src2.tasks.scruples.prompts import INTERVENTION_SUGGESTED_ANSWER
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "scruples"
 OUTPUT_DIR = DATA_DIR / "entropy_baseline"
+
+
+def _create_run_dir(phase: str) -> Path:
+    """Create a timestamped run directory and update the 'latest' symlink."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = OUTPUT_DIR / f"{phase}_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    latest = OUTPUT_DIR / f"latest_{phase}"
+    if latest.is_symlink() or latest.exists():
+        latest.unlink()
+    os.symlink(run_dir.name, latest)
+    return run_dir
 
 SUBJECT_MODEL = "Qwen/Qwen3-32B"
 VARIANTS = ["suggest_wrong", "suggest_right"]
@@ -173,6 +186,7 @@ def generate_forcing_data():
         return {c: 1.0 / len(CHOICES) for c in CHOICES}
 
     def _force_rollout(user_msg, thinking_text):
+        """Force at each sentence boundary sequentially (parallelism is at rollout level)."""
         segments = get_cumulative_cot_segments(thinking_text)
         n_sentences = len(segments)
         if n_sentences == 0:
@@ -182,7 +196,7 @@ def generate_forcing_data():
             indices.append(n_sentences - 1)
         results = []
 
-        def _force_at(idx):
+        for idx in indices:
             partial_cot = segments[idx]
             anchor = " So, the answer is: " if partial_cot else "So, the answer is: "
             cot_with_anchor = partial_cot + anchor
@@ -196,18 +210,13 @@ def generate_forcing_data():
             )
             probs = _get_choice_probs(prompt_str)
             fraction_remaining = 1.0 - (idx + 1) / n_sentences
-            return {
+            results.append({
                 "sentence_idx": idx,
                 "fraction_remaining": fraction_remaining,
                 "choice_probs": probs,
                 "entropy": _shannon_entropy(probs),
-            }
+            })
 
-        with ThreadPoolExecutor(max_workers=min(2000, len(indices))) as executor:
-            futures = {executor.submit(_force_at, idx): idx for idx in indices}
-            for future in as_completed(futures):
-                results.append(future.result())
-        results.sort(key=lambda r: r["sentence_idx"])
         return results
 
     # ── Get anecdote IDs from uncertainty-robust split ────────────────
@@ -311,34 +320,79 @@ def generate_forcing_data():
         f"  Sycophantic: {syc_count}, Non-sycophantic: {len(all_rollouts) - syc_count}"
     )
 
-    # ── Run forcing ───────────────────────────────────────────────────
-    results = []
-    for i, rollout in enumerate(tqdm(all_rollouts, desc="Forcing rollouts")):
+    # ── Resume from checkpoint if available ─────────────────────────────
+    import threading
+
+    # Checkpoints go to a stable file; final results are archived in a timestamped dir
+    checkpoint_path = OUTPUT_DIR / "forcing_checkpoint.json"
+    done_keys = set()
+    prior_results = []
+    if checkpoint_path.exists():
+        with open(checkpoint_path) as f:
+            prior_data = json.load(f)
+        prior_results = prior_data.get("rollouts", [])
+        for r in prior_results:
+            done_keys.add((r["anecdote_id"], r["variant"], r["run_idx"]))
+        print(f"Resuming: {len(prior_results)} rollouts already done, skipping them")
+
+    remaining = [
+        (i, r) for i, r in enumerate(all_rollouts)
+        if (r["anecdote_id"], r["variant"], r["run_idx"]) not in done_keys
+    ]
+    print(f"Remaining: {len(remaining)} rollouts to force")
+
+    if not remaining:
+        print("All rollouts already complete!")
+        return
+
+    # ── Run forcing (parallelized across rollouts) ─────────────────────
+    new_results = []
+    results_lock = threading.Lock()
+
+    def _process_rollout(rollout):
         entropy_trajectory = _force_rollout(rollout["user_msg"], rollout["thinking"])
-        results.append(
-            {
-                "anecdote_id": rollout["anecdote_id"],
-                "variant": rollout["variant"],
-                "run_idx": rollout["run_idx"],
-                "answer": rollout["answer"],
-                "is_sycophantic": rollout["is_sycophantic"],
-                "n_sentences": len(entropy_trajectory),
-                "results": entropy_trajectory,
-            }
-        )
+        return {
+            "anecdote_id": rollout["anecdote_id"],
+            "variant": rollout["variant"],
+            "run_idx": rollout["run_idx"],
+            "answer": rollout["answer"],
+            "is_sycophantic": rollout["is_sycophantic"],
+            "n_sentences": len(entropy_trajectory),
+            "results": entropy_trajectory,
+        }
 
-        # Save incrementally every 50 rollouts
-        if (i + 1) % 50 == 0:
-            _save_results(results)
-            print(f"  Saved checkpoint ({i + 1}/{len(all_rollouts)})")
+    n_workers = min(2000, len(remaining))
+    print(f"Forcing {len(remaining)} rollouts with {n_workers} parallel workers")
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {
+            executor.submit(_process_rollout, r): i
+            for i, r in remaining
+        }
+        with tqdm(total=len(remaining), desc="Forcing rollouts") as pbar:
+            for future in as_completed(futures):
+                result = future.result()
+                with results_lock:
+                    new_results.append(result)
+                    pbar.update(1)
+                    if len(new_results) % 50 == 0:
+                        _save_results(prior_results + new_results, checkpoint_path)
+                        print(f"  Saved checkpoint ({len(prior_results) + len(new_results)}/{len(all_rollouts)})")
 
-    _save_results(results)
-    print(f"\nForcing complete. Saved {len(results)} rollouts to {OUTPUT_DIR}")
+    all_results = prior_results + new_results
+
+    # Save final checkpoint
+    _save_results(all_results, checkpoint_path)
+
+    # Archive to timestamped directory (never overwritten)
+    run_dir = _create_run_dir("generate")
+    final_path = run_dir / "forcing_results.json"
+    _save_results(all_results, final_path)
+    print(f"\nForcing complete. Saved {len(all_results)} rollouts to {final_path}")
 
 
-def _save_results(results):
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_DIR / "forcing_results.json", "w") as f:
+def _save_results(results, save_path: Path):
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(save_path, "w") as f:
         json.dump(
             {
                 "model": SUBJECT_MODEL,
@@ -401,18 +455,19 @@ FEATURE_NAMES = [
 ]
 
 
-def _compute_f1(y_true, y_pred):
-    """F1 for class 1 (sycophantic)."""
+def _compute_classification_metrics(y_true, y_pred):
+    """Precision, recall, F1 for class 1 (sycophantic)."""
     tp = int(((y_pred == 1) & (y_true == 1)).sum())
     fp = int(((y_pred == 1) & (y_true == 0)).sum())
     fn = int(((y_pred == 0) & (y_true == 1)).sum())
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    return (
+    f1 = (
         2 * precision * recall / (precision + recall)
         if (precision + recall) > 0
         else 0.0
     )
+    return {"f1": f1, "precision": precision, "recall": recall, "tp": tp, "fp": fp, "fn": fn}
 
 
 def train_baseline():
@@ -420,11 +475,20 @@ def train_baseline():
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
-    results_path = OUTPUT_DIR / "forcing_results.json"
+    # Find forcing results: prefer latest archived run, fall back to checkpoint
+    latest_generate = OUTPUT_DIR / "latest_generate"
+    if latest_generate.exists():
+        results_path = latest_generate / "forcing_results.json"
+    else:
+        results_path = OUTPUT_DIR / "forcing_checkpoint.json"
+    # Also accept legacy path
     if not results_path.exists():
-        print(f"No forcing results found at {results_path}")
+        results_path = OUTPUT_DIR / "forcing_results.json"
+    if not results_path.exists():
+        print(f"No forcing results found in {OUTPUT_DIR}")
         print("Run with --generate first.")
         return
+    print(f"Loading forcing results from {results_path}")
 
     with open(results_path) as f:
         data = json.load(f)
@@ -527,16 +591,16 @@ def train_baseline():
     train_pred = clf.predict(X_train_s)
     test_pred = clf.predict(X_test_s)
 
-    train_f1 = _compute_f1(y_train, train_pred)
-    test_f1 = _compute_f1(y_test, test_pred)
+    train_metrics = _compute_classification_metrics(y_train, train_pred)
+    test_metrics = _compute_classification_metrics(y_test, test_pred)
     train_acc = float((y_train == train_pred).mean())
     test_acc = float((y_test == test_pred).mean())
 
     print(f"\n{'=' * 60}")
     print(f"  Entropy Baseline Results")
     print(f"{'=' * 60}")
-    print(f"  Train: F1={train_f1:.3f}, Acc={train_acc:.3f}")
-    print(f"  Test:  F1={test_f1:.3f}, Acc={test_acc:.3f}")
+    print(f"  Train: F1={train_metrics['f1']:.3f}, Acc={train_acc:.3f}")
+    print(f"  Test:  F1={test_metrics['f1']:.3f}, Acc={test_acc:.3f}")
     print(
         f"  Chance baseline: {max(Counter(y_test.tolist()).values()) / len(y_test):.3f}"
     )
@@ -550,8 +614,12 @@ def train_baseline():
 
     # ── Save ──────────────────────────────────────────────────────────
     output = {
-        "train_f1": train_f1,
-        "test_f1": test_f1,
+        "train_f1": train_metrics["f1"],
+        "test_f1": test_metrics["f1"],
+        "train_precision": train_metrics["precision"],
+        "test_precision": test_metrics["precision"],
+        "train_recall": train_metrics["recall"],
+        "test_recall": test_metrics["recall"],
         "train_accuracy": train_acc,
         "test_accuracy": test_acc,
         "n_train": len(X_train),
@@ -560,9 +628,15 @@ def train_baseline():
         "coefficients": clf.coef_[0].tolist(),
         "intercept": float(clf.intercept_[0]),
     }
+    # Save to timestamped dir + latest symlink
+    run_dir = _create_run_dir("train")
+    with open(run_dir / "baseline_results.json", "w") as f:
+        json.dump(output, f, indent=2)
+    # Also save to top-level for easy access by plot scripts
     with open(OUTPUT_DIR / "baseline_results.json", "w") as f:
         json.dump(output, f, indent=2)
-    print(f"\nResults saved to {OUTPUT_DIR / 'baseline_results.json'}")
+    print(f"\nResults saved to {run_dir / 'baseline_results.json'}")
+    print(f"  (also copied to {OUTPUT_DIR / 'baseline_results.json'})")
 
 
 def main():
