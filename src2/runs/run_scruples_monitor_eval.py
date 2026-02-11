@@ -239,36 +239,6 @@ def _flatten_to_intervention_runs(
     return flat
 
 
-def _split_by_anecdote(flat_rows, anecdote_strata=None):
-    """Split flat rows into train/test by anecdote, matching the probe's split."""
-    rng = np.random.default_rng(SEED)
-    all_aids = list(set(r["anecdote_id"] for r in flat_rows))
-
-    if anecdote_strata is not None:
-        strata_groups: Dict[str, list] = {}
-        for aid in all_aids:
-            s = anecdote_strata.get(aid, "unknown")
-            strata_groups.setdefault(s, []).append(aid)
-
-        train_anecdotes = set()
-        test_anecdotes = set()
-        for stratum, aids in sorted(strata_groups.items()):
-            aids = sorted(aids)
-            rng.shuffle(aids)
-            n_test = max(1, int(len(aids) * TEST_SPLIT))
-            test_anecdotes.update(aids[:n_test])
-            train_anecdotes.update(aids[n_test:])
-    else:
-        rng.shuffle(all_aids)
-        n_test = max(1, int(len(all_aids) * TEST_SPLIT))
-        test_anecdotes = set(all_aids[:n_test])
-        train_anecdotes = set(all_aids[n_test:])
-
-    train_rows = [r for r in flat_rows if r["anecdote_id"] in train_anecdotes]
-    test_rows = [r for r in flat_rows if r["anecdote_id"] in test_anecdotes]
-    return train_rows, test_rows, train_anecdotes, test_anecdotes
-
-
 def _pick_high_context_examples(
     monitor_data: List[Dict],
     anecdote_ids: set,
@@ -394,7 +364,7 @@ def main():
     print("\nLoading monitor data...")
     all_monitor_data = []
     for variant in VARIANTS:
-        variant_data = tasks[variant].get_monitor_data(split_info["data_slice"])
+        variant_data = tasks[variant].get_monitor_data(split_info)
         for row in variant_data:
             row["variant"] = variant
         all_monitor_data.extend(variant_data)
@@ -417,11 +387,11 @@ def main():
     print(f"  Label 0 (non-sycophantic): {(y_all == 0).sum()}")
     print(f"  Label 1 (sycophantic):     {(y_all == 1).sum()}")
 
-    # ── 5. Train/test split by anecdote (same as probe) ─────────────
-    train_rows, test_rows, train_aids, test_aids = _split_by_anecdote(
-        flat_data,
-        anecdote_strata=split_info.get("anecdote_strata"),
-    )
+    # ── 5. Train/test split by anecdote (canonical from get_uncertainty_robust_split) ──
+    train_aids = set(split_info.train_df["anecdote_id"].unique()) | set(split_info.val_df["anecdote_id"].unique())
+    test_aids = set(split_info.test_df["anecdote_id"].unique())
+    train_rows = [r for r in flat_data if r["anecdote_id"] in train_aids]
+    test_rows = [r for r in flat_data if r["anecdote_id"] in test_aids]
 
     y_test = np.array([r["label"] for r in test_rows])
     print(f"\nSplit (matching probe):")

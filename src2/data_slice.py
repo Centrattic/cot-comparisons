@@ -1,14 +1,21 @@
 """
-DataSlice — thin data selection layer for filtering data points across tasks.
+DataSlice — data selection layer for filtering data points across tasks.
 
 Provides optional filtering by IDs, sentence indices, timestamps, and direct
 path overrides. None means "no filter" (include all).
+
+Holds optional train/val/test DataFrames (keyed on `filepath` and `label`
+columns) for structured split access.
 """
+
+from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Any, List, Optional, Set
+
+import pandas as pd
 
 
 @dataclass
@@ -23,6 +30,49 @@ class DataSlice:
 
     # Direct path override
     run_paths: Optional[List[Path]] = None
+
+    # Split DataFrames (expected columns: filepath, label, plus task-specific)
+    train_df: Optional[pd.DataFrame] = field(default=None, repr=False)
+    val_df: Optional[pd.DataFrame] = field(default=None, repr=False)
+    test_df: Optional[pd.DataFrame] = field(default=None, repr=False)
+
+    EXPECTED_COLS = ("filepath", "label")
+
+    # ── DataFrame access ─────────────────────────────────────────
+
+    @property
+    def df(self) -> pd.DataFrame:
+        """Concatenation of all non-None split DataFrames."""
+        parts = [x for x in (self.train_df, self.val_df, self.test_df) if x is not None]
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+    @property
+    def train(self) -> DataSlice:
+        return DataSlice(train_df=self.train_df)
+
+    @property
+    def val(self) -> DataSlice:
+        return DataSlice(val_df=self.val_df)
+
+    @property
+    def test(self) -> DataSlice:
+        return DataSlice(test_df=self.test_df)
+
+    @property
+    def filepaths(self) -> List[str]:
+        """All filepaths across splits."""
+        return list(self.df["filepath"]) if "filepath" in self.df.columns else []
+
+    @property
+    def label_series(self) -> pd.Series:
+        """All labels across splits."""
+        return self.df["label"] if "label" in self.df.columns else pd.Series(dtype=object)
+
+    def labeled(self, label: Any) -> pd.DataFrame:
+        """Return rows from df where label matches."""
+        return self.df[self.df["label"] == label]
+
+    # ── ID / sentence filtering ──────────────────────────────────
 
     def matches_id(self, id: str) -> bool:
         return self.ids is None or id in self.ids
@@ -80,21 +130,47 @@ class DataSlice:
                 return True
         return False
 
-    # Convenience constructors
+    # ── Convenience constructors ─────────────────────────────────
 
     @classmethod
-    def all(cls) -> "DataSlice":
+    def all(cls) -> DataSlice:
         """Select everything (no filters)."""
         return cls()
 
     @classmethod
-    def from_ids(cls, ids) -> "DataSlice":
+    def from_ids(cls, ids) -> DataSlice:
         return cls(ids=set(ids))
 
     @classmethod
-    def latest(cls, n: int = 1) -> "DataSlice":
+    def latest(cls, n: int = 1) -> DataSlice:
         return cls(latest_n=n)
 
     @classmethod
-    def from_paths(cls, paths: List[Path]) -> "DataSlice":
+    def from_paths(cls, paths: List[Path]) -> DataSlice:
         return cls(run_paths=paths)
+
+    # ── Dunder helpers ───────────────────────────────────────────
+
+    def __len__(self) -> int:
+        n = len(self.ids) if self.ids is not None else 0
+        df_len = len(self.df)
+        return max(n, df_len)
+
+    def __contains__(self, id: object) -> bool:
+        return self.matches_id(id)  # type: ignore[arg-type]
+
+    # ── Display ──────────────────────────────────────────────────
+
+    def summary(self) -> str:
+        """Human-readable summary."""
+        parts: List[str] = []
+        n = len(self.ids) if self.ids is not None else "all"
+        parts.append(f"DataSlice({n} ids)")
+        for name, split_df in [("train", self.train_df), ("val", self.val_df), ("test", self.test_df)]:
+            if split_df is not None:
+                parts.append(f"  {name}: {len(split_df)} rows")
+        if "label" in self.df.columns:
+            counts = self.df["label"].value_counts().to_dict()
+            label_strs = [f"{lbl}: {cnt}" for lbl, cnt in sorted(counts.items(), key=lambda x: str(x[0]))]
+            parts.append(f"  labels: {', '.join(label_strs)}")
+        return "\n".join(parts)

@@ -32,54 +32,6 @@ PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
 VARIANTS = ["suggest_wrong", "suggest_right"]
 
-# Split params (must match run_sycophancy_probe.py)
-SWITCH_THRESHOLD = 0.40
-HIGH_INTERVENTION_RATE = 0.82
-LOW_INTERVENTION_RATE = 0.70
-N_SYC_HIGH_PER_VARIANT = 25
-N_SYC_LOW_PER_VARIANT = 25
-N_NON_SYC_PER_VARIANT = 50
-TEST_SPLIT = 0.20
-SEED = 42
-
-
-def get_test_anecdotes():
-    """Reproduce the probe's test anecdote set."""
-    task = ScruplesTask(
-        subject_model="moonshotai/kimi-k2-thinking",
-        variant="suggest_wrong",
-        data_dir=DATA_DIR,
-    )
-    split_info = task.get_uncertainty_robust_split(
-        switch_threshold=SWITCH_THRESHOLD,
-        non_syc_max_switch=0.10,
-        high_intervention_rate=HIGH_INTERVENTION_RATE,
-        low_intervention_rate=LOW_INTERVENTION_RATE,
-        n_syc_high_per_variant=N_SYC_HIGH_PER_VARIANT,
-        n_syc_low_per_variant=N_SYC_LOW_PER_VARIANT,
-        n_non_syc_per_variant=N_NON_SYC_PER_VARIANT,
-        variants=VARIANTS,
-    )
-
-    all_ids = set(split_info["syc_ids"]) | set(split_info["non_syc_ids"])
-    strata = split_info["anecdote_strata"]
-
-    rng = np.random.default_rng(SEED)
-    strata_groups = {}
-    for aid in all_ids:
-        s = strata.get(aid, "unknown")
-        strata_groups.setdefault(s, []).append(aid)
-
-    test_anecdotes = set()
-    for stratum, aids in sorted(strata_groups.items()):
-        aids = sorted(aids)
-        rng.shuffle(aids)
-        n_test = max(1, int(len(aids) * TEST_SPLIT))
-        test_anecdotes.update(aids[:n_test])
-
-    syc_ids = set(split_info["syc_ids"])
-    return test_anecdotes, syc_ids, split_info
-
 
 def compute_monitor_metrics(monitor_name, test_anecdotes, syc_ids):
     """Compute F1/precision/recall for an LLM monitor on the test anecdotes.
@@ -128,7 +80,14 @@ def compute_monitor_metrics(monitor_name, test_anecdotes, syc_ids):
 
 def main():
     print("Computing test split...")
-    test_anecdotes, syc_ids, split_info = get_test_anecdotes()
+    task = ScruplesTask(
+        subject_model="moonshotai/kimi-k2-thinking",
+        variant="suggest_wrong",
+        data_dir=DATA_DIR,
+    )
+    split_info = task.get_uncertainty_robust_split(variants=VARIANTS)
+    test_anecdotes = set(split_info.test_df["anecdote_id"].unique())
+    syc_ids = set(split_info.df.loc[split_info.df["label"] == "sycophantic", "anecdote_id"].unique())
 
     # ── Collect all method results ─────────────────────────────────────
     methods = {}

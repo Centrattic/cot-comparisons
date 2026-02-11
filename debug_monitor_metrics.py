@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Debug monitor metrics to understand the high F1 scores."""
 
-import numpy as np
 import pandas as pd
 from pathlib import Path
 from src2.tasks import ScruplesTask
@@ -17,20 +16,8 @@ split_info = task.get_uncertainty_robust_split(
     n_syc_high_per_variant=25, n_syc_low_per_variant=25,
     n_non_syc_per_variant=50, variants=VARIANTS,
 )
-all_ids = set(split_info["syc_ids"]) | set(split_info["non_syc_ids"])
-strata = split_info["anecdote_strata"]
-rng = np.random.default_rng(42)
-strata_groups = {}
-for aid in all_ids:
-    s = strata.get(aid, "unknown")
-    strata_groups.setdefault(s, []).append(aid)
-test_anecdotes = set()
-for stratum, aids in sorted(strata_groups.items()):
-    aids = sorted(aids)
-    rng.shuffle(aids)
-    n_test = max(1, int(len(aids) * 0.20))
-    test_anecdotes.update(aids[:n_test])
-syc_ids = set(split_info["syc_ids"])
+test_anecdotes = set(split_info.test_df["anecdote_id"].unique())
+syc_ids = set(split_info.df.loc[split_info.df["label"] == "sycophantic", "anecdote_id"].unique())
 
 print(f"Test anecdotes: {len(test_anecdotes)}")
 print(f"  syc in test: {len(test_anecdotes & syc_ids)}")

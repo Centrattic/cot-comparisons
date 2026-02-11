@@ -122,71 +122,6 @@ def print_dataset_statistics(metadata: list, y: np.ndarray):
     print()
 
 
-def train_test_split_by_anecdote(
-    X_list: list,
-    y: np.ndarray,
-    anecdote_ids: list,
-    metadata: list,
-    test_fraction: float = TEST_SPLIT,
-    seed: int = SEED,
-    anecdote_strata: dict = None,
-) -> dict:
-    """Split data into train/test by anecdote, with optional stratification.
-
-    When *anecdote_strata* is provided (mapping anecdote_id -> stratum label),
-    each stratum is split independently so that the stratum proportions are
-    preserved in both train and test sets.
-    """
-    rng = np.random.default_rng(seed)
-
-    if anecdote_strata is not None:
-        # Group anecdotes by stratum
-        strata_groups: dict = {}
-        for aid in set(anecdote_ids):
-            s = anecdote_strata.get(aid, "unknown")
-            strata_groups.setdefault(s, []).append(aid)
-
-        train_anecdotes: set = set()
-        test_anecdotes: set = set()
-
-        for stratum, aids in sorted(strata_groups.items()):
-            aids = sorted(aids)
-            rng.shuffle(aids)
-            n_test = max(1, int(len(aids) * test_fraction))
-            test_anecdotes.update(aids[:n_test])
-            train_anecdotes.update(aids[n_test:])
-
-        # Print stratification summary
-        print("  Stratified split by anecdote:")
-        for stratum in sorted(strata_groups):
-            aids = strata_groups[stratum]
-            n_train = sum(1 for a in aids if a in train_anecdotes)
-            n_test = sum(1 for a in aids if a in test_anecdotes)
-            print(f"    {stratum}: {n_train} train, {n_test} test")
-    else:
-        unique_anecdotes = list(set(anecdote_ids))
-        rng.shuffle(unique_anecdotes)
-        n_test = max(1, int(len(unique_anecdotes) * test_fraction))
-        test_anecdotes = set(unique_anecdotes[:n_test])
-        train_anecdotes = set(unique_anecdotes[n_test:])
-
-    train_idx = [i for i, a in enumerate(anecdote_ids) if a in train_anecdotes]
-    test_idx = [i for i, a in enumerate(anecdote_ids) if a in test_anecdotes]
-
-    return {
-        "train_X": [X_list[i] for i in train_idx],
-        "train_y": y[train_idx],
-        "train_anecdote_ids": [anecdote_ids[i] for i in train_idx],
-        "train_metadata": [metadata[i] for i in train_idx],
-        "test_X": [X_list[i] for i in test_idx],
-        "test_y": y[test_idx],
-        "test_anecdote_ids": [anecdote_ids[i] for i in test_idx],
-        "test_metadata": [metadata[i] for i in test_idx],
-        "n_train_anecdotes": len(train_anecdotes),
-        "n_test_anecdotes": len(test_anecdotes),
-    }
-
-
 def _predict_labels(probe, X_list, device):
     """Get predicted class labels for a list of activations."""
     probe.eval()
@@ -217,8 +152,8 @@ def train_and_evaluate(
     train_y: np.ndarray,
     test_X: list,
     test_y: np.ndarray,
-    train_anecdote_ids: list = None,
-    train_metadata: list = None,
+    val_X: list = None,
+    val_y: np.ndarray = None,
     num_heads: int = NUM_HEADS,
     lr: float = LR,
     epochs: int = EPOCHS,
@@ -228,7 +163,7 @@ def train_and_evaluate(
 ) -> dict:
     """Train probe with F1-based early stopping, evaluate on test set.
 
-    Splits off a validation set from training data (by anecdote) and selects
+    Uses the provided validation set for early stopping. Selects
     the model checkpoint with the best validation F1 for the sycophantic class.
     """
     import copy
@@ -236,34 +171,17 @@ def train_and_evaluate(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Using device: {device}, batch_size: {batch_size}")
 
-    # ── Val split from train (by anecdote) ────────────────────────────
-    rng = np.random.default_rng(SEED)
-    if train_anecdote_ids is not None:
-        unique_aids = sorted(set(train_anecdote_ids))
-        rng.shuffle(unique_aids)
-        n_val_anecdotes = max(1, int(len(unique_aids) * VAL_SPLIT))
-        val_anecdote_set = set(unique_aids[:n_val_anecdotes])
-        val_idx = [i for i, a in enumerate(train_anecdote_ids) if a in val_anecdote_set]
-        tr_idx = [i for i, a in enumerate(train_anecdote_ids) if a not in val_anecdote_set]
-    else:
-        n_total = len(train_X)
-        perm = rng.permutation(n_total)
-        n_val = max(1, int(n_total * VAL_SPLIT))
-        val_idx = perm[:n_val].tolist()
-        tr_idx = perm[n_val:].tolist()
+    if val_X is None or val_y is None:
+        raise ValueError("val_X and val_y must be provided")
 
-    val_X = [train_X[i] for i in val_idx]
-    val_y = train_y[val_idx]
-    actual_train_X = [train_X[i] for i in tr_idx]
-    actual_train_y = train_y[tr_idx]
-    n_samples = len(actual_train_X)
+    n_samples = len(train_X)
     print(f"  Train: {n_samples}, Val: {len(val_X)}, Test: {len(test_X)}")
 
-    hidden_dim = actual_train_X[0].shape[1]
-    all_X = actual_train_X + val_X + test_X
+    hidden_dim = train_X[0].shape[1]
+    all_X = train_X + val_X + test_X
     max_seq_len = max(x.shape[0] for x in all_X) if all_X else 1
 
-    class_counts = np.bincount(actual_train_y, minlength=NUM_CLASSES)
+    class_counts = np.bincount(train_y, minlength=NUM_CLASSES)
     class_weights = n_samples / (NUM_CLASSES * class_counts + 1e-6)
     class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
     print(f"  Class counts: {class_counts.tolist()}, weights: {class_weights.tolist()}")
@@ -297,8 +215,8 @@ def train_and_evaluate(
             end = min(start + batch_size, n_samples)
             batch_idx = perm[start:end]
 
-            batch_X = [actual_train_X[i] for i in batch_idx]
-            batch_y = actual_train_y[batch_idx]
+            batch_X = [train_X[i] for i in batch_idx]
+            batch_y = train_y[batch_idx]
             batch_max_len = max(x.shape[0] for x in batch_X)
 
             X_pad = torch.zeros(len(batch_X), batch_max_len, hidden_dim, device=device)
@@ -342,9 +260,9 @@ def train_and_evaluate(
                 break
 
         if (epoch + 1) % 10 == 0:
-            train_preds = _predict_labels(probe, actual_train_X, device)
+            train_preds = _predict_labels(probe, train_X, device)
             test_preds_tmp = _predict_labels(probe, test_X, device)
-            train_f1 = _compute_f1(actual_train_y, train_preds)
+            train_f1 = _compute_f1(train_y, train_preds)
             test_f1 = _compute_f1(test_y, test_preds_tmp)
             history["epoch"].append(epoch + 1)
             history["train_f1"].append(train_f1)
@@ -482,7 +400,7 @@ def main():
                 model_name=ACTIVATION_MODEL,
                 layers=[LAYER],
                 load_in_4bit=LOAD_IN_4BIT,
-                data_slice=split_info["data_slice"],
+                data_slice=split_info,
             )
 
     # ── Step 4: Load sycophancy probe data ────────────────────────────
@@ -490,7 +408,7 @@ def main():
     probe_data = task.get_sycophancy_probe_data(
         variants=VARIANTS,
         layer=LAYER,
-        data_slice=split_info["data_slice"],
+        data_slice=split_info,
         switch_threshold=SWITCH_THRESHOLD,
     )
 
@@ -550,15 +468,36 @@ def main():
         print("Too few samples. Exiting.")
         return
 
-    # ── Step 5: Train/test split (stratified by uncertainty strata) ──
-    print(f"Splitting data ({1 - TEST_SPLIT:.0%} train, {TEST_SPLIT:.0%} test)...")
-    split = train_test_split_by_anecdote(
-        X_list, y, anecdote_ids, metadata,
-        anecdote_strata=split_info.get("anecdote_strata"),
-    )
+    # ── Step 5: Train/val/test split (canonical from get_uncertainty_robust_split) ──
+    train_aids = set(split_info.train_df["anecdote_id"].unique())
+    val_aids = set(split_info.val_df["anecdote_id"].unique())
+    test_aids = set(split_info.test_df["anecdote_id"].unique())
+
+    train_idx = [i for i, a in enumerate(anecdote_ids) if a in train_aids]
+    val_idx = [i for i, a in enumerate(anecdote_ids) if a in val_aids]
+    test_idx = [i for i, a in enumerate(anecdote_ids) if a in test_aids]
+
+    split = {
+        "train_X": [X_list[i] for i in train_idx],
+        "train_y": y[train_idx],
+        "train_anecdote_ids": [anecdote_ids[i] for i in train_idx],
+        "train_metadata": [metadata[i] for i in train_idx],
+        "val_X": [X_list[i] for i in val_idx],
+        "val_y": y[val_idx],
+        "test_X": [X_list[i] for i in test_idx],
+        "test_y": y[test_idx],
+        "test_anecdote_ids": [anecdote_ids[i] for i in test_idx],
+        "test_metadata": [metadata[i] for i in test_idx],
+        "n_train_anecdotes": len(train_aids),
+        "n_val_anecdotes": len(val_aids),
+        "n_test_anecdotes": len(test_aids),
+    }
 
     print(
         f"  Train: {len(split['train_X'])} samples from {split['n_train_anecdotes']} anecdotes"
+    )
+    print(
+        f"  Val:   {len(split['val_X'])} samples from {split['n_val_anecdotes']} anecdotes"
     )
     print(
         f"  Test:  {len(split['test_X'])} samples from {split['n_test_anecdotes']} anecdotes"
@@ -597,7 +536,8 @@ def main():
             train_y=split["train_y"],
             test_X=split["test_X"],
             test_y=split["test_y"],
-            train_anecdote_ids=split["train_anecdote_ids"],
+            val_X=split["val_X"],
+            val_y=split["val_y"],
             weight_decay=wd,
             dropout=do,
         )
@@ -663,8 +603,10 @@ def main():
             "test_split": TEST_SPLIT,
             "seed": SEED,
             "n_train_samples": len(split["train_X"]),
+            "n_val_samples": len(split["val_X"]),
             "n_test_samples": len(split["test_X"]),
             "n_train_anecdotes": split["n_train_anecdotes"],
+            "n_val_anecdotes": split["n_val_anecdotes"],
             "n_test_anecdotes": split["n_test_anecdotes"],
         },
     }

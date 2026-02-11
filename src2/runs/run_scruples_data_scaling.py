@@ -331,46 +331,6 @@ def train_all_probes_batched(train_X_list, train_y,
     return test_f1_list, train_f1_list, test_acc_list, train_acc_list
 
 
-def train_test_split_by_anecdote(X_list, y, anecdote_ids, metadata,
-                                  test_fraction=TEST_SPLIT, seed=SEED,
-                                  anecdote_strata=None):
-    """Split by anecdote with optional stratification (copied from run_sycophancy_probe)."""
-    rng = np.random.default_rng(seed)
-
-    if anecdote_strata is not None:
-        strata_groups = {}
-        for aid in set(anecdote_ids):
-            s = anecdote_strata.get(aid, "unknown")
-            strata_groups.setdefault(s, []).append(aid)
-
-        train_anecdotes = set()
-        test_anecdotes = set()
-        for stratum, aids in sorted(strata_groups.items()):
-            aids = sorted(aids)
-            rng.shuffle(aids)
-            n_test = max(1, int(len(aids) * test_fraction))
-            test_anecdotes.update(aids[:n_test])
-            train_anecdotes.update(aids[n_test:])
-    else:
-        unique_anecdotes = list(set(anecdote_ids))
-        rng.shuffle(unique_anecdotes)
-        n_test = max(1, int(len(unique_anecdotes) * test_fraction))
-        test_anecdotes = set(unique_anecdotes[:n_test])
-        train_anecdotes = set(unique_anecdotes[n_test:])
-
-    train_idx = [i for i, a in enumerate(anecdote_ids) if a in train_anecdotes]
-    test_idx = [i for i, a in enumerate(anecdote_ids) if a in test_anecdotes]
-
-    return {
-        "train_X": [X_list[i] for i in train_idx],
-        "train_y": y[train_idx],
-        "train_anecdote_ids": [anecdote_ids[i] for i in train_idx],
-        "test_X": [X_list[i] for i in test_idx],
-        "test_y": y[test_idx],
-        "test_anecdote_ids": [anecdote_ids[i] for i in test_idx],
-    }
-
-
 def main():
     # ── Load data (same as run_sycophancy_probe) ──────────────────────
     tasks = {}
@@ -398,7 +358,7 @@ def main():
     probe_data = task.get_sycophancy_probe_data(
         variants=VARIANTS,
         layer=LAYER,
-        data_slice=split_info["data_slice"],
+        data_slice=split_info,
         switch_threshold=SWITCH_THRESHOLD,
     )
 
@@ -450,15 +410,17 @@ def main():
         print("Too few samples. Exiting.")
         return
 
-    # ── Fixed train/test split ────────────────────────────────────────
-    split = train_test_split_by_anecdote(
-        X_list, y, anecdote_ids, metadata,
-        anecdote_strata=split_info.get("anecdote_strata"),
-    )
-    full_train_X = split["train_X"]
-    full_train_y = split["train_y"]
-    test_X = split["test_X"]
-    test_y = split["test_y"]
+    # ── Fixed train/test split (canonical from get_uncertainty_robust_split) ──
+    train_aids = set(split_info.train_df["anecdote_id"].unique()) | set(split_info.val_df["anecdote_id"].unique())  # merge val into train for scaling
+    test_aids = set(split_info.test_df["anecdote_id"].unique())
+
+    train_idx = [i for i, a in enumerate(anecdote_ids) if a in train_aids]
+    test_idx = [i for i, a in enumerate(anecdote_ids) if a in test_aids]
+
+    full_train_X = [X_list[i] for i in train_idx]
+    full_train_y = y[train_idx]
+    test_X = [X_list[i] for i in test_idx]
+    test_y = y[test_idx]
     n_train = len(full_train_X)
     print(f"Train: {n_train}, Test: {len(test_X)}")
 
