@@ -432,7 +432,7 @@ def main():
             prompt=ScruplesBaseMonitorPrompt(variant),
             model=MONITOR_MODEL,
             max_workers=MAX_WORKERS,
-            name=f"llm_monitor_eval_base_{variant}",
+            name=f"llm_monitor_eval_base_v2_{variant}",
         )
         base_monitor.set_task(tasks[variant])
         base_results = base_monitor.infer(variant_test)

@@ -87,18 +87,18 @@ split = task.get_uncertainty_robust_split(
     n_non_syc_per_variant=50,
     variants=variants,
 )
-all_ids = set(split['syc_ids']) | set(split['non_syc_ids'])
 
-# Find the run_path directories for these anecdotes
+# filepaths in the DataSlice are absolute; extract relative run_path dirs
 paths = set()
-for variant in variants:
-    df = pd.read_csv(f'$LOCAL/results_{variant}.csv')
-    df = df[df['anecdote_id'].isin(all_ids)]
-    for rp in df['run_path']:
-        # run_path = 'runs/<timestamp>/<anecdote_id>/control_0.json'
-        # we want 'runs/<timestamp>/<anecdote_id>'
-        parts = rp.split('/')
-        paths.add('/'.join(parts[:3]))
+for fp in split.filepaths:
+    # fp = '/abs/path/data/scruples/runs/<timestamp>/<aid>/intervention_0.json'
+    # we want 'runs/<timestamp>/<aid>'
+    parts = fp.split('/')
+    try:
+        idx = parts.index('runs')
+        paths.add('/'.join(parts[idx:idx+3]))
+    except ValueError:
+        pass
 
 for p in sorted(paths):
     print(p)
