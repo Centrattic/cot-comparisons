@@ -60,20 +60,27 @@ VERIFICATION_DIR = PROJECT_ROOT / "data" / "verification_rollouts"
 QUESTIONS_FILE = PROJECT_ROOT / "src2" / "utils" / "questions.json"
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-TAXONOMY_MODEL = "openai/gpt-4o"
-ANNOTATION_MODEL = "openai/gpt-4o-mini"
+TAXONOMY_MODEL = "openai/gpt-5.2"
+ANNOTATION_MODEL = "openai/gpt-4o"
 
 TASK_DESCRIPTION = (
     "Predict whether a chain-of-thought reasoning trace from a language model "
     "reaches the majority or minority answer to a question"
 )
-NUM_FEATURES = 8
-NUM_SEGMENTS = 3  # early / mid / late
+NUM_FEATURES = 10
+NUM_SEGMENTS = 15
 SENTENCES_PER_CHUNK = 4
-MAX_WORKERS = 100
+MAX_WORKERS = 500
 
 NM_SUFFIX = "_nm"
 ALL_PROMPT_IDS_NM = [pid + NM_SUFFIX for pid in ALL_PROMPT_IDS]
+
+# First 3 prompts are used for taxonomy proposal context and excluded from
+# labeling/training/testing to avoid data contamination.
+N_TAXONOMY_PROMPTS = 3
+TAXONOMY_PROMPT_IDS_NM = ALL_PROMPT_IDS_NM[:N_TAXONOMY_PROMPTS]
+EVAL_PROMPT_IDS_NM = ALL_PROMPT_IDS_NM[N_TAXONOMY_PROMPTS:]
+EVAL_PROMPT_IDS = ALL_PROMPT_IDS[N_TAXONOMY_PROMPTS:]
 
 SEED = 42
 
@@ -186,63 +193,96 @@ def _chunk_cot(cot_text: str) -> List[str]:
 # ── Taxonomy proposal ─────────────────────────────────────────────────
 
 
-def _propose_taxonomy(client: openai.OpenAI) -> List[Dict[str, str]]:
-    """Use GPT-4o to propose a feature taxonomy for the task."""
+def _load_question_prompts() -> Dict[str, str]:
+    """Load question text for each _nm prompt ID."""
+    from src2.utils.questions import load_custom_questions
+
+    questions = load_custom_questions(QUESTIONS_FILE)
+    prompts = {}
+    for q in questions:
+        if q.id in ALL_PROMPT_IDS_NM:
+            prompts[q.id] = q.question
+    return prompts
+
+
+def _sample_examples(all_df: pd.DataFrame, n_per_class: int = 3) -> str:
+    """Sample majority/minority CoT snippets from taxonomy prompts (full text, no truncation)."""
+    examples = []
+    for pid in TAXONOMY_PROMPT_IDS_NM:
+        subset = all_df[all_df["prompt_id"] == pid]
+        for label in ["majority", "minority"]:
+            rows = subset[subset["label"] == label]
+            if rows.empty:
+                continue
+            for _, row in rows.head(n_per_class).iterrows():
+                cot = row["cot_content"]
+                if not isinstance(cot, str) or len(cot) < 50:
+                    continue
+                examples.append(f"[{label.upper()} answer, prompt={pid}]\n{cot}")
+    return "\n\n".join(examples)
+
+
+def _propose_taxonomy(client: openai.OpenAI, all_df: pd.DataFrame) -> List[Dict[str, str]]:
+    """Use an LLM to propose a feature taxonomy grounded in actual data."""
+    # Build context: question prompts (only taxonomy prompts)
+    question_prompts = _load_question_prompts()
+    questions_block = "\n\n".join(
+        f"--- {qid} ---\n{qtext}"
+        for qid, qtext in question_prompts.items()
+        if qid in TAXONOMY_PROMPT_IDS_NM
+    )
+
+    # Build context: example CoTs
+    examples_block = _sample_examples(all_df)
+
     prompt = f"""You are designing a feature taxonomy for analyzing chains of thought (reasoning traces) from language models.
 
 The downstream task is: {TASK_DESCRIPTION}
 
-Propose exactly {NUM_FEATURES} behavioral feature categories that would be relevant for this task. Each feature should describe a TYPE of reasoning step that might carry signal about the prediction target.
+Here are the actual questions the model is reasoning about:
 
-Good features are things like: confidence level, hedging/uncertainty, backtracking, standard vs unusual approach, exploration, verification, problem setup, etc. Choose features specifically relevant to the task.
+{questions_block}
 
-Output a JSON array of objects with "id" (snake_case identifier) and "description" (one sentence).
+Here are example reasoning traces, labeled with whether they led to the majority or minority answer:
+
+{examples_block}
+
+Propose exactly {NUM_FEATURES} behavioral feature categories that would be relevant for distinguishing majority from minority reasoning. Each feature should describe a TYPE of reasoning behavior that might carry signal about the prediction target.
+
+IMPORTANT: These features must be detectable from the reasoning text alone, without access to the question, the answer, or any other rollouts. The scoring model will only see a short segment of reasoning and must rate each feature based purely on what the text says.
+
+Good features are things like: confidence level, hedging/uncertainty, backtracking, exploring multiple approaches, self-correction, verification, systematic vs intuitive reasoning, etc. Choose features specifically relevant to distinguishing majority from minority reasoning patterns.
+
+Output a JSON array of objects with "id" (snake_case identifier) and "description" (one sentence explaining what to look for in the text).
 Output ONLY the JSON array, no other text.
 
 Example format:
 [
-  {{"id": "confident_commitment", "description": "Model confidently commits to a specific answer"}},
-  {{"id": "hedging", "description": "Model expresses uncertainty or considers multiple options"}}
+  {{"id": "confident_commitment", "description": "The text shows the model confidently committing to a specific conclusion without reservation"}},
+  {{"id": "hedging", "description": "The text shows the model expressing uncertainty or actively considering multiple options"}}
 ]"""
 
-    print(f"Proposing feature taxonomy with {TAXONOMY_MODEL}...")
+    print(f"Proposing feature taxonomy with {TAXONOMY_MODEL} (reasoning=high)...")
     response = client.chat.completions.create(
         model=TAXONOMY_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=2000,
+        max_tokens=16000,
         temperature=0.7,
+        extra_body={"reasoning": {"effort": "high"}},
     )
     raw = response.choices[0].message.content or ""
 
-    try:
-        start = raw.find("[")
-        end = raw.rfind("]") + 1
-        if start >= 0 and end > start:
-            features = json.loads(raw[start:end])
-        else:
-            features = json.loads(raw)
-    except json.JSONDecodeError:
-        print("Failed to parse taxonomy response, using fallback")
-        features = _fallback_taxonomy()
+    start = raw.find("[")
+    end = raw.rfind("]") + 1
+    if start >= 0 and end > start:
+        features = json.loads(raw[start:end])
+    else:
+        features = json.loads(raw)
 
     print(f"Proposed {len(features)} features:")
     for f in features:
         print(f"  - {f['id']}: {f['description']}")
     return features
-
-
-def _fallback_taxonomy() -> List[Dict[str, str]]:
-    """Fallback taxonomy if LLM parsing fails."""
-    return [
-        {"id": "problem_setup", "description": "Model restates or sets up the problem"},
-        {"id": "standard_approach", "description": "Model follows a common solution method"},
-        {"id": "unusual_approach", "description": "Model uses a non-standard or creative method"},
-        {"id": "calculation", "description": "Model performs arithmetic or symbolic computation"},
-        {"id": "verification", "description": "Model checks its own work or verifies results"},
-        {"id": "backtracking", "description": "Model corrects itself or reverses a previous step"},
-        {"id": "hedging", "description": "Model expresses uncertainty or considers alternatives"},
-        {"id": "confident_commitment", "description": "Model confidently commits to an answer"},
-    ]
 
 
 # ── Chunk scoring ─────────────────────────────────────────────────────
@@ -319,6 +359,8 @@ def _save_labeling(results: List[Dict], save_path: Path, taxonomy: List[Dict[str
                 "task_description": TASK_DESCRIPTION,
                 "taxonomy_model": TAXONOMY_MODEL,
                 "annotation_model": ANNOTATION_MODEL,
+                "taxonomy_prompt_ids": TAXONOMY_PROMPT_IDS_NM,
+                "eval_prompt_ids": EVAL_PROMPT_IDS_NM,
                 "n_rollouts": len(results),
                 "taxonomy": taxonomy,
                 "rollouts": results,
@@ -334,13 +376,20 @@ def generate_labeling_data(max_rollouts: Optional[int] = None):
     client = _get_openai_client()
 
     # ── Load all rollouts from verification_rollouts ──────────────────
-    dfs = []
+    # Load ALL prompts (taxonomy prompts needed for taxonomy proposal context)
+    all_dfs = []
     for qid in ALL_PROMPT_IDS_NM:
         df = _load_verification_rollouts(qid)
-        dfs.append(df)
+        all_dfs.append(df)
 
-    all_df = pd.concat(dfs, ignore_index=True)
-    print(f"\nTotal rollouts: {len(all_df)} ({all_df['label'].value_counts().to_dict()})")
+    all_df = pd.concat(all_dfs, ignore_index=True)
+    print(f"\nTotal rollouts (all prompts): {len(all_df)} ({all_df['label'].value_counts().to_dict()})")
+
+    # Eval rollouts: only prompts NOT used for taxonomy context
+    eval_df = all_df[~all_df["prompt_id"].isin(TAXONOMY_PROMPT_IDS_NM)]
+    print(f"Eval rollouts (excluding taxonomy prompts): {len(eval_df)}")
+    print(f"  Taxonomy prompts (context only): {TAXONOMY_PROMPT_IDS_NM}")
+    print(f"  Eval prompts: {EVAL_PROMPT_IDS_NM}")
 
     # ── Propose taxonomy (or load existing) ───────────────────────────
     taxonomy_path = OUTPUT_DIR / "taxonomy.json"
@@ -350,11 +399,16 @@ def generate_labeling_data(max_rollouts: Optional[int] = None):
             taxonomy_data = json.load(f)
         taxonomy = taxonomy_data["features"]
     else:
-        taxonomy = _propose_taxonomy(client)
+        taxonomy = _propose_taxonomy(client, all_df)
         taxonomy_path.parent.mkdir(parents=True, exist_ok=True)
         with open(taxonomy_path, "w") as f:
             json.dump(
-                {"task_description": TASK_DESCRIPTION, "features": taxonomy},
+                {
+                    "task_description": TASK_DESCRIPTION,
+                    "features": taxonomy,
+                    "taxonomy_prompt_ids": TAXONOMY_PROMPT_IDS_NM,
+                    "eval_prompt_ids": EVAL_PROMPT_IDS_NM,
+                },
                 f,
                 indent=2,
             )
@@ -362,9 +416,9 @@ def generate_labeling_data(max_rollouts: Optional[int] = None):
 
     feature_ids = [feat["id"] for feat in taxonomy]
 
-    # ── Build rollout list ────────────────────────────────────────────
+    # ── Build rollout list (eval prompts only) ────────────────────────
     all_rollouts = []
-    for _, row in all_df.iterrows():
+    for _, row in eval_df.iterrows():
         cot = row["cot_content"]
         if not isinstance(cot, str) or len(cot) < 50:
             continue
@@ -619,9 +673,8 @@ def train_baseline():
     print(f"  majority (0): {(y == 0).sum()}, minority (1): {(y == 1).sum()}")
 
     feature_dim = NUM_SEGMENTS * len(feature_ids)
-    segment_names = ["early", "mid", "late"]
     feature_names = [
-        f"{seg}_{fid}" for seg in segment_names for fid in feature_ids
+        f"seg{s}_{fid}" for s in range(NUM_SEGMENTS) for fid in feature_ids
     ]
     print(f"Feature dimensionality: {feature_dim}")
 
@@ -635,12 +688,25 @@ def train_baseline():
         f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
         return {"precision": prec, "recall": rec, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
 
-    # ── LOO cross-validation ──────────────────────────────────────────
-    folds = MinMajAnswerTask.loo_folds()
+    # ── LOO cross-validation (eval prompts only) ────────────────────
+    # Load taxonomy_prompt_ids from taxonomy.json if available, else use constant
+    taxonomy_path = OUTPUT_DIR / "taxonomy.json"
+    if taxonomy_path.exists():
+        with open(taxonomy_path) as f:
+            tax_meta = json.load(f)
+        taxonomy_prompt_ids = set(tax_meta.get("taxonomy_prompt_ids", TAXONOMY_PROMPT_IDS_NM))
+    else:
+        taxonomy_prompt_ids = set(TAXONOMY_PROMPT_IDS_NM)
+
+    # Only fold over prompts not used for taxonomy
+    eval_pids = [pid for pid in ALL_PROMPT_IDS if pid + NM_SUFFIX not in taxonomy_prompt_ids]
+    folds = MinMajAnswerTask.loo_folds(prompt_ids=eval_pids)
     fold_results = []
     all_test_preds = []
     all_test_true = []
 
+    print(f"\n  Taxonomy prompts (excluded): {sorted(taxonomy_prompt_ids)}")
+    print(f"  Eval prompts: {eval_pids}")
     print(f"\n{'=' * 60}")
     print(f"  Feature Vector Baseline — LOO Cross-Validation ({len(folds)} folds)")
     print(f"{'=' * 60}")
