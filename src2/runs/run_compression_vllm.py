@@ -22,8 +22,11 @@ Usage:
 import json
 import os
 import sys
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+warnings.filterwarnings("ignore", message=".*torch_dtype.*is deprecated.*")
 
 import torch
 from tqdm import tqdm
@@ -73,19 +76,11 @@ QUESTION_IDS = [
     "gpqa_gpqa_diamond_0039",
 ]
 
-# ── vLLM initialization (multi-GPU auto-detect) ─────────────────────
-
-NUM_GPUS = torch.cuda.device_count() or 1
-
-llm = LLM(
-    model=SUBJECT_MODEL,
-    gpu_memory_utilization=0.90,
-    tensor_parallel_size=NUM_GPUS,
-    max_model_len=16384,
-    trust_remote_code=True,
-)
-tokenizer = AutoTokenizer.from_pretrained(SUBJECT_MODEL, trust_remote_code=True)
-END_THINK_TOKENS = tokenizer.encode("</think>", add_special_tokens=False)
+# Module-level globals — initialized in __main__ guard to avoid
+# re-initialization in vLLM's spawned child processes.
+llm = None
+tokenizer = None
+END_THINK_TOKENS = None
 
 
 class LastNBaselineMethod(BaseMethod):
@@ -430,212 +425,227 @@ def compute_baseline_vllm(task, question_id, rollout_idx=0, num_resamples=50,
 
 # ── Main ─────────────────────────────────────────────────────────────
 
-task = CompressedCotTask(
-    model=SUBJECT_MODEL,
-    compression_factor=COMPRESSION_FACTOR,
-    char_limit_multiplier=CHAR_LIMIT_MULTIPLIER,
-    compress_pct=COMPRESS_PCT,
-    region=REGION,
-)
+if __name__ == "__main__":
 
-run_bb = "--skip-bb" not in sys.argv
-run_faithful = "--skip-faithful" not in sys.argv
-run_baseline = "--skip-baseline" not in sys.argv
+    # ── vLLM initialization (multi-GPU auto-detect) ──────────────────
+    NUM_GPUS = torch.cuda.device_count() or 1
 
-# Build skip index from existing results
-BB_DIR = str(task.data_dir / "llm_monitor_sentence_selection")
-FB_DIR = str(task.data_dir / "llm_monitor_faithful_sentence_selection")
-LN_DIR = str(task.data_dir / "last_n_baseline")
-
-tqdm.write("Scanning existing results...")
-bb_index = build_result_index(BB_DIR) if run_bb else {}
-fb_index = build_result_index(FB_DIR) if run_faithful else {}
-ln_index = build_result_index(LN_DIR) if run_baseline else {}
-
-for qid in QUESTION_IDS:
-    bb_n = bb_index.get(qid, 0)
-    fb_n = fb_index.get(qid, 0)
-    ln_n = ln_index.get(qid, 0)
-    tqdm.write(f"  {qid}: BB={bb_n}, Faithful={fb_n}, Last-N={ln_n}")
-
-for q_idx, qid in enumerate(QUESTION_IDS):
-    # Determine which methods need to run
-    need_bb = run_bb and bb_index.get(qid, 0) < NUM_ROLLOUTS
-    need_fb = run_faithful and fb_index.get(qid, 0) < NUM_ROLLOUTS
-    need_ln = run_baseline and ln_index.get(qid, 0) < NUM_ROLLOUTS
-
-    if not need_bb and not need_fb and not need_ln:
-        tqdm.write(f"\n[{q_idx+1}/{len(QUESTION_IDS)}] {qid} — skipping (already complete)")
-        continue
-
-    methods_str = ", ".join(
-        [m for m, needed in [("BB", need_bb), ("Faithful", need_fb), ("Last-N", need_ln)] if needed]
+    llm = LLM(
+        model=SUBJECT_MODEL,
+        gpu_memory_utilization=0.90,
+        tensor_parallel_size=NUM_GPUS,
+        max_model_len=16384,
+        trust_remote_code=True,
     )
-    tqdm.write(f"\n{'='*60}")
-    tqdm.write(f"[{q_idx+1}/{len(QUESTION_IDS)}] {qid}  [{methods_str}]")
-    tqdm.write(f"{'='*60}")
+    tokenizer = AutoTokenizer.from_pretrained(SUBJECT_MODEL, trust_remote_code=True)
+    END_THINK_TOKENS = tokenizer.encode("</think>", add_special_tokens=False)
 
-    # Load or compute baseline distribution
-    baseline_path = task.compression_dir / qid / "baseline_distribution.json"
-    if baseline_path.exists():
-        with open(baseline_path) as f:
-            baseline = json.load(f)
-    else:
-        tqdm.write("  Computing baseline distribution (vLLM)...")
-        baseline = compute_baseline_vllm(
-            task, qid, rollout_idx=0, num_resamples=NUM_RESAMPLES,
-        )
-        baseline_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(baseline_path, "w") as f:
-            json.dump(baseline, f, indent=2)
-        tqdm.write(f"  Saved baseline to {baseline_path}")
-
-    # ── Phase 1: Prepare all specs + monitor predictions (parallel) ──
-    def prepare_one_rollout(rollout_idx):
-        """Prepare spec + run monitors for one rollout. Returns list of jobs."""
-        spec = get_existing_spec(task, qid, rollout_idx)
-        if spec is None:
-            spec = task.run_data(question_id=qid, rollout_idx=rollout_idx, verbose=False)
-        if spec is None:
-            return []
-
-        loaded = task.load_question_and_cot(qid, rollout_idx)
-        if loaded is None:
-            return []
-        question, _ = loaded
-        monitor_row = build_monitor_row(spec, question)
-        monitor_data = [monitor_row]
-
-        rollout_jobs = []
-
-        if need_bb:
-            prompt = SentenceSelectionPrompt()
-            monitor = LlmMonitor(prompt=prompt, model=MONITOR_MODEL)
-            monitor.set_task(task)
-            results = monitor.infer(monitor_data, verbose=False)
-            selected = results[0].get("monitor_prediction", [])
-            relative = [i - spec.region_start for i in selected]
-            compressed_cot = spec.reconstruct_from_indices(relative)
-            rollout_jobs.append({
-                "rollout_idx": rollout_idx, "method": "bb",
-                "compressed_cot": compressed_cot,
-                "selected_indices": selected, "relative_indices": relative,
-                "output_folder": monitor.get_folder(), "method_obj": monitor,
-                "spec": spec,
-            })
-
-        if need_fb:
-            prompt = FaithfulSentenceSelectionPrompt()
-            monitor = LlmMonitor(prompt=prompt, model=MONITOR_MODEL)
-            monitor.set_task(task)
-            results = monitor.infer(monitor_data, verbose=False)
-            selected = results[0].get("monitor_prediction", [])
-            relative = [i - spec.region_start for i in selected]
-            compressed_cot = spec.reconstruct_from_indices(relative)
-            rollout_jobs.append({
-                "rollout_idx": rollout_idx, "method": "faithful",
-                "compressed_cot": compressed_cot,
-                "selected_indices": selected, "relative_indices": relative,
-                "output_folder": monitor.get_folder(), "method_obj": monitor,
-                "spec": spec,
-            })
-
-        if need_ln:
-            last_n = LastNBaselineMethod()
-            last_n.set_task(task)
-            results = last_n.infer(monitor_data, verbose=False)
-            selected = results[0].get("monitor_prediction", [])
-            relative = [i - spec.region_start for i in selected]
-            compressed_cot = spec.reconstruct_from_indices(relative)
-            rollout_jobs.append({
-                "rollout_idx": rollout_idx, "method": "last_n",
-                "compressed_cot": compressed_cot,
-                "selected_indices": selected, "relative_indices": relative,
-                "output_folder": last_n.get_folder(), "method_obj": last_n,
-                "spec": spec,
-            })
-
-        return rollout_jobs
-
-    jobs = []
-    with ThreadPoolExecutor(max_workers=NUM_ROLLOUTS) as executor:
-        futures = {
-            executor.submit(prepare_one_rollout, ri): ri
-            for ri in range(NUM_ROLLOUTS)
-        }
-        for future in tqdm(
-            as_completed(futures), total=NUM_ROLLOUTS,
-            desc="  Preparing", unit="rollout", leave=False,
-        ):
-            rollout_jobs = future.result()
-            jobs.extend(rollout_jobs)
-    tqdm.write(f"  Prepared {len(jobs)} compression jobs")
-
-    # ── Phase 2: Batch evaluate ALL compressions via vLLM ──
-    distributions = batch_evaluate_compressions(
-        task, qid, jobs,
-        num_resamples=NUM_RESAMPLES,
+    task = CompressedCotTask(
+        model=SUBJECT_MODEL,
+        compression_factor=COMPRESSION_FACTOR,
+        char_limit_multiplier=CHAR_LIMIT_MULTIPLIER,
+        compress_pct=COMPRESS_PCT,
+        region=REGION,
     )
 
-    # ── Phase 3: Compute KL, save results ──
-    bb_eval_results = []
-    faithful_eval_results = []
-    last_n_eval_results = []
+    run_bb = "--skip-bb" not in sys.argv
+    run_faithful = "--skip-faithful" not in sys.argv
+    run_baseline = "--skip-baseline" not in sys.argv
 
-    for job, dist in zip(jobs, distributions):
-        metrics = task.evaluate(
-            [dist["distribution"]], [baseline["distribution"]],
-            mode=EVAL_MODE,
+    # Build skip index from existing results
+    BB_DIR = str(task.data_dir / "llm_monitor_sentence_selection")
+    FB_DIR = str(task.data_dir / "llm_monitor_faithful_sentence_selection")
+    LN_DIR = str(task.data_dir / "last_n_baseline")
+
+    tqdm.write("Scanning existing results...")
+    bb_index = build_result_index(BB_DIR) if run_bb else {}
+    fb_index = build_result_index(FB_DIR) if run_faithful else {}
+    ln_index = build_result_index(LN_DIR) if run_baseline else {}
+
+    for qid in QUESTION_IDS:
+        bb_n = bb_index.get(qid, 0)
+        fb_n = fb_index.get(qid, 0)
+        ln_n = ln_index.get(qid, 0)
+        tqdm.write(f"  {qid}: BB={bb_n}, Faithful={fb_n}, Last-N={ln_n}")
+
+    for q_idx, qid in enumerate(QUESTION_IDS):
+        # Determine which methods need to run
+        need_bb = run_bb and bb_index.get(qid, 0) < NUM_ROLLOUTS
+        need_fb = run_faithful and fb_index.get(qid, 0) < NUM_ROLLOUTS
+        need_ln = run_baseline and ln_index.get(qid, 0) < NUM_ROLLOUTS
+
+        if not need_bb and not need_fb and not need_ln:
+            tqdm.write(f"\n[{q_idx+1}/{len(QUESTION_IDS)}] {qid} — skipping (already complete)")
+            continue
+
+        methods_str = ", ".join(
+            [m for m, needed in [("BB", need_bb), ("Faithful", need_fb), ("Last-N", need_ln)] if needed]
+        )
+        tqdm.write(f"\n{'='*60}")
+        tqdm.write(f"[{q_idx+1}/{len(QUESTION_IDS)}] {qid}  [{methods_str}]")
+        tqdm.write(f"{'='*60}")
+
+        # Load or compute baseline distribution
+        baseline_path = task.compression_dir / qid / "baseline_distribution.json"
+        if baseline_path.exists():
+            with open(baseline_path) as f:
+                baseline = json.load(f)
+        else:
+            tqdm.write("  Computing baseline distribution (vLLM)...")
+            baseline = compute_baseline_vllm(
+                task, qid, rollout_idx=0, num_resamples=NUM_RESAMPLES,
+            )
+            baseline_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(baseline_path, "w") as f:
+                json.dump(baseline, f, indent=2)
+            tqdm.write(f"  Saved baseline to {baseline_path}")
+
+        # ── Phase 1: Prepare all specs + monitor predictions (parallel) ──
+        def prepare_one_rollout(rollout_idx):
+            """Prepare spec + run monitors for one rollout. Returns list of jobs."""
+            spec = get_existing_spec(task, qid, rollout_idx)
+            if spec is None:
+                spec = task.run_data(question_id=qid, rollout_idx=rollout_idx, verbose=False)
+            if spec is None:
+                return []
+
+            loaded = task.load_question_and_cot(qid, rollout_idx)
+            if loaded is None:
+                return []
+            question, _ = loaded
+            monitor_row = build_monitor_row(spec, question)
+            monitor_data = [monitor_row]
+
+            rollout_jobs = []
+
+            if need_bb:
+                prompt = SentenceSelectionPrompt()
+                monitor = LlmMonitor(prompt=prompt, model=MONITOR_MODEL)
+                monitor.set_task(task)
+                results = monitor.infer(monitor_data, verbose=False)
+                selected = results[0].get("monitor_prediction", [])
+                relative = [i - spec.region_start for i in selected]
+                compressed_cot = spec.reconstruct_from_indices(relative)
+                rollout_jobs.append({
+                    "rollout_idx": rollout_idx, "method": "bb",
+                    "compressed_cot": compressed_cot,
+                    "selected_indices": selected, "relative_indices": relative,
+                    "output_folder": monitor.get_folder(), "method_obj": monitor,
+                    "spec": spec,
+                })
+
+            if need_fb:
+                prompt = FaithfulSentenceSelectionPrompt()
+                monitor = LlmMonitor(prompt=prompt, model=MONITOR_MODEL)
+                monitor.set_task(task)
+                results = monitor.infer(monitor_data, verbose=False)
+                selected = results[0].get("monitor_prediction", [])
+                relative = [i - spec.region_start for i in selected]
+                compressed_cot = spec.reconstruct_from_indices(relative)
+                rollout_jobs.append({
+                    "rollout_idx": rollout_idx, "method": "faithful",
+                    "compressed_cot": compressed_cot,
+                    "selected_indices": selected, "relative_indices": relative,
+                    "output_folder": monitor.get_folder(), "method_obj": monitor,
+                    "spec": spec,
+                })
+
+            if need_ln:
+                last_n = LastNBaselineMethod()
+                last_n.set_task(task)
+                results = last_n.infer(monitor_data, verbose=False)
+                selected = results[0].get("monitor_prediction", [])
+                relative = [i - spec.region_start for i in selected]
+                compressed_cot = spec.reconstruct_from_indices(relative)
+                rollout_jobs.append({
+                    "rollout_idx": rollout_idx, "method": "last_n",
+                    "compressed_cot": compressed_cot,
+                    "selected_indices": selected, "relative_indices": relative,
+                    "output_folder": last_n.get_folder(), "method_obj": last_n,
+                    "spec": spec,
+                })
+
+            return rollout_jobs
+
+        jobs = []
+        with ThreadPoolExecutor(max_workers=NUM_ROLLOUTS) as executor:
+            futures = {
+                executor.submit(prepare_one_rollout, ri): ri
+                for ri in range(NUM_ROLLOUTS)
+            }
+            for future in tqdm(
+                as_completed(futures), total=NUM_ROLLOUTS,
+                desc="  Preparing", unit="rollout", leave=False,
+            ):
+                rollout_jobs = future.result()
+                jobs.extend(rollout_jobs)
+        tqdm.write(f"  Prepared {len(jobs)} compression jobs")
+
+        # ── Phase 2: Batch evaluate ALL compressions via vLLM ──
+        distributions = batch_evaluate_compressions(
+            task, qid, jobs,
+            num_resamples=NUM_RESAMPLES,
         )
 
-        eval_result = {
-            "mode": EVAL_MODE,
-            "selected_indices": job["selected_indices"],
-            "relative_indices": job["relative_indices"],
-            "compressed_distribution": dist,
-            "baseline_distribution": baseline,
-            **metrics,
-        }
+        # ── Phase 3: Compute KL, save results ──
+        bb_eval_results = []
+        faithful_eval_results = []
+        last_n_eval_results = []
 
-        # Save per-rollout results
-        output_folder = Path(job["output_folder"])
-        with open(output_folder / "compression_eval.json", "w") as f:
-            json.dump(eval_result, f, indent=2)
-        with open(output_folder / "compressed_cot.txt", "w") as f:
-            f.write(job["compressed_cot"])
+        for job, dist in zip(jobs, distributions):
+            metrics = task.evaluate(
+                [dist["distribution"]], [baseline["distribution"]],
+                mode=EVAL_MODE,
+            )
 
-        if hasattr(job["method_obj"], "_output") and job["method_obj"]._output:
-            job["method_obj"]._output.mark_success()
+            eval_result = {
+                "mode": EVAL_MODE,
+                "selected_indices": job["selected_indices"],
+                "relative_indices": job["relative_indices"],
+                "compressed_distribution": dist,
+                "baseline_distribution": baseline,
+                **metrics,
+            }
 
-        record = {"rollout_idx": job["rollout_idx"], **eval_result}
-        if job["method"] == "bb":
-            bb_eval_results.append(record)
-        elif job["method"] == "faithful":
-            faithful_eval_results.append(record)
-        elif job["method"] == "last_n":
-            last_n_eval_results.append(record)
+            # Save per-rollout results
+            output_folder = Path(job["output_folder"])
+            with open(output_folder / "compression_eval.json", "w") as f:
+                json.dump(eval_result, f, indent=2)
+            with open(output_folder / "compressed_cot.txt", "w") as f:
+                f.write(job["compressed_cot"])
 
-    # Print question summary
-    for method_name, results in [("BB Monitor", bb_eval_results),
-                                  ("Faithful BB", faithful_eval_results),
-                                  ("Last-N", last_n_eval_results)]:
-        if results:
-            avg_kl = sum(r["kl_divergence"] for r in results) / len(results)
-            tqdm.write(f"  {method_name}: avg KL={avg_kl:.4f} ({len(results)} rollouts)")
+            if hasattr(job["method_obj"], "_output") and job["method_obj"]._output:
+                job["method_obj"]._output.mark_success()
 
-    # Save aggregate results per question
-    if bb_eval_results:
-        summary_path = task.compression_dir / qid / "all_rollouts_bb_eval.json"
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(summary_path, "w") as f:
-            json.dump(bb_eval_results, f, indent=2)
-    if faithful_eval_results:
-        summary_path = task.compression_dir / qid / "all_rollouts_faithful_eval.json"
-        with open(summary_path, "w") as f:
-            json.dump(faithful_eval_results, f, indent=2)
-    if last_n_eval_results:
-        summary_path = task.compression_dir / qid / "all_rollouts_last_n_eval.json"
-        with open(summary_path, "w") as f:
-            json.dump(last_n_eval_results, f, indent=2)
+            record = {"rollout_idx": job["rollout_idx"], **eval_result}
+            if job["method"] == "bb":
+                bb_eval_results.append(record)
+            elif job["method"] == "faithful":
+                faithful_eval_results.append(record)
+            elif job["method"] == "last_n":
+                last_n_eval_results.append(record)
 
-tqdm.write("\nDone.")
+        # Print question summary
+        for method_name, results in [("BB Monitor", bb_eval_results),
+                                      ("Faithful BB", faithful_eval_results),
+                                      ("Last-N", last_n_eval_results)]:
+            if results:
+                avg_kl = sum(r["kl_divergence"] for r in results) / len(results)
+                tqdm.write(f"  {method_name}: avg KL={avg_kl:.4f} ({len(results)} rollouts)")
+
+        # Save aggregate results per question
+        if bb_eval_results:
+            summary_path = task.compression_dir / qid / "all_rollouts_bb_eval.json"
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(summary_path, "w") as f:
+                json.dump(bb_eval_results, f, indent=2)
+        if faithful_eval_results:
+            summary_path = task.compression_dir / qid / "all_rollouts_faithful_eval.json"
+            with open(summary_path, "w") as f:
+                json.dump(faithful_eval_results, f, indent=2)
+        if last_n_eval_results:
+            summary_path = task.compression_dir / qid / "all_rollouts_last_n_eval.json"
+            with open(summary_path, "w") as f:
+                json.dump(last_n_eval_results, f, indent=2)
+
+    tqdm.write("\nDone.")
