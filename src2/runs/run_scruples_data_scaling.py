@@ -12,22 +12,21 @@ Usage:
 
 import json
 from pathlib import Path
+from typing import List, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src2.methods.attention_probe import AttentionPoolingProbe
 from src2.tasks import ScruplesTask
-from src2.tasks.scruples.prompts import INTERVENTION_SUGGESTED_ANSWER
 
 # ── Configuration (mirrors run_sycophancy_probe.py) ──────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "scruples"
 
 SUBJECT_MODEL = "moonshotai/kimi-k2-thinking"
-ACTIVATION_MODEL = "Qwen/Qwen3-32B"
 LAYER = 32
 
 VARIANTS = ["suggest_wrong", "suggest_right"]
@@ -41,7 +40,6 @@ DROPOUT = 0.3
 EPOCHS = 40
 BATCH_SIZE = 64
 GRAD_CLIP = 1.0
-TEST_SPLIT = 0.2
 SWITCH_THRESHOLD = 0.40
 HIGH_INTERVENTION_RATE = 0.82
 LOW_INTERVENTION_RATE = 0.70
@@ -66,6 +64,64 @@ def _compute_f1(y_true, y_pred):
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     return 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+
+LABEL_MAP = {"sycophantic": 1, "nonsycophantic": 0}
+
+
+def _load_activations_from_df(
+    df: pd.DataFrame, layer: int
+) -> Tuple[List[np.ndarray], np.ndarray]:
+    """Load activation segments directly from the filepaths in a split DataFrame."""
+    seq_key = f"layer{layer}_full_sequence"
+    bnd_key = f"layer{layer}_boundaries"
+    boundary_names = ["last_input", "last_thinking", "last_response"]
+
+    X_list: List[np.ndarray] = []
+    y_list: List[int] = []
+    skipped = 0
+
+    for _, row in df.iterrows():
+        filepath = Path(row["filepath"])
+        act_path = filepath.with_suffix(".npz")
+        if not act_path.exists():
+            skipped += 1
+            continue
+
+        try:
+            f = np.load(act_path, mmap_mode="r")
+            if seq_key not in f.files:
+                del f
+                skipped += 1
+                continue
+            boundaries = f[bnd_key]
+        except Exception:
+            skipped += 1
+            continue
+
+        last_input = int(boundaries[boundary_names.index("last_input")])
+        last_response = int(boundaries[boundary_names.index("last_response")])
+        if last_input < 0 or last_response <= last_input:
+            del f
+            skipped += 1
+            continue
+
+        segment = np.array(
+            f[seq_key][last_input + 1 : last_response + 1],
+            dtype=np.float16,
+        )
+        del f
+        if segment.shape[0] == 0:
+            skipped += 1
+            continue
+
+        X_list.append(segment)
+        y_list.append(LABEL_MAP[row["label"]])
+
+    if skipped:
+        print(f"  Skipped {skipped}/{len(df)} rows (missing/invalid activations)")
+
+    return X_list, np.array(y_list, dtype=np.int64)
 
 
 # ── Batched attention probes ─────────────────────────────────────────
@@ -332,16 +388,12 @@ def train_all_probes_batched(train_X_list, train_y,
 
 
 def main():
-    # ── Load data (same as run_sycophancy_probe) ──────────────────────
-    tasks = {}
-    for variant in VARIANTS:
-        tasks[variant] = ScruplesTask(
-            subject_model=SUBJECT_MODEL,
-            variant=variant,
-            data_dir=DATA_DIR,
-        )
-
-    task = tasks[VARIANTS[0]]
+    # ── Load data ─────────────────────────────────────────────────────
+    task = ScruplesTask(
+        subject_model=SUBJECT_MODEL,
+        variant=VARIANTS[0],
+        data_dir=DATA_DIR,
+    )
     print("Computing uncertainty-robust split...")
     split_info = task.get_uncertainty_robust_split(
         switch_threshold=SWITCH_THRESHOLD,
@@ -354,75 +406,22 @@ def main():
         variants=VARIANTS,
     )
 
-    print("Loading sycophancy probe data...")
-    probe_data = task.get_sycophancy_probe_data(
-        variants=VARIANTS,
-        layer=LAYER,
-        data_slice=split_info,
-        switch_threshold=SWITCH_THRESHOLD,
-    )
+    # ── Load activations directly from split DataFrames ─────────────
+    # Merge val into train for scaling
+    train_df = pd.concat([split_info.train_df, split_info.val_df], ignore_index=True)
+    test_df = split_info.test_df
 
-    X_list_all = probe_data["X_list"]
-    y_all = probe_data["y"]
-    anecdote_ids_all = probe_data["anecdote_ids"]
-    metadata_all = probe_data["metadata"]
+    print("Loading activations from split DataFrames...")
+    full_train_X, full_train_y = _load_activations_from_df(train_df, LAYER)
+    test_X, test_y = _load_activations_from_df(test_df, LAYER)
+    n_train = len(full_train_X)
 
-    # Filter to intervention arm only (exclude control)
-    intv_mask = [m["arm"] == "intervention" for m in metadata_all]
-    X_list_intv = [x for x, keep in zip(X_list_all, intv_mask) if keep]
-    y_intv = y_all[np.array(intv_mask)]
-    anecdote_ids_intv = [a for a, keep in zip(anecdote_ids_all, intv_mask) if keep]
-    metadata_intv = [m for m, keep in zip(metadata_all, intv_mask) if keep]
+    print(f"Train: {n_train} (syc: {(full_train_y == 1).sum()}, non-syc: {(full_train_y == 0).sum()})")
+    print(f"Test:  {len(test_X)} (syc: {(test_y == 1).sum()}, non-syc: {(test_y == 0).sum()})")
 
-    print(f"Loaded {len(X_list_all)} total, kept {len(X_list_intv)} intervention-only")
-
-    # Clean-example filter: keep only sycophantic runs from sycophantic
-    # prompts, and control-majority-matching runs from non-sycophantic prompts
-    clean_mask = []
-    for m in metadata_intv:
-        variant = m["variant"]
-        syc_answer = INTERVENTION_SUGGESTED_ANSWER[variant]
-        non_syc_answer = "B" if syc_answer == "A" else "A"
-        ctrl_rate = m.get("control_sycophancy_rate", 0.0)
-        majority_ctrl_answer = syc_answer if ctrl_rate > 0.5 else non_syc_answer
-        answer = m.get("answer", "")
-        if not isinstance(answer, str):
-            clean_mask.append(False)
-            continue
-
-        if m["prompt_is_sycophantic"]:
-            # Keep only runs where answer matches the suggested (sycophantic) answer
-            clean_mask.append(m["is_sycophantic_answer"])
-        else:
-            # Keep only runs where answer matches the majority control answer
-            clean_mask.append(answer.upper() == majority_ctrl_answer)
-
-    X_list = [x for x, keep in zip(X_list_intv, clean_mask) if keep]
-    y = y_intv[np.array(clean_mask)]
-    anecdote_ids = [a for a, keep in zip(anecdote_ids_intv, clean_mask) if keep]
-    metadata = [m for m, keep in zip(metadata_intv, clean_mask) if keep]
-
-    print(f"  After clean-example filter: {len(X_list)} (discarded {len(X_list_intv) - len(X_list)})")
-    print(f"  Class 0 (non_sycophantic): {(y == 0).sum()}")
-    print(f"  Class 1 (sycophantic):     {(y == 1).sum()}")
-
-    if len(X_list) < 10:
+    if n_train < 10:
         print("Too few samples. Exiting.")
         return
-
-    # ── Fixed train/test split (canonical from get_uncertainty_robust_split) ──
-    train_aids = set(split_info.train_df["anecdote_id"].unique()) | set(split_info.val_df["anecdote_id"].unique())  # merge val into train for scaling
-    test_aids = set(split_info.test_df["anecdote_id"].unique())
-
-    train_idx = [i for i, a in enumerate(anecdote_ids) if a in train_aids]
-    test_idx = [i for i, a in enumerate(anecdote_ids) if a in test_aids]
-
-    full_train_X = [X_list[i] for i in train_idx]
-    full_train_y = y[train_idx]
-    test_X = [X_list[i] for i in test_idx]
-    test_y = y[test_idx]
-    n_train = len(full_train_X)
-    print(f"Train: {n_train}, Test: {len(test_X)}")
 
     # ── Train all probes simultaneously ───────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -10,22 +10,16 @@ from minority rollouts. Two-phase script:
 
   Phase 2 (TRAIN): Load the saved entropy data, extract features
     (mean, final, std, etc.), and train logistic regression to
-    classify majority vs minority. Reports accuracy/F1.
+    classify majority vs minority using LOO cross-validation
+    across all 7 prompts. Reports per-fold and aggregate metrics.
 
-All prompts use A/B answer format from verification_rollouts.
-
-Train prompts:
-  bagel_ab, gpqa_nmr_compound_ab, gpqa_benzene_naming_ab,
-  harder_well_ab, bookworm_ab
-
-Test prompts:
-  gpqa_diels_alder_ab, gpqa_optical_activity_ab
+All prompts use N/M answer format from verification_rollouts.
 
 Usage:
     # Phase 1: generate forcing data (requires Tinker)
     python -m src2.runs.run_min_maj_entropy_baseline --generate
 
-    # Phase 2: train baseline (no Tinker needed)
+    # Phase 2: train baseline with LOO-CV (no Tinker needed)
     python -m src2.runs.run_min_maj_entropy_baseline --train
 
     # Both
@@ -47,6 +41,8 @@ import pandas as pd
 
 from dotenv import load_dotenv
 
+from src2.tasks.min_maj_answer.task import ALL_PROMPT_IDS, MinMajAnswerTask
+
 load_dotenv()
 
 # ── Configuration ─────────────────────────────────────────────────────
@@ -58,18 +54,9 @@ QUESTIONS_FILE = PROJECT_ROOT / "src2" / "utils" / "questions.json"
 
 SUBJECT_MODEL = "Qwen/Qwen3-32B"
 
-TRAIN_PROMPT_IDS = [
-    "bagel_ab",
-    "gpqa_nmr_compound_ab",
-    "gpqa_benzene_naming_ab",
-    "harder_well_ab",
-    "bookworm_ab",
-]
-
-TEST_PROMPT_IDS = [
-    "gpqa_diels_alder_ab",
-    "gpqa_optical_activity_ab",
-]
+# Entropy baseline uses _nm suffix variants of the prompt IDs
+NM_SUFFIX = "_nm"
+ALL_PROMPT_IDS_NM = [pid + NM_SUFFIX for pid in ALL_PROMPT_IDS]
 
 TOPK = 20
 SENTENCE_STRIDE = 1
@@ -205,7 +192,7 @@ def generate_forcing_data():
     sampling_client = client.create_sampling_client(base_model=SUBJECT_MODEL)
 
     # ── Load all rollouts from verification_rollouts ──────────────────
-    all_prompt_ids = TRAIN_PROMPT_IDS + TEST_PROMPT_IDS
+    all_prompt_ids = ALL_PROMPT_IDS_NM
     dfs = []
     user_msgs = {}
     for qid in all_prompt_ids:
@@ -214,16 +201,11 @@ def generate_forcing_data():
         user_msgs[qid] = _build_user_msg(qid)
 
     all_df = pd.concat(dfs, ignore_index=True)
-
-    train_df = all_df[all_df["prompt_id"].isin(TRAIN_PROMPT_IDS)]
-    test_df = all_df[all_df["prompt_id"].isin(TEST_PROMPT_IDS)]
-    print(f"\nTrain: {len(train_df)} ({train_df['label'].value_counts().to_dict()})")
-    print(f"Test:  {len(test_df)} ({test_df['label'].value_counts().to_dict()})")
-    print(f"Total rollouts to force: {len(all_df)}")
+    print(f"\nTotal rollouts to force: {len(all_df)} ({all_df['label'].value_counts().to_dict()})")
 
     # ── Resolve A/B token IDs ─────────────────────────────────────────
-    # All prompts use A/B answer format
-    choices = ["A", "B"]
+    # All prompts use N/M answer format
+    choices = ["N", "M"]
     answer_token_ids = {}
     for ans in choices:
         with contextlib.redirect_stdout(io.StringIO()):
@@ -231,13 +213,13 @@ def generate_forcing_data():
         answer_token_ids[ans] = ids[-1]
     print(f"Answer token IDs: {answer_token_ids}")
 
-    assert answer_token_ids["A"] != answer_token_ids["B"], \
-        "A and B map to the same token ID!"
+    assert answer_token_ids["N"] != answer_token_ids["M"], \
+        "N and M map to the same token ID!"
 
     def _get_choice_probs(prompt_str: str) -> Dict[str, float]:
         with contextlib.redirect_stdout(io.StringIO()):
             prompt_tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
-        dummy_id = answer_token_ids["A"]
+        dummy_id = answer_token_ids["N"]
         extended_tokens = prompt_tokens + [dummy_id]
         extended_input = types.ModelInput.from_ints(extended_tokens)
         topk_result = sampling_client.sample(
@@ -352,24 +334,43 @@ def generate_forcing_data():
         }
 
     n_workers = min(2000, len(remaining))
+    n_errors = 0
     print(f"Forcing {len(remaining)} rollouts with {n_workers} parallel workers")
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        futures = {
-            executor.submit(_process_rollout, r): i
-            for i, r in remaining
-        }
-        with tqdm(total=len(remaining), desc="Forcing rollouts") as pbar:
-            for future in as_completed(futures):
-                result = future.result()
-                with results_lock:
-                    new_results.append(result)
-                    pbar.update(1)
-                    if len(new_results) % 50 == 0:
-                        _save_results(prior_results + new_results, checkpoint_path)
+    try:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_process_rollout, r): i
+                for i, r in remaining
+            }
+            with tqdm(total=len(remaining), desc="Forcing rollouts") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        n_errors += 1
+                        if n_errors <= 5:
+                            print(f"\n  Error on rollout: {e}")
+                        elif n_errors == 6:
+                            print(f"\n  (suppressing further error messages)")
+                        pbar.update(1)
+                        continue
+                    with results_lock:
+                        new_results.append(result)
+                        pbar.update(1)
+                        if len(new_results) % 50 == 0:
+                            _save_results(prior_results + new_results, checkpoint_path)
+    except KeyboardInterrupt:
+        print(f"\nInterrupted! Saving {len(new_results)} new results...")
+    finally:
+        # Always save whatever we have
+        all_results = prior_results + new_results
+        _save_results(all_results, checkpoint_path)
+        print(f"Checkpoint saved: {len(all_results)} total rollouts ({n_errors} errors)")
+
+    if n_errors > 0:
+        print(f"Warning: {n_errors} rollouts failed. Rerun --generate to retry.")
 
     all_results = prior_results + new_results
-    _save_results(all_results, checkpoint_path)
-
     run_dir = _create_run_dir("generate")
     final_path = run_dir / "forcing_results.json"
     _save_results(all_results, final_path)
@@ -439,7 +440,7 @@ FEATURE_NAMES = [
 
 
 def train_baseline():
-    """Train logistic regression on entropy features."""
+    """Train logistic regression on entropy features using LOO-CV."""
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
@@ -485,39 +486,11 @@ def train_baseline():
 
     X = np.stack(X_list)
     y = np.array(y_list)
+    prompt_ids_arr = np.array(prompt_ids)
     print(f"Total samples: {len(y)}")
     print(f"  majority (0): {(y == 0).sum()}, minority (1): {(y == 1).sum()}")
 
-    # ── Train/test split by prompt ID ─────────────────────────────────
-    train_set = set(TRAIN_PROMPT_IDS)
-    test_set = set(TEST_PROMPT_IDS)
-
-    train_idx = [i for i, pid in enumerate(prompt_ids) if pid in train_set]
-    test_idx = [i for i, pid in enumerate(prompt_ids) if pid in test_set]
-
-    X_train, y_train = X[train_idx], y[train_idx]
-    X_test, y_test = X[test_idx], y[test_idx]
-    print(
-        f"Train: {len(X_train)} ({y_train.sum()} minority), "
-        f"Test: {len(X_test)} ({y_test.sum()} minority)"
-    )
-
-    # ── Standardize ───────────────────────────────────────────────────
-    scaler = StandardScaler()
-    X_train_s = scaler.fit_transform(X_train)
-    X_test_s = scaler.transform(X_test)
-
-    # ── Logistic regression ───────────────────────────────────────────
-    clf = LogisticRegression(class_weight="balanced", max_iter=1000, random_state=SEED)
-    clf.fit(X_train_s, y_train)
-
-    train_pred = clf.predict(X_train_s)
-    test_pred = clf.predict(X_test_s)
-
-    train_acc = float((y_train == train_pred).mean())
-    test_acc = float((y_test == test_pred).mean())
-
-    # Per-class metrics
+    # Per-class metrics helper
     def _metrics(y_true, y_pred, pos_label=1):
         tp = int(((y_pred == pos_label) & (y_true == pos_label)).sum())
         fp = int(((y_pred == pos_label) & (y_true != pos_label)).sum())
@@ -527,51 +500,106 @@ def train_baseline():
         f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
         return {"precision": prec, "recall": rec, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
 
-    train_min_metrics = _metrics(y_train, train_pred, pos_label=1)
-    test_min_metrics = _metrics(y_test, test_pred, pos_label=1)
+    # ── LOO cross-validation ──────────────────────────────────────────
+    folds = MinMajAnswerTask.loo_folds()
+    fold_results = []
+    all_test_preds = []
+    all_test_true = []
 
     print(f"\n{'=' * 60}")
-    print(f"  Entropy Baseline — Majority/Minority Classification")
+    print(f"  Entropy Baseline — LOO Cross-Validation ({len(folds)} folds)")
     print(f"{'=' * 60}")
-    print(f"  Train: Acc={train_acc:.3f}, Minority F1={train_min_metrics['f1']:.3f}")
-    print(f"  Test:  Acc={test_acc:.3f}, Minority F1={test_min_metrics['f1']:.3f}")
-    majority_frac = (y_test == 0).sum() / len(y_test) if len(y_test) > 0 else 0.0
-    print(f"  Chance baseline (always majority): {majority_frac:.3f}")
 
-    # Per-prompt test breakdown
-    for pid in TEST_PROMPT_IDS:
-        pid_idx = [i for i in test_idx if prompt_ids[i] == pid]
-        if not pid_idx:
+    for fold in folds:
+        test_pid_nm = fold["test_prompt_id"] + NM_SUFFIX
+        train_pids_nm = {pid + NM_SUFFIX for pid in fold["train_prompt_ids"]}
+
+        train_mask = np.isin(prompt_ids_arr, list(train_pids_nm))
+        test_mask = prompt_ids_arr == test_pid_nm
+
+        if not test_mask.any():
+            print(f"  Fold {fold['fold_idx']} ({test_pid_nm}): no test data, skipping")
             continue
-        pid_y = y[pid_idx]
-        pid_pred = clf.predict(scaler.transform(X[pid_idx]))
-        pid_acc = float((pid_y == pid_pred).mean())
-        pid_m = _metrics(pid_y, pid_pred)
-        print(f"\n  {pid} (n={len(pid_idx)}, {(pid_y == 1).sum()} minority):")
-        print(f"    Acc={pid_acc:.3f}, Minority F1={pid_m['f1']:.3f}")
 
-    # Feature importances
-    print(f"\n  Feature coefficients:")
-    for name, coef in sorted(
-        zip(FEATURE_NAMES, clf.coef_[0]), key=lambda x: -abs(x[1])
-    ):
-        print(f"    {name:>20s}: {coef:+.4f}")
+        X_train, y_train = X[train_mask], y[train_mask]
+        X_test, y_test = X[test_mask], y[test_mask]
+
+        # Standardize per fold
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s = scaler.transform(X_test)
+
+        # Fit logistic regression
+        clf = LogisticRegression(
+            class_weight="balanced", max_iter=1000, random_state=SEED
+        )
+        clf.fit(X_train_s, y_train)
+
+        test_pred = clf.predict(X_test_s)
+        test_acc = float((y_test == test_pred).mean())
+        min_m = _metrics(y_test, test_pred, pos_label=1)
+        maj_m = _metrics(y_test, test_pred, pos_label=0)
+        macro_f1 = (min_m["f1"] + maj_m["f1"]) / 2
+
+        print(f"  Fold {fold['fold_idx']} ({fold['test_prompt_id']}): "
+              f"Acc={test_acc:.3f}, F1={macro_f1:.3f} "
+              f"(maj={maj_m['f1']:.3f}, min={min_m['f1']:.3f}), "
+              f"n={len(y_test)}")
+
+        fold_results.append({
+            "fold_idx": fold["fold_idx"],
+            "test_prompt_id": fold["test_prompt_id"],
+            "accuracy": test_acc,
+            "macro_f1": macro_f1,
+            "majority_f1": maj_m["f1"],
+            "majority_precision": maj_m["precision"],
+            "majority_recall": maj_m["recall"],
+            "minority_f1": min_m["f1"],
+            "minority_precision": min_m["precision"],
+            "minority_recall": min_m["recall"],
+            "n_test": len(y_test),
+            "n_train": len(y_train),
+        })
+        all_test_preds.extend(test_pred.tolist())
+        all_test_true.extend(y_test.tolist())
+
+    # ── Aggregate metrics ─────────────────────────────────────────────
+    all_test_preds = np.array(all_test_preds)
+    all_test_true = np.array(all_test_true)
+    pooled_acc = float((all_test_true == all_test_preds).mean())
+    pooled_min = _metrics(all_test_true, all_test_preds, pos_label=1)
+    pooled_maj = _metrics(all_test_true, all_test_preds, pos_label=0)
+    pooled_macro_f1 = (pooled_min["f1"] + pooled_maj["f1"]) / 2
+    fold_f1s = [fr["macro_f1"] for fr in fold_results]
+    mean_fold_f1 = sum(fold_f1s) / len(fold_f1s) if fold_f1s else 0.0
+
+    majority_frac = float((all_test_true == 0).sum()) / len(all_test_true) if len(all_test_true) > 0 else 0.0
+
+    print(f"\n  Aggregate ({len(fold_results)} folds):")
+    print(f"    Pooled accuracy:    {pooled_acc:.3f} (n={len(all_test_true)})")
+    print(f"    Pooled macro F1:    {pooled_macro_f1:.3f}")
+    print(f"    Mean fold macro F1: {mean_fold_f1:.3f}")
+    print(f"    Pooled majority F1: {pooled_maj['f1']:.3f}")
+    print(f"    Pooled minority F1: {pooled_min['f1']:.3f}")
+    print(f"    Chance baseline (always majority): {majority_frac:.3f}")
 
     # ── Save ──────────────────────────────────────────────────────────
     output = {
-        "train_accuracy": train_acc,
-        "test_accuracy": test_acc,
-        "train_minority_f1": train_min_metrics["f1"],
-        "test_minority_f1": test_min_metrics["f1"],
-        "test_minority_precision": test_min_metrics["precision"],
-        "test_minority_recall": test_min_metrics["recall"],
-        "n_train": len(X_train),
-        "n_test": len(X_test),
+        "method": "loo_cv",
+        "pooled_accuracy": pooled_acc,
+        "pooled_macro_f1": pooled_macro_f1,
+        "mean_fold_macro_f1": mean_fold_f1,
+        "pooled_majority_f1": pooled_maj["f1"],
+        "pooled_majority_precision": pooled_maj["precision"],
+        "pooled_majority_recall": pooled_maj["recall"],
+        "pooled_minority_f1": pooled_min["f1"],
+        "pooled_minority_precision": pooled_min["precision"],
+        "pooled_minority_recall": pooled_min["recall"],
+        "chance_baseline": majority_frac,
+        "n_folds": len(fold_results),
+        "n_total": len(all_test_true),
         "feature_names": FEATURE_NAMES,
-        "coefficients": clf.coef_[0].tolist(),
-        "intercept": float(clf.intercept_[0]),
-        "train_prompt_ids": TRAIN_PROMPT_IDS,
-        "test_prompt_ids": TEST_PROMPT_IDS,
+        "fold_results": fold_results,
     }
     run_dir = _create_run_dir("train")
     with open(run_dir / "baseline_results.json", "w") as f:

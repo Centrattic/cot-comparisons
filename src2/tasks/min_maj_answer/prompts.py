@@ -5,6 +5,7 @@ MinMajBlackBoxMonitorPrompt: Few-shot black-box monitor that classifies
 a rollout as majority or minority using examples from other prompts.
 """
 
+import json
 import re
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +21,39 @@ def _truncate_cot(cot: str, max_chars: int = 2000) -> str:
     return cot[:half] + "\n[... truncated ...]\n" + cot[-half:]
 
 
+def _build_examples_json(
+    examples_by_prompt: List[Dict[str, Any]], cot_max_chars: int = 2000
+) -> str:
+    """Build a JSON string of examples grouped by question.
+
+    Returns a JSON array like:
+    [
+      {
+        "question": "...",
+        "rollouts": [
+          {"chain_of_thought": "...", "final_answer": "...", "classification": "majority"},
+          ...
+        ]
+      },
+      ...
+    ]
+    """
+    grouped = []
+    for prompt_group in examples_by_prompt:
+        rollouts = []
+        for ex in prompt_group["examples"]:
+            rollouts.append({
+                "chain_of_thought": _truncate_cot(ex["cot_content"], cot_max_chars),
+                "final_answer": ex["answer"],
+                "classification": ex["label"],
+            })
+        grouped.append({
+            "question": prompt_group["prompt_text"],
+            "rollouts": rollouts,
+        })
+    return json.dumps(grouped, indent=2)
+
+
 class MinMajBlackBoxMonitorPrompt(BasePrompt):
     """
     Few-shot black-box monitor for majority/minority classification.
@@ -32,11 +66,13 @@ class MinMajBlackBoxMonitorPrompt(BasePrompt):
       - "prompt_text": str — the question/prompt
       - "cot_content": str — the chain-of-thought reasoning
       - "answer": str — the final answer
-      - "examples": list[dict] — few-shot examples, each with:
-          - "example_prompt_text": str
-          - "example_cot": str
-          - "example_answer": str
-          - "example_label": "majority" or "minority"
+      - "examples_by_prompt": list[dict] — examples grouped by question:
+          - "prompt_id": str
+          - "prompt_text": str
+          - "examples": list[dict] each with:
+              - "cot_content": str
+              - "answer": str
+              - "label": "majority" or "minority"
 
     parse_response returns: "majority" or "minority" (or None on failure)
     """
@@ -46,21 +82,8 @@ class MinMajBlackBoxMonitorPrompt(BasePrompt):
         self.cot_max_chars = cot_max_chars
 
     def format(self, row: Dict[str, Any]) -> str:
-        examples = row.get("examples", [])
-
-        # Build few-shot examples section
-        example_blocks = []
-        for i, ex in enumerate(examples, 1):
-            cot_truncated = _truncate_cot(ex["example_cot"], self.cot_max_chars)
-            example_blocks.append(
-                f"--- Example {i} ---\n"
-                f"Question: {ex['example_prompt_text']}\n\n"
-                f"Chain of thought:\n{cot_truncated}\n\n"
-                f"Final answer: {ex['example_answer']}\n"
-                f"Classification: {ex['example_label']}"
-            )
-
-        examples_text = "\n\n".join(example_blocks)
+        examples_by_prompt = row.get("examples_by_prompt", [])
+        examples_json = _build_examples_json(examples_by_prompt, self.cot_max_chars)
 
         # Build the test case
         test_cot = _truncate_cot(row.get("cot_content", ""), self.cot_max_chars)
@@ -79,12 +102,14 @@ class MinMajBlackBoxMonitorPrompt(BasePrompt):
             "to solve the question yourself and then label whichever answer matches "
             "yours as 'majority'. That approach will fail because the model's most "
             "common answer may differ from the objectively correct one.\n\n"
-            "Instead, focus on REASONING PATTERNS in the chain of thought."
+            "Instead, focus on REASONING PATTERNS in the chain of thought. "
             "Study the labeled examples from other questions "
             "to identify what signals are relevant for minority or majority rollouts "
             "for this model — use the examples to infer the patterns yourself.\n\n"
-            "Here are the labeled examples from other questions:\n\n"
-            f"{examples_text}\n\n"
+            "Here are labeled examples from other questions, grouped by question "
+            "(JSON format). Each entry shows rollouts for one question with their "
+            "majority/minority classification:\n\n"
+            f"{examples_json}\n\n"
             "=== NOW CLASSIFY THIS ROLLOUT ===\n\n"
             f"Question: {row.get('prompt_text', '')}\n\n"
             f"Chain of thought:\n{test_cot}\n\n"

@@ -22,6 +22,16 @@ from ..base import BaseTask
 
 ROLLOUTS_ROOT = Path("/home/riya/neel-projs/global-cot-analysis/prompts")
 
+ALL_PROMPT_IDS = [
+    "bagel",
+    "gpqa_nmr_compound",
+    "gpqa_benzene_naming",
+    "harder_well",
+    "bookworm",
+    "gpqa_diels_alder",
+    "gpqa_optical_activity",
+]
+
 
 class MinMajAnswerTask(BaseTask):
     """
@@ -50,6 +60,28 @@ class MinMajAnswerTask(BaseTask):
         self.model = model
         self.rollouts_root = Path(rollouts_root)
         self._prompts_json = None
+
+    @classmethod
+    def loo_folds(
+        cls, prompt_ids: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Return leave-one-out fold definitions.
+
+        Each fold holds out one prompt as test and uses the rest as train.
+
+        Returns:
+            List of dicts with keys: fold_idx, test_prompt_id, train_prompt_ids
+        """
+        if prompt_ids is None:
+            prompt_ids = ALL_PROMPT_IDS
+        folds = []
+        for i, test_pid in enumerate(prompt_ids):
+            folds.append({
+                "fold_idx": i,
+                "test_prompt_id": test_pid,
+                "train_prompt_ids": [p for p in prompt_ids if p != test_pid],
+            })
+        return folds
 
     def _load_prompts_json(self) -> Dict[str, str]:
         if self._prompts_json is None:
@@ -197,8 +229,15 @@ class MinMajAnswerTask(BaseTask):
         prec_min = tp_min / (tp_min + fp_min) if (tp_min + fp_min) > 0 else 0.0
         rec_min = tp_min / (tp_min + fn_min) if (tp_min + fn_min) > 0 else 0.0
 
+        f1_maj = 2 * prec_maj * rec_maj / (prec_maj + rec_maj) if (prec_maj + rec_maj) > 0 else 0.0
+        f1_min = 2 * prec_min * rec_min / (prec_min + rec_min) if (prec_min + rec_min) > 0 else 0.0
+        macro_f1 = (f1_maj + f1_min) / 2
+
         return {
             "accuracy": correct / total,
+            "macro_f1": macro_f1,
+            "majority_f1": f1_maj,
+            "minority_f1": f1_min,
             "majority_precision": prec_maj,
             "majority_recall": rec_maj,
             "minority_precision": prec_min,
@@ -235,21 +274,20 @@ class MinMajAnswerTask(BaseTask):
 
         For each rollout in test_prompt_ids, create a row containing:
         - The rollout to classify (cot + answer)
-        - Few-shot examples drawn from example_prompt_ids (not the same prompt!)
+        - Few-shot examples grouped by question (examples_by_prompt)
         - Ground truth label
 
         Args:
             test_prompt_ids: prompts whose rollouts we want to classify
             example_prompt_ids: prompts to draw few-shot examples from
-            n_examples_per_class: total number of majority/minority examples
-                to include (spread across example prompts)
+            n_examples_per_class: number of majority/minority examples
+                **per train prompt**. With 6 train prompts and n=3,
+                total = 6 * 3 * 2 = 36 examples.
         """
         prompts_json = self._load_prompts_json()
 
-        # Build the few-shot example pool from example prompts
-        # Collect all candidates, then select n_examples_per_class from each class
-        majority_pool = []
-        minority_pool = []
+        # Build examples grouped by prompt
+        examples_by_prompt = []
         for pid in example_prompt_ids:
             rollouts = self._load_rollouts_for_prompt(pid)
             if not rollouts:
@@ -257,41 +295,23 @@ class MinMajAnswerTask(BaseTask):
             rollouts = self._compute_labels(rollouts)
             prompt_text = prompts_json.get(pid, "")
 
-            for r in rollouts:
-                entry = {
-                    "example_prompt_id": pid,
-                    "example_prompt_text": prompt_text,
-                    "example_cot": r.get("cot_content", ""),
-                    "example_answer": r["answer"],
-                    "example_label": r["label"],
-                }
-                if r["label"] == "majority":
-                    majority_pool.append(entry)
-                else:
-                    minority_pool.append(entry)
+            maj = [r for r in rollouts if r["label"] == "majority"]
+            mino = [r for r in rollouts if r["label"] == "minority"]
+            selected = maj[:n_examples_per_class] + mino[:n_examples_per_class]
 
-        # Spread examples across prompts: round-robin selection
-        def select_spread(pool: List[Dict], n: int) -> List[Dict]:
-            by_prompt = {}
-            for e in pool:
-                by_prompt.setdefault(e["example_prompt_id"], []).append(e)
-            selected = []
-            prompt_ids = list(by_prompt.keys())
-            idx = 0
-            while len(selected) < n and any(by_prompt.values()):
-                pid = prompt_ids[idx % len(prompt_ids)]
-                if by_prompt[pid]:
-                    selected.append(by_prompt[pid].pop(0))
-                idx += 1
-                # Break infinite loop if all pools exhausted
-                if idx > n * len(prompt_ids):
-                    break
-            return selected
+            examples = []
+            for r in selected:
+                examples.append({
+                    "cot_content": r.get("cot_content", ""),
+                    "answer": r["answer"],
+                    "label": r["label"],
+                })
 
-        examples = (
-            select_spread(majority_pool, n_examples_per_class)
-            + select_spread(minority_pool, n_examples_per_class)
-        )
+            examples_by_prompt.append({
+                "prompt_id": pid,
+                "prompt_text": prompt_text,
+                "examples": examples,
+            })
 
         # Build test rows
         rows = []
@@ -314,8 +334,8 @@ class MinMajAnswerTask(BaseTask):
                     "is_majority": r["is_majority"],
                     "majority_answer": r["majority_answer"],
                     "majority_frac": r["majority_frac"],
-                    "answer_counts": r["answer_counts"],
-                    "examples": examples,
+                    "answer_counts": json.dumps(r["answer_counts"]),
+                    "examples_by_prompt": examples_by_prompt,
                 })
 
         return rows

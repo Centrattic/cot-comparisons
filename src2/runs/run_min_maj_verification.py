@@ -32,17 +32,17 @@ TEMPERATURE = 0.7
 MAX_TOKENS = 8192
 MAX_WORKERS = 300
 
-# All 7 prompts: 5 train + 2 test, all with A/B answer format
+# All 7 prompts: 5 train + 2 test, with N/M answer labels (no position bias)
 TARGET_IDS = {
     # Train
-    "bagel_ab",
-    "gpqa_nmr_compound_ab",
-    "gpqa_benzene_naming_ab",
-    "harder_well_ab",
-    "bookworm_ab",
+    "bagel_nm",
+    "gpqa_nmr_compound_nm",
+    "gpqa_benzene_naming_nm",
+    "harder_well_nm",
+    "bookworm_nm",
     # Test
-    "gpqa_diels_alder_ab",
-    "gpqa_optical_activity_ab",
+    "gpqa_diels_alder_nm",
+    "gpqa_optical_activity_nm",
 }
 # ─────────────────────────────────────────────────────────────────────
 

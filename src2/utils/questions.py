@@ -20,11 +20,12 @@ class GPQAQuestion:
     id: str
     question: str
     choices: List[str]
-    correct_answer: str  # The letter (A, B, C, D)
+    correct_answer: str  # The label letter (A, B, C, D or custom like N, M)
     correct_index: int  # 0-indexed
     subject: Optional[str] = None
     difficulty: Optional[str] = None
     question_type: str = "multiple_choice"
+    labels: Optional[List[str]] = None  # Custom labels (e.g., ["N", "M"]) instead of A, B, C, D
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -150,7 +151,11 @@ def load_custom_questions(
             )
         else:
             correct_answer = item["correct_answer"]
-            correct_index = ord(correct_answer) - ord("A")
+            labels = item.get("labels")
+            if labels and correct_answer in labels:
+                correct_index = labels.index(correct_answer)
+            else:
+                correct_index = ord(correct_answer) - ord("A")
             questions.append(
                 GPQAQuestion(
                     id=item["id"],
@@ -160,6 +165,7 @@ def load_custom_questions(
                     correct_index=correct_index,
                     subject=item.get("subject"),
                     difficulty=item.get("difficulty"),
+                    labels=labels,
                 )
             )
 

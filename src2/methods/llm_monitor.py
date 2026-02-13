@@ -51,6 +51,7 @@ class LlmMonitor(BaseMethod):
         max_tokens: int = 4000,
         api_key: Optional[str] = None,
         name: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ):
         if name is None:
             name = f"llm_monitor_{prompt.name}"
@@ -61,6 +62,7 @@ class LlmMonitor(BaseMethod):
         self.max_workers = max_workers
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
 
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
         if not self.api_key:
@@ -131,12 +133,17 @@ class LlmMonitor(BaseMethod):
         prompt_text = self.prompt.format(row)
 
         try:
-            response = self.client.chat.completions.create(
+            kwargs: Dict[str, Any] = dict(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt_text}],
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
             )
+            if self.reasoning_effort is not None:
+                kwargs["extra_body"] = {
+                    "reasoning": {"effort": self.reasoning_effort},
+                }
+            response = self.client.chat.completions.create(**kwargs)
             raw_response = response.choices[0].message.content or ""
         except Exception as e:
             raw_response = f"ERROR: {e}"

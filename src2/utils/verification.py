@@ -59,7 +59,7 @@ def _format_user_message(question: Question) -> str:
     """Format a Question into the user message text."""
     if isinstance(question, BinaryJudgeQuestion):
         return question.question
-    labels = [chr(ord("A") + i) for i in range(len(question.choices))]
+    labels = question.labels if question.labels else [chr(ord("A") + i) for i in range(len(question.choices))]
     choices = "\n".join(f"{l}. {c}" for l, c in zip(labels, question.choices))
     labels_str = ", ".join(labels[:-1]) + f", or {labels[-1]}" if len(labels) > 2 else " or ".join(labels)
     return f"{question.question}\n\n{choices}\n\nAnswer with just the letter ({labels_str})."
@@ -104,11 +104,14 @@ def _extract_answer(raw_response: str, question: Question) -> str:
         )
 
     # Multiple choice — look after </think>
+    valid_labels = question.labels if question.labels else ["A", "B", "C", "D"]
+    valid_set = set(valid_labels)
     if "</think>" in raw_response:
         after = raw_response.split("</think>", 1)[1].strip().upper().rstrip(".")
-        if after in ["A", "B", "C", "D"]:
+        if after in valid_set:
             return after
-        match = re.search(r"\b([A-D])\b", after)
+        pattern = r"\b(" + "|".join(valid_labels) + r")\b"
+        match = re.search(pattern, after)
         if match:
             return match.group(1)
     return ""
@@ -187,7 +190,8 @@ def compute_summary(question: Question, rollouts: List[Dict[str, Any]]) -> Dict[
     if isinstance(question, BinaryJudgeQuestion):
         valid_answers = [a for a in answers if a in ["YES", "NO"]]
     else:
-        valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
+        valid_labels = set(question.labels) if question.labels else {"A", "B", "C", "D"}
+        valid_answers = [a for a in answers if a in valid_labels]
 
     answer_counts: Dict[str, int] = {}
     for a in valid_answers:

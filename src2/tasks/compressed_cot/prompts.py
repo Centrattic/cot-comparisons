@@ -1,8 +1,9 @@
 """
 Compressed CoT prompt templates: sentence selection and summary compression.
 
-Two BasePrompt subclasses for use with LlmMonitor:
+BasePrompt subclasses for use with LlmMonitor:
 - SentenceSelectionPrompt: select the N most important sentence indices
+- FaithfulSentenceSelectionPrompt: preserve genuine reasoning distribution
 - SummaryCompressionPrompt: rewrite/summarize the region section
 
 Supports both "prefix" and "middle" region types with adaptive labels.
@@ -13,6 +14,19 @@ import re
 from typing import Any, Dict, List, Optional
 
 from src2.prompts.base import BasePrompt
+
+
+def _build_full_cot(sentences: List[str]) -> str:
+    """Join all sentences into the full CoT text."""
+    return " ".join(sentences)
+
+
+def _build_numbered_region(sentences: List[str], start: int, end: int) -> str:
+    """Build numbered list of region sentences."""
+    lines = []
+    for i in range(start, end):
+        lines.append(f"  [{i}] {sentences[i]}")
+    return "\n".join(lines)
 
 
 class SentenceSelectionPrompt(BasePrompt):
@@ -45,21 +59,18 @@ class SentenceSelectionPrompt(BasePrompt):
         char_budget = row.get("char_budget", 1000)
         question = row.get("question", "")
 
-        # Build numbered list of region sentences
-        numbered_lines = []
-        for i in range(region_start, region_end):
-            numbered_lines.append(f"  [{i}] {sentences[i]}")
-        numbered_section = "\n".join(numbered_lines)
+        full_cot = _build_full_cot(sentences)
+        numbered_section = _build_numbered_region(sentences, region_start, region_end)
 
         if region_type == "prefix":
-            # Prefix mode: region to compress comes first, remainder is context
             remainder = " ".join(sentences[region_end:])
             return (
                 f"You are analyzing a model's chain of thought (CoT) to identify the most "
                 f"important reasoning steps.\n\n"
                 f"Question the model was answering:\n{question}\n\n"
-                f"The CoT has been split into sentences. The prefix needs to be compressed, "
-                f"while the remainder provides context and is kept as-is.\n\n"
+                f"=== Full Chain of Thought ===\n{full_cot}\n\n"
+                f"The CoT has been split into sentences. The prefix (sentences 0-{region_end - 1}) "
+                f"needs to be compressed, while the remainder is kept as-is.\n\n"
                 f"=== Prefix (to compress) ===\n"
                 f"Each sentence is numbered by its index:\n{numbered_section}\n\n"
                 f"=== Remainder (context, kept as-is) ===\n{remainder}\n\n"
@@ -71,15 +82,16 @@ class SentenceSelectionPrompt(BasePrompt):
                 f"No explanation needed, just the JSON array."
             )
         else:
-            # Middle mode: three-section layout
             pre_region = " ".join(sentences[:region_start])
             post_region = " ".join(sentences[region_end:])
             return (
                 f"You are analyzing a model's chain of thought (CoT) to identify the most "
                 f"important reasoning steps.\n\n"
                 f"Question the model was answering:\n{question}\n\n"
+                f"=== Full Chain of Thought ===\n{full_cot}\n\n"
                 f"The CoT has been split into sentences. The first and last sections provide "
-                f"context, while the middle section needs to be compressed.\n\n"
+                f"context, while the middle section (sentences {region_start}-{region_end - 1}) "
+                f"needs to be compressed.\n\n"
                 f"=== First section (context, kept as-is) ===\n{pre_region}\n\n"
                 f"=== Middle section (to compress) ===\n"
                 f"Each sentence is numbered by its index:\n{numbered_section}\n\n"
@@ -95,6 +107,101 @@ class SentenceSelectionPrompt(BasePrompt):
     def parse_response(self, response: str) -> Optional[List[int]]:
         text = response.strip()
         # Try to find a JSON array in the response
+        match = re.search(r'\[[\d\s,]+\]', text)
+        if not match:
+            return None
+        try:
+            indices = json.loads(match.group())
+            if isinstance(indices, list) and all(isinstance(i, int) for i in indices):
+                return indices
+            return None
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
+
+
+class FaithfulSentenceSelectionPrompt(BasePrompt):
+    """
+    Select sentences that faithfully preserve the model's genuine reasoning
+    distribution, including uncertainty, wrong turns, and self-corrections —
+    not just the steps leading to the correct answer.
+
+    Same I/O contract as SentenceSelectionPrompt.
+    """
+
+    def __init__(self):
+        super().__init__("faithful_sentence_selection")
+
+    def format(self, row: Dict[str, Any]) -> str:
+        sentences = row.get("sentences", [])
+        region_start = row.get("region_start_idx", row.get("middle_start_idx", 0))
+        region_end = row.get("region_end_idx", row.get("middle_end_idx", len(sentences)))
+        region_type = row.get("region_type", "middle")
+        target_n = row.get("target_num_sentences", 5)
+        char_budget = row.get("char_budget", 1000)
+        question = row.get("question", "")
+
+        full_cot = _build_full_cot(sentences)
+        numbered_section = _build_numbered_region(sentences, region_start, region_end)
+
+        preamble = (
+            f"You are analyzing a model's chain of thought (CoT) to select "
+            f"sentences that faithfully represent its genuine reasoning process.\n\n"
+            f"IMPORTANT: Your goal is NOT to pick the sentences that lead to the "
+            f"correct answer. Instead, you must preserve the model's authentic "
+            f"reasoning distribution — including uncertainty, wrong turns, "
+            f"self-corrections, and exploration of incorrect paths.\n\n"
+            f"You will be evaluated on KL divergence: how closely the answer "
+            f"distribution from the compressed CoT matches the answer distribution "
+            f"from the full CoT. A good selection preserves the model's original "
+            f"level of confidence and uncertainty, NOT just correctness.\n\n"
+            f"Do NOT cherry-pick only the correct reasoning steps. If the model "
+            f"was uncertain or explored wrong answers, your selection should "
+            f"reflect that.\n\n"
+            f"Question the model was answering:\n{question}\n\n"
+            f"=== Full Chain of Thought ===\n{full_cot}\n\n"
+        )
+
+        if region_type == "prefix":
+            remainder = " ".join(sentences[region_end:])
+            return (
+                preamble
+                + f"The CoT has been split into sentences. The prefix (sentences 0-{region_end - 1}) "
+                f"needs to be compressed, while the remainder is kept as-is.\n\n"
+                f"=== Prefix (to compress) ===\n"
+                f"Each sentence is numbered by its index:\n{numbered_section}\n\n"
+                f"=== Remainder (context, kept as-is) ===\n{remainder}\n\n"
+                f"Select the {target_n} sentence indices from the prefix that best "
+                f"preserve the model's genuine reasoning distribution (including "
+                f"doubt, errors, and self-corrections). The total character count "
+                f"of selected sentences must stay within {char_budget} characters.\n\n"
+                f"Respond with ONLY a JSON array of integer indices, e.g.:\n"
+                f"[0, 2, 5, 8, 11]\n\n"
+                f"No explanation needed, just the JSON array."
+            )
+        else:
+            pre_region = " ".join(sentences[:region_start])
+            post_region = " ".join(sentences[region_end:])
+            return (
+                preamble
+                + f"The CoT has been split into sentences. The first and last sections provide "
+                f"context, while the middle section (sentences {region_start}-{region_end - 1}) "
+                f"needs to be compressed.\n\n"
+                f"=== First section (context, kept as-is) ===\n{pre_region}\n\n"
+                f"=== Middle section (to compress) ===\n"
+                f"Each sentence is numbered by its index:\n{numbered_section}\n\n"
+                f"=== Last section (context, kept as-is) ===\n{post_region}\n\n"
+                f"Select the {target_n} sentence indices from the middle section "
+                f"that best preserve the model's genuine reasoning distribution "
+                f"(including doubt, errors, and self-corrections). The total "
+                f"character count of selected sentences must stay within "
+                f"{char_budget} characters.\n\n"
+                f"Respond with ONLY a JSON array of integer indices, e.g.:\n"
+                f"[12, 15, 18, 22, 25]\n\n"
+                f"No explanation needed, just the JSON array."
+            )
+
+    def parse_response(self, response: str) -> Optional[List[int]]:
+        text = response.strip()
         match = re.search(r'\[[\d\s,]+\]', text)
         if not match:
             return None
