@@ -242,49 +242,45 @@ def batch_evaluate_compressions(task, question_id, jobs, num_resamples=50,
     prefix_indices = [i for i, p in enumerate(prepared) if p["continuation_budget"] is not None]
     middle_indices = [i for i, p in enumerate(prepared) if p["continuation_budget"] is None]
 
-    # ── Prefix mode: two-step generation ──
+    # ── Prefix mode: interleaved two-step generation ──
+    # Process each job's Step 1 (think) then immediately Step 2 (answer)
+    # so the KV cache from Step 1 is still warm for Step 2's prefill.
     if prefix_indices:
-        # Step 1: thinking continuation (one prompt per job, n=num_resamples each)
-        step1_prompts = [{"prompt_token_ids": prepared[i]["tokens"]} for i in prefix_indices]
-        step1_params = [
-            VllmSamplingParams(
-                max_tokens=prepared[i]["continuation_budget"],
-                temperature=temperature,
-                n=num_resamples,
-            )
-            for i in prefix_indices
-        ]
-
-        tqdm.write(f"    Step 1: {len(prefix_indices)} thinking continuations "
-                    f"x {num_resamples} resamples")
-        step1_outputs = llm.generate(step1_prompts, step1_params)
-
-        # Step 2: answer generation (flatten all continuations)
-        step2_inputs = []
-        step2_job_indices = []  # maps step2 index -> original job index
-
-        for pi, pj_idx in enumerate(prefix_indices):
-            base_tokens = prepared[pj_idx]["tokens"]
-            output = step1_outputs[pi]
-            for completion in output.outputs:
-                think_token_ids = list(completion.token_ids)
-                full_prefix = base_tokens + think_token_ids + END_THINK_TOKENS
-                step2_inputs.append({"prompt_token_ids": full_prefix})
-                step2_job_indices.append(pj_idx)
+        tqdm.write(f"    Prefix mode: {len(prefix_indices)} jobs "
+                    f"x {num_resamples} resamples (interleaved step1+step2)")
 
         step2_params = VllmSamplingParams(
             max_tokens=ANSWER_MAX_TOKENS, temperature=temperature, n=1,
         )
 
-        tqdm.write(f"    Step 2: {len(step2_inputs)} answer generations")
-        step2_outputs = llm.generate(step2_inputs, step2_params)
+        for pi, pj_idx in enumerate(tqdm(
+            prefix_indices, desc="    Eval jobs", leave=False,
+        )):
+            base_tokens = prepared[pj_idx]["tokens"]
+            cb = prepared[pj_idx]["continuation_budget"]
 
-        for s2_idx, output in enumerate(step2_outputs):
-            orig_idx = step2_job_indices[s2_idx]
-            answer_text = output.outputs[0].text.strip()
-            answer = task._extract_answer_from_text(answer_text, question)
-            if answer:
-                job_answers[orig_idx].append(answer)
+            # Step 1: generate thinking continuations (n=num_resamples)
+            step1_params = VllmSamplingParams(
+                max_tokens=cb, temperature=temperature, n=num_resamples,
+            )
+            step1_output = llm.generate(
+                [{"prompt_token_ids": base_tokens}], step1_params,
+            )[0]
+
+            # Step 2: immediately generate answers (KV cache is warm)
+            step2_inputs = []
+            for completion in step1_output.outputs:
+                think_token_ids = list(completion.token_ids)
+                full_prefix = base_tokens + think_token_ids + END_THINK_TOKENS
+                step2_inputs.append({"prompt_token_ids": full_prefix})
+
+            step2_outputs = llm.generate(step2_inputs, step2_params)
+
+            for output in step2_outputs:
+                answer_text = output.outputs[0].text.strip()
+                answer = task._extract_answer_from_text(answer_text, question)
+                if answer:
+                    job_answers[pj_idx].append(answer)
 
     # ── Middle mode: single-step generation ──
     if middle_indices:

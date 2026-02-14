@@ -53,9 +53,13 @@ class OutputManager:
 
         latest = self.base_dir / "latest"
 
-        # Remove existing symlink if present
+        # Remove existing symlink/file if present; rmdir if it's a real directory
         if latest.is_symlink() or latest.exists():
-            latest.unlink()
+            if latest.is_dir() and not latest.is_symlink():
+                import shutil
+                shutil.rmtree(latest)
+            else:
+                latest.unlink()
 
         # Create relative symlink so it's portable
         latest.symlink_to(self._run_folder.name)

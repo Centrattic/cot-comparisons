@@ -385,11 +385,8 @@ def generate_labeling_data(max_rollouts: Optional[int] = None):
     all_df = pd.concat(all_dfs, ignore_index=True)
     print(f"\nTotal rollouts (all prompts): {len(all_df)} ({all_df['label'].value_counts().to_dict()})")
 
-    # Eval rollouts: only prompts NOT used for taxonomy context
-    eval_df = all_df[~all_df["prompt_id"].isin(TAXONOMY_PROMPT_IDS_NM)]
-    print(f"Eval rollouts (excluding taxonomy prompts): {len(eval_df)}")
-    print(f"  Taxonomy prompts (context only): {TAXONOMY_PROMPT_IDS_NM}")
-    print(f"  Eval prompts: {EVAL_PROMPT_IDS_NM}")
+    print(f"  Taxonomy prompts (used for taxonomy context): {TAXONOMY_PROMPT_IDS_NM}")
+    print(f"  All prompts will be labeled and used for LOO-CV")
 
     # ── Propose taxonomy (or load existing) ───────────────────────────
     taxonomy_path = OUTPUT_DIR / "taxonomy.json"
@@ -416,9 +413,9 @@ def generate_labeling_data(max_rollouts: Optional[int] = None):
 
     feature_ids = [feat["id"] for feat in taxonomy]
 
-    # ── Build rollout list (eval prompts only) ────────────────────────
+    # ── Build rollout list (all prompts) ─────────────────────────────
     all_rollouts = []
-    for _, row in eval_df.iterrows():
+    for _, row in all_df.iterrows():
         cot = row["cot_content"]
         if not isinstance(cot, str) or len(cot) < 50:
             continue
@@ -688,25 +685,12 @@ def train_baseline():
         f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
         return {"precision": prec, "recall": rec, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
 
-    # ── LOO cross-validation (eval prompts only) ────────────────────
-    # Load taxonomy_prompt_ids from taxonomy.json if available, else use constant
-    taxonomy_path = OUTPUT_DIR / "taxonomy.json"
-    if taxonomy_path.exists():
-        with open(taxonomy_path) as f:
-            tax_meta = json.load(f)
-        taxonomy_prompt_ids = set(tax_meta.get("taxonomy_prompt_ids", TAXONOMY_PROMPT_IDS_NM))
-    else:
-        taxonomy_prompt_ids = set(TAXONOMY_PROMPT_IDS_NM)
-
-    # Only fold over prompts not used for taxonomy
-    eval_pids = [pid for pid in ALL_PROMPT_IDS if pid + NM_SUFFIX not in taxonomy_prompt_ids]
-    folds = MinMajAnswerTask.loo_folds(prompt_ids=eval_pids)
+    # ── LOO cross-validation (all prompts) ──────────────────────────
+    folds = MinMajAnswerTask.loo_folds()
     fold_results = []
     all_test_preds = []
     all_test_true = []
 
-    print(f"\n  Taxonomy prompts (excluded): {sorted(taxonomy_prompt_ids)}")
-    print(f"  Eval prompts: {eval_pids}")
     print(f"\n{'=' * 60}")
     print(f"  Feature Vector Baseline — LOO Cross-Validation ({len(folds)} folds)")
     print(f"{'=' * 60}")
