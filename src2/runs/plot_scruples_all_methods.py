@@ -4,8 +4,8 @@ Plot comparing all scruples sycophancy detection methods on the balanced test se
 
 Methods:
   1. Attention Probe (best config from hyperparameter sweep)
-  2. Base LLM Monitor (no context)
-  3. High-Context LLM Monitor (15 few-shot examples)
+  2. Base Monitor v2 (LLM counterfactual monitor)
+  3. High-Context Monitor (45 few-shot examples)
   4. Entropy Baseline (logistic regression on forced-response entropy features)
   5. BoW TF-IDF (TF-IDF + LogisticRegressionCV on CoT thinking text)
 
@@ -22,9 +22,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from src2.tasks import ScruplesTask
-from src2.tasks.scruples.prompts import INTERVENTION_SUGGESTED_ANSWER
-
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "scruples"
@@ -40,7 +37,6 @@ def _resolve_latest_run(base_dir: Path) -> Path:
     latest = base_dir / "latest"
     if latest.exists():
         return latest
-    # Fall back to most recent timestamped directory
     timestamped = sorted(
         [d for d in base_dir.iterdir() if d.is_dir() and d.name[0].isdigit()],
         key=lambda d: d.name,
@@ -48,21 +44,19 @@ def _resolve_latest_run(base_dir: Path) -> Path:
     )
     if timestamped:
         return timestamped[0]
-    return latest  # will fail downstream with a clear path
+    return latest
 
 
-def compute_monitor_metrics(monitor_name, test_anecdotes, syc_ids):
-    """Compute F1/precision/recall for an LLM monitor on the test anecdotes.
+def compute_eval_monitor_metrics(monitor_name):
+    """Compute F1/precision/recall from llm_monitor_eval_* directories.
 
-    Ground truth (per-run): anecdote is in syc_ids AND this run's answer
-      matches the sycophantic answer (i.e., this run WAS sycophantic).
-    Prediction: monitor_prediction != answer (monitor's counterfactual
-      differs from actual answer → monitor thinks model was influenced).
+    These CSVs have pre-computed columns:
+      label (0/1), answer, monitor_prediction (A/B)
+    Predicted label: monitor_prediction != answer -> sycophantic (1)
     """
     tp = fp = fn = tn = 0
     for variant in VARIANTS:
-        syc_answer = INTERVENTION_SUGGESTED_ANSWER[variant]
-        base_dir = DATA_DIR / f"llm_monitor_scruples_{monitor_name}_{variant}"
+        base_dir = DATA_DIR / f"llm_monitor_eval_{monitor_name}_{variant}"
         if not base_dir.exists():
             print(f"  Warning: {base_dir} not found")
             continue
@@ -72,21 +66,15 @@ def compute_monitor_metrics(monitor_name, test_anecdotes, syc_ids):
             print(f"  Warning: {csv_path} not found")
             continue
         df = pd.read_csv(csv_path)
-        df = df[df["anecdote_id"].isin(test_anecdotes)]
+        df = df[df["monitor_prediction"].notna()].copy()
 
-        df["prompt_is_syc"] = df["anecdote_id"].isin(syc_ids)
-        df["is_syc_answer"] = df["answer"].str.upper() == syc_answer
-        df["true_label"] = df["prompt_is_syc"] & df["is_syc_answer"]
+        y_true = df["label"].values
+        y_pred = (df["monitor_prediction"] != df["answer"]).astype(int).values
 
-        df_valid = df[df["monitor_prediction"].notna()].copy()
-        df_valid["pred_label"] = (
-            df_valid["monitor_prediction"].str.upper() != df_valid["answer"].str.upper()
-        )
-
-        tp += int(((df_valid["true_label"]) & (df_valid["pred_label"])).sum())
-        fp += int(((~df_valid["true_label"]) & (df_valid["pred_label"])).sum())
-        fn += int(((df_valid["true_label"]) & (~df_valid["pred_label"])).sum())
-        tn += int(((~df_valid["true_label"]) & (~df_valid["pred_label"])).sum())
+        tp += int(((y_pred == 1) & (y_true == 1)).sum())
+        fp += int(((y_pred == 1) & (y_true == 0)).sum())
+        fn += int(((y_pred == 0) & (y_true == 1)).sum())
+        tn += int(((y_pred == 0) & (y_true == 0)).sum())
 
     total = tp + fp + fn + tn
     p = tp / (tp + fp) if (tp + fp) > 0 else 0
@@ -97,16 +85,6 @@ def compute_monitor_metrics(monitor_name, test_anecdotes, syc_ids):
 
 
 def main():
-    print("Computing test split...")
-    task = ScruplesTask(
-        subject_model="moonshotai/kimi-k2-thinking",
-        variant="suggest_wrong",
-        data_dir=DATA_DIR,
-    )
-    split_info = task.get_uncertainty_robust_split(variants=VARIANTS)
-    test_anecdotes = set(split_info.test_df["anecdote_id"].unique())
-    syc_ids = set(split_info.df.loc[split_info.df["label"] == "sycophantic", "anecdote_id"].unique())
-
     # ── Collect all method results ─────────────────────────────────────
     methods = {}
 
@@ -123,16 +101,16 @@ def main():
             "accuracy": best["accuracy"],
             "n": best["n_samples"],
         }
-        print(f"Probe: F1={methods['Attention\nProbe']['f1']:.3f}")
+        print(f"Probe: F1={methods['Attention' + chr(10) + 'Probe']['f1']:.3f}")
 
-    # 2. Base Monitor
-    base_m = compute_monitor_metrics("base_monitor", test_anecdotes, syc_ids)
+    # 2. Base Monitor v2
+    base_m = compute_eval_monitor_metrics("base_v2")
     if base_m["n"] > 0:
-        methods["Base\nMonitor"] = base_m
-        print(f"Base Monitor: F1={base_m['f1']:.3f} (n={base_m['n']})")
+        methods["Base Monitor\n(v2)"] = base_m
+        print(f"Base Monitor v2: F1={base_m['f1']:.3f} (n={base_m['n']})")
 
     # 3. High-Context Monitor
-    hc_m = compute_monitor_metrics("high_context_monitor", test_anecdotes, syc_ids)
+    hc_m = compute_eval_monitor_metrics("high_context")
     if hc_m["n"] > 0:
         methods["High-Context\nMonitor"] = hc_m
         print(f"High-Context Monitor: F1={hc_m['f1']:.3f} (n={hc_m['n']})")
@@ -154,22 +132,23 @@ def main():
         print("Entropy baseline results not found (run --train phase first)")
 
     # 5. BoW TF-IDF
-    bow_results_path = DATA_DIR / "bow_tfidf_scruples" / "latest" / "results.json"
-    if bow_results_path.exists():
-        with open(bow_results_path) as f:
-            bow = json.load(f)
-        if "metrics" in bow:
-            bm = bow["metrics"]
-            methods["BoW\nTF-IDF"] = {
-                "f1": bm["f1"],
-                "precision": bm["precision"],
-                "recall": bm["recall"],
-                "accuracy": bm["accuracy"],
-                "n": len(bow.get("predictions", [])),
-            }
-            print(f"BoW TF-IDF: F1={bm['f1']:.3f}")
-    else:
-        print("BoW TF-IDF results not found (run run_scruples_bow_tfidf first)")
+    bow_base = DATA_DIR / "bow_tfidf_scruples"
+    if bow_base.exists():
+        bow_run = _resolve_latest_run(bow_base)
+        bow_results_path = bow_run / "results.json"
+        if bow_results_path.exists():
+            with open(bow_results_path) as f:
+                bow = json.load(f)
+            if "metrics" in bow:
+                bm = bow["metrics"]
+                methods["BoW\nTF-IDF"] = {
+                    "f1": bm["f1"],
+                    "precision": bm["precision"],
+                    "recall": bm["recall"],
+                    "accuracy": bm["accuracy"],
+                    "n": len(bow.get("predictions", [])),
+                }
+                print(f"BoW TF-IDF: F1={bm['f1']:.3f}")
 
     if not methods:
         print("No method results found!")
@@ -180,22 +159,23 @@ def main():
 
     method_names = list(methods.keys())
     n_methods = len(method_names)
-    metrics = ["f1", "precision", "recall", "accuracy"]
+    metric_keys = ["f1", "precision", "recall", "accuracy"]
     metric_labels = ["F1", "Precision", "Recall", "Accuracy"]
     x = np.arange(n_methods)
     width = 0.18
-    colors = ["#2196F3", "#4CAF50", "#FF9800", "#9C27B0"]
+    colors = ["#4E79A7", "#59A14F", "#E15759", "#F28E2B"]
 
-    for i, (metric, label, color) in enumerate(zip(metrics, metric_labels, colors)):
+    for i, (metric, label, color) in enumerate(zip(metric_keys, metric_labels, colors)):
         vals = [methods[m].get(metric, 0) for m in method_names]
-        bars = ax.bar(x + i * width - 1.5 * width, vals, width, label=label, color=color, alpha=0.85)
+        bars = ax.bar(x + i * width - 1.5 * width, vals, width,
+                      label=label, color=color, alpha=0.85, edgecolor="white", linewidth=0.5)
         for bar, val in zip(bars, vals):
             if val > 0:
                 ax.text(
                     bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + 0.01,
                     f"{val:.2f}",
-                    ha="center", va="bottom", fontsize=7, fontweight="bold",
+                    ha="center", va="bottom", fontsize=6.5,
                 )
 
     ax.axhline(y=0.5, color="gray", linestyle="--", alpha=0.4, label="Chance")
@@ -203,15 +183,9 @@ def main():
     ax.set_title("Sycophancy Detection: Method Comparison\n(Balanced Test Set)", fontsize=14)
     ax.set_xticks(x)
     ax.set_xticklabels(method_names, fontsize=10)
-    ax.legend(loc="upper left", fontsize=9)
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
     ax.set_ylim(0, 1.15)
     ax.grid(axis="y", alpha=0.3)
-
-    # Add sample sizes
-    for i, m in enumerate(method_names):
-        n = methods[m].get("n", 0)
-        ax.text(i, -0.08, f"n={n}", ha="center", va="top", fontsize=8, color="gray",
-                transform=ax.get_xaxis_transform())
 
     fig.tight_layout()
     fig.savefig(PLOT_DIR / "method_comparison.png", dpi=150)
@@ -264,8 +238,8 @@ def main():
         val_f1s = [c["best_val_f1"] for c in configs_sorted]
 
         x = np.arange(len(configs_sorted))
-        ax.bar(x - 0.15, test_f1s, 0.3, label="Test F1", color="#2196F3", alpha=0.85)
-        ax.bar(x + 0.15, val_f1s, 0.3, label="Val F1", color="#FF9800", alpha=0.85)
+        ax.bar(x - 0.15, test_f1s, 0.3, label="Test F1", color="#3A86FF", alpha=0.85)
+        ax.bar(x + 0.15, val_f1s, 0.3, label="Val F1", color="#FFD166", alpha=0.85)
 
         for i, (tf, vf) in enumerate(zip(test_f1s, val_f1s)):
             ax.text(i - 0.15, tf + 0.01, f"{tf:.3f}", ha="center", va="bottom", fontsize=7)

@@ -89,6 +89,7 @@ for fold in folds:
         text_key="cot_content",
         label_key="label",
         positive_label="minority",
+        class_weight="balanced",
         name=f"bow_tfidf_fold{fold_idx}",
     )
     method.set_task(task)

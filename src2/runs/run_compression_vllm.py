@@ -127,22 +127,31 @@ class LastNBaselineMethod(BaseMethod):
 
 
 def build_result_index(method_dir):
-    """Scan method directory and return {question_id: count} of existing results."""
-    index = {}
+    """Scan method directory and return {question_id: count} of unique rollout results."""
+    seen = {}  # {question_id: {rollout_idx: folder_name}} — keeps latest per rollout
     if not os.path.isdir(method_dir):
-        return index
-    for name in os.listdir(method_dir):
+        return {}
+    for name in sorted(os.listdir(method_dir)):  # sorted = chronological, latest wins
         eval_path = os.path.join(method_dir, name, "compression_eval.json")
-        if os.path.exists(eval_path):
-            try:
-                with open(eval_path) as f:
-                    ev = json.load(f)
-                qid = ev.get("compressed_distribution", {}).get("question_id", "")
-                if qid:
-                    index[qid] = index.get(qid, 0) + 1
-            except (json.JSONDecodeError, KeyError):
-                pass
-    return index
+        if not os.path.exists(eval_path):
+            continue
+        try:
+            with open(eval_path) as f:
+                ev = json.load(f)
+            qid = ev.get("compressed_distribution", {}).get("question_id", "")
+            ridx = ev.get("rollout_idx")
+            if not qid:
+                continue
+            if qid not in seen:
+                seen[qid] = {}
+            if ridx is not None:
+                seen[qid][ridx] = name  # latest folder wins (sorted order)
+            else:
+                # Legacy files without rollout_idx: count each as unique
+                seen[qid][f"_legacy_{name}"] = name
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return {qid: len(rollouts) for qid, rollouts in seen.items()}
 
 
 def get_existing_spec(task, qid, rollout_idx):
@@ -574,6 +583,7 @@ if __name__ == "__main__":
 
                 eval_result = {
                     "mode": EVAL_MODE,
+                    "rollout_idx": job["rollout_idx"],
                     "selected_indices": job["selected_indices"],
                     "relative_indices": job["relative_indices"],
                     "compressed_distribution": dist,

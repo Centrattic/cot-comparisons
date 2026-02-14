@@ -28,6 +28,7 @@ class BowTfidfConfig:
     text_key: str = "prefix_text"
     label_key: str = "label"
     positive_label: str = "yes"
+    class_weight: Optional[str] = None
 
 
 class BoWTfidf(BaseMethod):
@@ -55,6 +56,7 @@ class BoWTfidf(BaseMethod):
         text_key: str = "prefix_text",
         label_key: str = "label",
         positive_label: str = "yes",
+        class_weight: Optional[str] = None,
         name: Optional[str] = None,
     ):
         if name is None:
@@ -70,6 +72,7 @@ class BoWTfidf(BaseMethod):
             text_key=text_key,
             label_key=label_key,
             positive_label=positive_label,
+            class_weight=class_weight,
         )
 
         self._vectorizer: Optional[TfidfVectorizer] = None
@@ -96,6 +99,7 @@ class BoWTfidf(BaseMethod):
             cv=cfg.cv,
             max_iter=cfg.max_iter,
             random_state=cfg.seed,
+            class_weight=cfg.class_weight,
         )
         self._classifier.fit(X, y)
 
