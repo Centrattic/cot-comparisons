@@ -64,7 +64,7 @@ run_dir = _create_run_dir()
 print(f"Run directory: {run_dir}")
 
 # Initialize prompt template (shared across folds)
-prompt = MinMajBlackBoxMonitorPrompt(cot_max_chars=2000)
+prompt = MinMajBlackBoxMonitorPrompt()
 
 folds = MinMajAnswerTask.loo_folds()
 all_fold_results = []

@@ -12,9 +12,9 @@ from typing import Any, Dict, List, Optional
 from src2.prompts.base import BasePrompt
 
 
-def _truncate_cot(cot: str, max_chars: int = 2000) -> str:
-    """Truncate a CoT to a reasonable length for the prompt."""
-    if len(cot) <= max_chars:
+def _truncate_cot(cot: str, max_chars: int = -1) -> str:
+    """Truncate a CoT to a reasonable length for the prompt. 0 = no limit."""
+    if max_chars < 0 or len(cot) <= max_chars:
         return cot
     # Keep the beginning and end
     half = max_chars // 2
@@ -77,7 +77,7 @@ class MinMajBlackBoxMonitorPrompt(BasePrompt):
     parse_response returns: "majority" or "minority" (or None on failure)
     """
 
-    def __init__(self, cot_max_chars: int = 2000):
+    def __init__(self, cot_max_chars: int = -1):
         super().__init__("min_maj_black_box_monitor")
         self.cot_max_chars = cot_max_chars
 
