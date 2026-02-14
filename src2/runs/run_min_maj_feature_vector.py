@@ -593,17 +593,18 @@ def _save_checkpoint(
 def _extract_positional_features(
     chunk_scores: List[Dict[str, float]],
     feature_ids: List[str],
+    num_segments: int = NUM_SEGMENTS,
 ) -> np.ndarray:
     """Extract positionally-encoded feature vector from chunk scores.
 
-    Bins chunks into NUM_SEGMENTS segments (early/mid/late), sums feature
-    scores per segment, and flattens to a 1D vector.
+    Bins chunks into num_segments segments, averages feature scores per
+    segment, and flattens to a 1D vector.
 
-    Returns array of shape [NUM_SEGMENTS * len(feature_ids)].
+    Returns array of shape [num_segments * len(feature_ids)].
     """
     n_features = len(feature_ids)
-    feature_matrix = np.zeros((NUM_SEGMENTS, n_features))
-    segment_counts = np.zeros(NUM_SEGMENTS)
+    feature_matrix = np.zeros((num_segments, n_features))
+    segment_counts = np.zeros(num_segments)
 
     if not chunk_scores:
         return feature_matrix.flatten()
@@ -611,23 +612,207 @@ def _extract_positional_features(
     n_chunks = len(chunk_scores)
     for i, scores in enumerate(chunk_scores):
         position = i / max(n_chunks - 1, 1)
-        seg = min(int(position * NUM_SEGMENTS), NUM_SEGMENTS - 1)
+        seg = min(int(position * num_segments), num_segments - 1)
         segment_counts[seg] += 1
         for j, fid in enumerate(feature_ids):
             feature_matrix[seg, j] += scores.get(fid, 0.0)
 
-    for s in range(NUM_SEGMENTS):
+    for s in range(num_segments):
         if segment_counts[s] > 0:
             feature_matrix[s, :] /= segment_counts[s]
 
     return feature_matrix.flatten()
 
 
+def _extract_aggregate_features(
+    chunk_scores: List[Dict[str, float]],
+    feature_ids: List[str],
+) -> np.ndarray:
+    """Extract global aggregate statistics per feature across all chunks.
+
+    For each feature: mean, std, max, and linear trend (slope).
+    Returns array of shape [4 * len(feature_ids)].
+    """
+    n_features = len(feature_ids)
+    if not chunk_scores:
+        return np.zeros(4 * n_features)
+
+    # Build matrix of shape [n_chunks, n_features]
+    mat = np.array([
+        [scores.get(fid, 0.0) for fid in feature_ids]
+        for scores in chunk_scores
+    ])
+
+    means = mat.mean(axis=0)
+    stds = mat.std(axis=0)
+    maxs = mat.max(axis=0)
+
+    # Linear trend: slope of feature value vs normalized position
+    n_chunks = len(chunk_scores)
+    if n_chunks > 1:
+        positions = np.linspace(0, 1, n_chunks)
+        pos_mean = positions.mean()
+        pos_var = ((positions - pos_mean) ** 2).sum()
+        slopes = np.array([
+            ((positions - pos_mean) * (mat[:, j] - means[j])).sum() / pos_var
+            for j in range(n_features)
+        ])
+    else:
+        slopes = np.zeros(n_features)
+
+    return np.concatenate([means, stds, maxs, slopes])
+
+
+def _build_feature_matrix(
+    rollouts: List[Dict],
+    feature_ids: List[str],
+    num_segments: int,
+    representation: str,
+) -> tuple:
+    """Build feature matrix for a given representation config.
+
+    representation: "positional", "aggregate", or "combined"
+    Returns (X, y, prompt_ids_arr, feature_names).
+    """
+    X_list, y_list, pids = [], [], []
+    for rollout in rollouts:
+        if not rollout.get("chunk_scores"):
+            continue
+        chunks = rollout["chunk_scores"]
+        if representation == "positional":
+            vec = _extract_positional_features(chunks, feature_ids, num_segments)
+        elif representation == "aggregate":
+            vec = _extract_aggregate_features(chunks, feature_ids)
+        else:  # combined
+            pos = _extract_positional_features(chunks, feature_ids, num_segments)
+            agg = _extract_aggregate_features(chunks, feature_ids)
+            vec = np.concatenate([pos, agg])
+        X_list.append(vec)
+        y_list.append(1 if rollout["label"] == "minority" else 0)
+        pids.append(rollout["prompt_id"])
+
+    X = np.stack(X_list)
+    y = np.array(y_list)
+    prompt_ids_arr = np.array(pids)
+
+    # Build feature names
+    names = []
+    if representation in ("positional", "combined"):
+        names += [f"seg{s}_{fid}" for s in range(num_segments) for fid in feature_ids]
+    if representation in ("aggregate", "combined"):
+        for stat in ["mean", "std", "max", "slope"]:
+            names += [f"{stat}_{fid}" for fid in feature_ids]
+
+    return X, y, prompt_ids_arr, names
+
+
+def _metrics(y_true, y_pred, pos_label=1):
+    tp = int(((y_pred == pos_label) & (y_true == pos_label)).sum())
+    fp = int(((y_pred == pos_label) & (y_true != pos_label)).sum())
+    fn = int(((y_pred != pos_label) & (y_true == pos_label)).sum())
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    return {"precision": prec, "recall": rec, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
+
+
+def _run_loo_cv(
+    X: np.ndarray,
+    y: np.ndarray,
+    prompt_ids_arr: np.ndarray,
+    clf_template,
+    folds: List[Dict],
+    use_pca: bool = False,
+    pca_variance: float = 0.95,
+) -> Dict:
+    """Run LOO-CV for a single classifier config. Returns results dict."""
+    from sklearn.base import clone
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+
+    fold_results = []
+    all_test_preds, all_test_true = [], []
+
+    for fold in folds:
+        test_pid_nm = fold["test_prompt_id"] + NM_SUFFIX
+        train_pids_nm = {pid + NM_SUFFIX for pid in fold["train_prompt_ids"]}
+
+        train_mask = np.isin(prompt_ids_arr, list(train_pids_nm))
+        test_mask = prompt_ids_arr == test_pid_nm
+
+        if not test_mask.any():
+            continue
+
+        X_train, y_train = X[train_mask], y[train_mask]
+        X_test, y_test = X[test_mask], y[test_mask]
+
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s = scaler.transform(X_test)
+
+        if use_pca:
+            pca = PCA(n_components=pca_variance, random_state=SEED)
+            X_train_s = pca.fit_transform(X_train_s)
+            X_test_s = pca.transform(X_test_s)
+
+        clf = clone(clf_template)
+        clf.fit(X_train_s, y_train)
+
+        test_pred = clf.predict(X_test_s)
+        test_acc = float((y_test == test_pred).mean())
+        min_m = _metrics(y_test, test_pred, pos_label=1)
+        maj_m = _metrics(y_test, test_pred, pos_label=0)
+        macro_f1 = (min_m["f1"] + maj_m["f1"]) / 2
+
+        fold_results.append({
+            "fold_idx": fold["fold_idx"],
+            "test_prompt_id": fold["test_prompt_id"],
+            "accuracy": test_acc,
+            "macro_f1": macro_f1,
+            "majority_f1": maj_m["f1"],
+            "majority_precision": maj_m["precision"],
+            "majority_recall": maj_m["recall"],
+            "minority_f1": min_m["f1"],
+            "minority_precision": min_m["precision"],
+            "minority_recall": min_m["recall"],
+            "n_test": len(y_test),
+            "n_train": len(y_train),
+        })
+        all_test_preds.extend(test_pred.tolist())
+        all_test_true.extend(y_test.tolist())
+
+    all_test_preds_arr = np.array(all_test_preds)
+    all_test_true_arr = np.array(all_test_true)
+    pooled_acc = float((all_test_true_arr == all_test_preds_arr).mean())
+    pooled_min = _metrics(all_test_true_arr, all_test_preds_arr, pos_label=1)
+    pooled_maj = _metrics(all_test_true_arr, all_test_preds_arr, pos_label=0)
+    pooled_macro_f1 = (pooled_min["f1"] + pooled_maj["f1"]) / 2
+    fold_f1s = [fr["macro_f1"] for fr in fold_results]
+    mean_fold_f1 = sum(fold_f1s) / len(fold_f1s) if fold_f1s else 0.0
+    majority_frac = float((all_test_true_arr == 0).sum()) / len(all_test_true_arr) if len(all_test_true_arr) > 0 else 0.0
+
+    return {
+        "pooled_accuracy": pooled_acc,
+        "pooled_macro_f1": pooled_macro_f1,
+        "mean_fold_macro_f1": mean_fold_f1,
+        "pooled_majority_f1": pooled_maj["f1"],
+        "pooled_majority_precision": pooled_maj["precision"],
+        "pooled_majority_recall": pooled_maj["recall"],
+        "pooled_minority_f1": pooled_min["f1"],
+        "pooled_minority_precision": pooled_min["precision"],
+        "pooled_minority_recall": pooled_min["recall"],
+        "chance_baseline": majority_frac,
+        "n_folds": len(fold_results),
+        "n_total": len(all_test_true_arr),
+        "feature_dim": X.shape[1],
+        "fold_results": fold_results,
+    }
+
+
 def train_baseline():
-    """Train multiple classifiers on feature vectors using LOO-CV."""
+    """Train classifiers with sweeps over representations, segments, regularization, and PCA."""
     from sklearn.linear_model import LogisticRegression
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-    from sklearn.preprocessing import StandardScaler
 
     # Find labeling results
     latest_generate = OUTPUT_DIR / "latest_generate"
@@ -649,199 +834,150 @@ def train_baseline():
     feature_ids = [feat["id"] for feat in taxonomy]
     print(f"Loaded {len(rollouts)} rollouts, {len(feature_ids)} features")
 
-    # ── Extract features and labels ───────────────────────────────────
-    X_list = []
-    y_list = []
-    prompt_ids = []
-    metadata = []
+    folds = MinMajAnswerTask.loo_folds()
 
-    for rollout in rollouts:
-        if not rollout.get("chunk_scores"):
-            continue
-        features = _extract_positional_features(rollout["chunk_scores"], feature_ids)
-        label = 1 if rollout["label"] == "minority" else 0
-        X_list.append(features)
-        y_list.append(label)
-        prompt_ids.append(rollout["prompt_id"])
-        metadata.append({
-            "prompt_id": rollout["prompt_id"],
-            "rollout_idx": rollout["rollout_idx"],
-            "answer": rollout["answer"],
-            "label": rollout["label"],
-        })
+    # ── Sweep configurations ──────────────────────────────────────────
+    segment_options = [3, 5, 15]
+    representation_options = ["positional", "aggregate", "combined"]
 
-    X = np.stack(X_list)
-    y = np.array(y_list)
-    prompt_ids_arr = np.array(prompt_ids)
-    print(f"Total samples: {len(y)}")
-    print(f"  majority (0): {(y == 0).sum()}, minority (1): {(y == 1).sum()}")
-
-    feature_dim = NUM_SEGMENTS * len(feature_ids)
-    feature_names = [
-        f"seg{s}_{fid}" for s in range(NUM_SEGMENTS) for fid in feature_ids
-    ]
-    print(f"Feature dimensionality: {feature_dim}")
-
-    # Per-class metrics helper
-    def _metrics(y_true, y_pred, pos_label=1):
-        tp = int(((y_pred == pos_label) & (y_true == pos_label)).sum())
-        fp = int(((y_pred == pos_label) & (y_true != pos_label)).sum())
-        fn = int(((y_pred != pos_label) & (y_true == pos_label)).sum())
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-        return {"precision": prec, "recall": rec, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
-
-    # ── Define classifiers to compare ─────────────────────────────────
-    minority_ratio = float((y == 1).sum()) / float((y == 0).sum()) if (y == 0).sum() > 0 else 1.0
-
-    classifiers = {
-        "LogReg (balanced)": LogisticRegression(
-            class_weight="balanced", max_iter=1000, random_state=SEED,
-        ),
-        "LogReg (L1, C=0.1)": LogisticRegression(
+    classifier_configs = [
+        # LogReg L2 sweep
+        *[(f"LogReg L2 C={C}", LogisticRegression(
+            class_weight="balanced", penalty="l2", C=C,
+            max_iter=2000, random_state=SEED,
+        )) for C in [0.01, 0.1, 1.0]],
+        # LogReg L1 sweep
+        *[(f"LogReg L1 C={C}", LogisticRegression(
             class_weight="balanced", penalty="l1", solver="liblinear",
-            C=0.1, max_iter=1000, random_state=SEED,
-        ),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=200, max_depth=8, class_weight="balanced",
+            C=C, max_iter=2000, random_state=SEED,
+        )) for C in [0.01, 0.1, 1.0]],
+        # Random Forest
+        ("RF n=200 d=6", RandomForestClassifier(
+            n_estimators=200, max_depth=6, class_weight="balanced",
             random_state=SEED, n_jobs=-1,
-        ),
-        "Gradient Boosting": GradientBoostingClassifier(
+        )),
+        ("RF n=200 d=12", RandomForestClassifier(
+            n_estimators=200, max_depth=12, class_weight="balanced",
+            random_state=SEED, n_jobs=-1,
+        )),
+        # Gradient Boosting
+        ("GB n=200 lr=0.05 d=3", GradientBoostingClassifier(
             n_estimators=200, max_depth=3, learning_rate=0.05,
             subsample=0.8, random_state=SEED,
-        ),
-    }
+        )),
+        ("GB n=200 lr=0.1 d=2", GradientBoostingClassifier(
+            n_estimators=200, max_depth=2, learning_rate=0.1,
+            subsample=0.8, random_state=SEED,
+        )),
+    ]
 
-    folds = MinMajAnswerTask.loo_folds()
-    best_clf_name = None
+    # ── Run all combinations ──────────────────────────────────────────
+    all_results = []  # list of (config_name, config_dict, results_dict)
     best_macro_f1 = -1.0
-    all_classifier_results = {}
+    best_config_name = None
 
-    for clf_name, clf_template in classifiers.items():
-        fold_results = []
-        all_test_preds = []
-        all_test_true = []
+    # Pre-compute feature matrices for each (num_segments, representation)
+    feature_matrices = {}
+    for rep in representation_options:
+        for n_seg in segment_options:
+            if rep == "aggregate" and n_seg != segment_options[0]:
+                continue  # aggregate doesn't depend on segments
+            key = (n_seg, rep)
+            X, y, pids, fnames = _build_feature_matrix(rollouts, feature_ids, n_seg, rep)
+            feature_matrices[key] = (X, y, pids, fnames)
+            if rep == "aggregate":
+                for n_seg2 in segment_options[1:]:
+                    feature_matrices[(n_seg2, rep)] = (X, y, pids, fnames)
 
-        print(f"\n{'=' * 60}")
-        print(f"  {clf_name} — LOO Cross-Validation ({len(folds)} folds)")
-        print(f"{'=' * 60}")
+    # Build flat list of all configs to sweep
+    sweep_configs = []  # (config_name, config_dict, n_seg, rep, use_pca, clf_template)
+    for rep in representation_options:
+        seg_list = [segment_options[0]] if rep == "aggregate" else segment_options
+        for n_seg in seg_list:
+            rep_label = rep if rep == "aggregate" else f"{rep} seg={n_seg}"
+            # PCA only for high-dim configs (positional seg=15 or combined seg=15)
+            pca_options = [False]
+            if n_seg == 15 and rep in ("positional", "combined"):
+                pca_options = [False, True]
+            for use_pca in pca_options:
+                pca_label = "+PCA" if use_pca else ""
+                for clf_name, clf_template in classifier_configs:
+                    config_name = f"{rep_label}{pca_label} | {clf_name}"
+                    sweep_configs.append((config_name, {
+                        "representation": rep,
+                        "num_segments": n_seg,
+                        "use_pca": use_pca,
+                        "classifier": clf_name,
+                    }, n_seg, rep, use_pca, clf_template))
 
-        for fold in folds:
-            test_pid_nm = fold["test_prompt_id"] + NM_SUFFIX
-            train_pids_nm = {pid + NM_SUFFIX for pid in fold["train_prompt_ids"]}
+    print(f"\nSweeping {len(sweep_configs)} configurations")
 
-            train_mask = np.isin(prompt_ids_arr, list(train_pids_nm))
-            test_mask = prompt_ids_arr == test_pid_nm
+    for config_name, config_dict, n_seg, rep, use_pca, clf_template in tqdm(
+        sweep_configs, desc="Sweeping configs"
+    ):
+        X, y, pids, fnames = feature_matrices[(n_seg, rep)]
+        results = _run_loo_cv(X, y, pids, clf_template, folds, use_pca=use_pca)
+        f1 = results["pooled_macro_f1"]
+        all_results.append((config_name, config_dict, results))
+        if f1 > best_macro_f1:
+            best_macro_f1 = f1
+            best_config_name = config_name
 
-            if not test_mask.any():
-                print(f"  Fold {fold['fold_idx']} ({test_pid_nm}): no test data, skipping")
-                continue
+    # ── Sort and print top results ────────────────────────────────────
+    all_results.sort(key=lambda x: x[2]["pooled_macro_f1"], reverse=True)
 
-            X_train, y_train = X[train_mask], y[train_mask]
-            X_test, y_test = X[test_mask], y[test_mask]
+    print(f"\n{'=' * 90}")
+    print(f"  TOP 20 CONFIGURATIONS (of {len(all_results)} total)")
+    print(f"{'=' * 90}")
+    print(f"  {'Rank':<5} {'Config':<55} {'Acc':>6} {'MacF1':>6} {'MajF1':>6} {'MinF1':>6} {'Dim':>4}")
+    print(f"  {'-'*5} {'-'*55} {'-'*6} {'-'*6} {'-'*6} {'-'*6} {'-'*4}")
+    for i, (name, cfg, res) in enumerate(all_results[:20]):
+        print(f"  {i+1:<5} {name:<55} {res['pooled_accuracy']:>6.3f} "
+              f"{res['pooled_macro_f1']:>6.3f} {res['pooled_majority_f1']:>6.3f} "
+              f"{res['pooled_minority_f1']:>6.3f} {res['feature_dim']:>4}")
 
-            # Standardize per fold
-            scaler = StandardScaler()
-            X_train_s = scaler.fit_transform(X_train)
-            X_test_s = scaler.transform(X_test)
+    # Also print best per-fold breakdown
+    best_name, best_cfg, best_res = all_results[0]
+    print(f"\n  BEST: {best_name}")
+    print(f"  Pooled macro F1: {best_res['pooled_macro_f1']:.4f}")
+    print(f"  Per-fold breakdown:")
+    for fr in best_res["fold_results"]:
+        print(f"    {fr['test_prompt_id']:<25} Acc={fr['accuracy']:.3f} "
+              f"F1={fr['macro_f1']:.3f} (maj={fr['majority_f1']:.3f}, min={fr['minority_f1']:.3f})")
 
-            # Clone the classifier for this fold
-            from sklearn.base import clone
-            clf = clone(clf_template)
-            clf.fit(X_train_s, y_train)
-
-            test_pred = clf.predict(X_test_s)
-            test_acc = float((y_test == test_pred).mean())
-            min_m = _metrics(y_test, test_pred, pos_label=1)
-            maj_m = _metrics(y_test, test_pred, pos_label=0)
-            macro_f1 = (min_m["f1"] + maj_m["f1"]) / 2
-
-            print(f"  Fold {fold['fold_idx']} ({fold['test_prompt_id']}): "
-                  f"Acc={test_acc:.3f}, F1={macro_f1:.3f} "
-                  f"(maj={maj_m['f1']:.3f}, min={min_m['f1']:.3f}), "
-                  f"n={len(y_test)}")
-
-            fold_results.append({
-                "fold_idx": fold["fold_idx"],
-                "test_prompt_id": fold["test_prompt_id"],
-                "accuracy": test_acc,
-                "macro_f1": macro_f1,
-                "majority_f1": maj_m["f1"],
-                "majority_precision": maj_m["precision"],
-                "majority_recall": maj_m["recall"],
-                "minority_f1": min_m["f1"],
-                "minority_precision": min_m["precision"],
-                "minority_recall": min_m["recall"],
-                "n_test": len(y_test),
-                "n_train": len(y_train),
-            })
-            all_test_preds.extend(test_pred.tolist())
-            all_test_true.extend(y_test.tolist())
-
-        # ── Aggregate metrics for this classifier ─────────────────────
-        all_test_preds_arr = np.array(all_test_preds)
-        all_test_true_arr = np.array(all_test_true)
-        pooled_acc = float((all_test_true_arr == all_test_preds_arr).mean())
-        pooled_min = _metrics(all_test_true_arr, all_test_preds_arr, pos_label=1)
-        pooled_maj = _metrics(all_test_true_arr, all_test_preds_arr, pos_label=0)
-        pooled_macro_f1 = (pooled_min["f1"] + pooled_maj["f1"]) / 2
-        fold_f1s = [fr["macro_f1"] for fr in fold_results]
-        mean_fold_f1 = sum(fold_f1s) / len(fold_f1s) if fold_f1s else 0.0
-
-        majority_frac = float((all_test_true_arr == 0).sum()) / len(all_test_true_arr) if len(all_test_true_arr) > 0 else 0.0
-
-        print(f"\n  Aggregate ({len(fold_results)} folds):")
-        print(f"    Pooled accuracy:    {pooled_acc:.3f} (n={len(all_test_true_arr)})")
-        print(f"    Pooled macro F1:    {pooled_macro_f1:.3f}")
-        print(f"    Mean fold macro F1: {mean_fold_f1:.3f}")
-        print(f"    Pooled majority F1: {pooled_maj['f1']:.3f}")
-        print(f"    Pooled minority F1: {pooled_min['f1']:.3f}")
-        print(f"    Chance baseline (always majority): {majority_frac:.3f}")
-
-        all_classifier_results[clf_name] = {
-            "pooled_accuracy": pooled_acc,
-            "pooled_macro_f1": pooled_macro_f1,
-            "mean_fold_macro_f1": mean_fold_f1,
-            "pooled_majority_f1": pooled_maj["f1"],
-            "pooled_majority_precision": pooled_maj["precision"],
-            "pooled_majority_recall": pooled_maj["recall"],
-            "pooled_minority_f1": pooled_min["f1"],
-            "pooled_minority_precision": pooled_min["precision"],
-            "pooled_minority_recall": pooled_min["recall"],
-            "chance_baseline": majority_frac,
-            "n_folds": len(fold_results),
-            "n_total": len(all_test_true_arr),
-            "fold_results": fold_results,
-        }
-
-        if pooled_macro_f1 > best_macro_f1:
-            best_macro_f1 = pooled_macro_f1
-            best_clf_name = clf_name
-
-    # ── Summary comparison ────────────────────────────────────────────
-    print(f"\n{'=' * 60}")
-    print(f"  COMPARISON SUMMARY")
-    print(f"{'=' * 60}")
-    print(f"  {'Classifier':<25} {'Accuracy':>8} {'Macro F1':>9} {'Maj F1':>7} {'Min F1':>7}")
-    print(f"  {'-'*25} {'-'*8} {'-'*9} {'-'*7} {'-'*7}")
-    for clf_name, res in all_classifier_results.items():
-        marker = " *" if clf_name == best_clf_name else ""
-        print(f"  {clf_name:<25} {res['pooled_accuracy']:>8.3f} {res['pooled_macro_f1']:>9.3f} "
-              f"{res['pooled_majority_f1']:>7.3f} {res['pooled_minority_f1']:>7.3f}{marker}")
-    print(f"\n  * Best by pooled macro F1")
+    majority_frac = best_res.get("chance_baseline", 0.0)
+    print(f"  Chance baseline (always majority): {majority_frac:.3f}")
 
     # ── Save ──────────────────────────────────────────────────────────
     output = {
-        "method": "loo_cv",
+        "method": "loo_cv_sweep",
         "baseline": "feature_vector",
-        "best_classifier": best_clf_name,
+        "best_config": best_config_name,
+        "best_config_details": best_cfg,
         "best_pooled_macro_f1": best_macro_f1,
-        "feature_names": feature_names,
-        "num_segments": NUM_SEGMENTS,
-        "num_features": len(feature_ids),
+        "num_configs_tested": len(all_results),
         "taxonomy": taxonomy,
-        "classifiers": all_classifier_results,
+        "top_20": [
+            {
+                "rank": i + 1,
+                "config_name": name,
+                "config_details": cfg,
+                **res,
+            }
+            for i, (name, cfg, res) in enumerate(all_results[:20])
+        ],
+        "all_results": [
+            {
+                "config_name": name,
+                "config_details": cfg,
+                "pooled_macro_f1": res["pooled_macro_f1"],
+                "pooled_accuracy": res["pooled_accuracy"],
+                "pooled_majority_f1": res["pooled_majority_f1"],
+                "pooled_minority_f1": res["pooled_minority_f1"],
+                "feature_dim": res["feature_dim"],
+            }
+            for name, cfg, res in all_results
+        ],
     }
     run_dir = _create_run_dir("train")
     with open(run_dir / "baseline_results.json", "w") as f:

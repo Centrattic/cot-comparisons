@@ -242,47 +242,61 @@ def batch_evaluate_compressions(task, question_id, jobs, num_resamples=50,
     prefix_indices = [i for i, p in enumerate(prepared) if p["continuation_budget"] is not None]
     middle_indices = [i for i, p in enumerate(prepared) if p["continuation_budget"] is None]
 
-    # ── Prefix mode: interleaved two-step generation ──
-    # Process each job's Step 1 (think) then immediately Step 2 (answer)
-    # so the KV cache from Step 1 is still warm for Step 2's prefill.
+    # ── Prefix mode: chunked two-step generation ──
+    # Process jobs in chunks so each chunk does Step 1 → Step 2 while
+    # KV cache is warm, but with enough sequences per call to saturate GPUs.
+    CHUNK_SIZE = 15  # 15 jobs × 50 resamples = 750 sequences per call
     if prefix_indices:
+        n_chunks = (len(prefix_indices) + CHUNK_SIZE - 1) // CHUNK_SIZE
         tqdm.write(f"    Prefix mode: {len(prefix_indices)} jobs "
-                    f"x {num_resamples} resamples (interleaved step1+step2)")
+                    f"x {num_resamples} resamples ({n_chunks} chunks of <={CHUNK_SIZE})")
 
         step2_params = VllmSamplingParams(
             max_tokens=ANSWER_MAX_TOKENS, temperature=temperature, n=1,
         )
 
-        for pi, pj_idx in enumerate(tqdm(
-            prefix_indices, desc="    Eval jobs", leave=False,
-        )):
-            base_tokens = prepared[pj_idx]["tokens"]
-            cb = prepared[pj_idx]["continuation_budget"]
+        for chunk_start in tqdm(
+            range(0, len(prefix_indices), CHUNK_SIZE),
+            desc="    Eval chunks", leave=False,
+            total=n_chunks,
+        ):
+            chunk = prefix_indices[chunk_start:chunk_start + CHUNK_SIZE]
 
-            # Step 1: generate thinking continuations (n=num_resamples)
-            step1_params = VllmSamplingParams(
-                max_tokens=cb, temperature=temperature, n=num_resamples,
-            )
-            step1_output = llm.generate(
-                [{"prompt_token_ids": base_tokens}], step1_params,
-                use_tqdm=False,
-            )[0]
+            # Step 1: thinking continuations for all jobs in this chunk
+            step1_prompts = [
+                {"prompt_token_ids": prepared[pj_idx]["tokens"]}
+                for pj_idx in chunk
+            ]
+            step1_params = [
+                VllmSamplingParams(
+                    max_tokens=prepared[pj_idx]["continuation_budget"],
+                    temperature=temperature, n=num_resamples,
+                )
+                for pj_idx in chunk
+            ]
+            step1_outputs = llm.generate(step1_prompts, step1_params,
+                                          use_tqdm=False)
 
-            # Step 2: immediately generate answers (KV cache is warm)
+            # Step 2: answer generation for all continuations in this chunk
             step2_inputs = []
-            for completion in step1_output.outputs:
-                think_token_ids = list(completion.token_ids)
-                full_prefix = base_tokens + think_token_ids + END_THINK_TOKENS
-                step2_inputs.append({"prompt_token_ids": full_prefix})
+            step2_job_indices = []
+            for ci, pj_idx in enumerate(chunk):
+                base_tokens = prepared[pj_idx]["tokens"]
+                for completion in step1_outputs[ci].outputs:
+                    think_token_ids = list(completion.token_ids)
+                    full_prefix = base_tokens + think_token_ids + END_THINK_TOKENS
+                    step2_inputs.append({"prompt_token_ids": full_prefix})
+                    step2_job_indices.append(pj_idx)
 
             step2_outputs = llm.generate(step2_inputs, step2_params,
-                                         use_tqdm=False)
+                                          use_tqdm=False)
 
-            for output in step2_outputs:
+            for s2_idx, output in enumerate(step2_outputs):
+                orig_idx = step2_job_indices[s2_idx]
                 answer_text = output.outputs[0].text.strip()
                 answer = task._extract_answer_from_text(answer_text, question)
                 if answer:
-                    job_answers[pj_idx].append(answer)
+                    job_answers[orig_idx].append(answer)
 
     # ── Middle mode: single-step generation ──
     if middle_indices:
