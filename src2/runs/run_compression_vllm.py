@@ -594,8 +594,12 @@ if __name__ == "__main__":
                 as_completed(futures), total=NUM_ROLLOUTS,
                 desc="  Preparing", unit="rollout", leave=False,
             ):
-                rollout_jobs = future.result()
-                jobs.extend(rollout_jobs)
+                try:
+                    rollout_jobs = future.result()
+                    jobs.extend(rollout_jobs)
+                except Exception as e:
+                    ri = futures[future]
+                    tqdm.write(f"    WARNING: prep failed for rollout {ri}: {e}")
         tqdm.write(f"  Prepared {len(jobs)} compression jobs")
 
         # ── Phase 2: Batch evaluate ALL compressions via vLLM ──
@@ -610,37 +614,41 @@ if __name__ == "__main__":
         last_n_eval_results = []
 
         for job, dist in zip(jobs, distributions):
-            metrics = task.evaluate(
-                [dist["distribution"]], [baseline["distribution"]],
-                mode=EVAL_MODE,
-            )
+            try:
+                metrics = task.evaluate(
+                    [dist["distribution"]], [baseline["distribution"]],
+                    mode=EVAL_MODE,
+                )
 
-            eval_result = {
-                "mode": EVAL_MODE,
-                "selected_indices": job["selected_indices"],
-                "relative_indices": job["relative_indices"],
-                "compressed_distribution": dist,
-                "baseline_distribution": baseline,
-                **metrics,
-            }
+                eval_result = {
+                    "mode": EVAL_MODE,
+                    "selected_indices": job["selected_indices"],
+                    "relative_indices": job["relative_indices"],
+                    "compressed_distribution": dist,
+                    "baseline_distribution": baseline,
+                    **metrics,
+                }
 
-            # Save per-rollout results
-            output_folder = Path(job["output_folder"])
-            with open(output_folder / "compression_eval.json", "w") as f:
-                json.dump(eval_result, f, indent=2)
-            with open(output_folder / "compressed_cot.txt", "w") as f:
-                f.write(job["compressed_cot"])
+                # Save per-rollout results
+                output_folder = Path(job["output_folder"])
+                with open(output_folder / "compression_eval.json", "w") as f:
+                    json.dump(eval_result, f, indent=2)
+                with open(output_folder / "compressed_cot.txt", "w") as f:
+                    f.write(job["compressed_cot"])
 
-            if hasattr(job["method_obj"], "_output") and job["method_obj"]._output:
-                job["method_obj"]._output.mark_success()
+                if hasattr(job["method_obj"], "_output") and job["method_obj"]._output:
+                    job["method_obj"]._output.mark_success()
 
-            record = {"rollout_idx": job["rollout_idx"], **eval_result}
-            if job["method"] == "bb":
-                bb_eval_results.append(record)
-            elif job["method"] == "faithful":
-                faithful_eval_results.append(record)
-            elif job["method"] == "last_n":
-                last_n_eval_results.append(record)
+                record = {"rollout_idx": job["rollout_idx"], **eval_result}
+                if job["method"] == "bb":
+                    bb_eval_results.append(record)
+                elif job["method"] == "faithful":
+                    faithful_eval_results.append(record)
+                elif job["method"] == "last_n":
+                    last_n_eval_results.append(record)
+            except Exception as e:
+                tqdm.write(f"    WARNING: save failed for {job['method']} "
+                           f"rollout {job['rollout_idx']}: {e}")
 
         # Print question summary
         for method_name, results in [("BB Monitor", bb_eval_results),
