@@ -432,10 +432,12 @@ if __name__ == "__main__":
 
     llm = LLM(
         model=SUBJECT_MODEL,
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=0.95,
         tensor_parallel_size=NUM_GPUS,
         max_model_len=16384,
         trust_remote_code=True,
+        enable_prefix_caching=True,
+        max_num_seqs=512,
     )
     tokenizer = AutoTokenizer.from_pretrained(SUBJECT_MODEL, trust_remote_code=True)
     END_THINK_TOKENS = tokenizer.encode("</think>", add_special_tokens=False)
