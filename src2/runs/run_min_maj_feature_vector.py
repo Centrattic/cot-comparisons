@@ -603,6 +603,7 @@ def _extract_positional_features(
     """
     n_features = len(feature_ids)
     feature_matrix = np.zeros((NUM_SEGMENTS, n_features))
+    segment_counts = np.zeros(NUM_SEGMENTS)
 
     if not chunk_scores:
         return feature_matrix.flatten()
@@ -611,15 +612,21 @@ def _extract_positional_features(
     for i, scores in enumerate(chunk_scores):
         position = i / max(n_chunks - 1, 1)
         seg = min(int(position * NUM_SEGMENTS), NUM_SEGMENTS - 1)
+        segment_counts[seg] += 1
         for j, fid in enumerate(feature_ids):
             feature_matrix[seg, j] += scores.get(fid, 0.0)
+
+    for s in range(NUM_SEGMENTS):
+        if segment_counts[s] > 0:
+            feature_matrix[s, :] /= segment_counts[s]
 
     return feature_matrix.flatten()
 
 
 def train_baseline():
-    """Train logistic regression on feature vectors using LOO-CV."""
+    """Train multiple classifiers on feature vectors using LOO-CV."""
     from sklearn.linear_model import LogisticRegression
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.preprocessing import StandardScaler
 
     # Find labeling results
@@ -685,110 +692,156 @@ def train_baseline():
         f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
         return {"precision": prec, "recall": rec, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
 
-    # ── LOO cross-validation (all prompts) ──────────────────────────
+    # ── Define classifiers to compare ─────────────────────────────────
+    minority_ratio = float((y == 1).sum()) / float((y == 0).sum()) if (y == 0).sum() > 0 else 1.0
+
+    classifiers = {
+        "LogReg (balanced)": LogisticRegression(
+            class_weight="balanced", max_iter=1000, random_state=SEED,
+        ),
+        "LogReg (L1, C=0.1)": LogisticRegression(
+            class_weight="balanced", penalty="l1", solver="liblinear",
+            C=0.1, max_iter=1000, random_state=SEED,
+        ),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=200, max_depth=8, class_weight="balanced",
+            random_state=SEED, n_jobs=-1,
+        ),
+        "Gradient Boosting": GradientBoostingClassifier(
+            n_estimators=200, max_depth=3, learning_rate=0.05,
+            subsample=0.8, random_state=SEED,
+        ),
+    }
+
     folds = MinMajAnswerTask.loo_folds()
-    fold_results = []
-    all_test_preds = []
-    all_test_true = []
+    best_clf_name = None
+    best_macro_f1 = -1.0
+    all_classifier_results = {}
 
+    for clf_name, clf_template in classifiers.items():
+        fold_results = []
+        all_test_preds = []
+        all_test_true = []
+
+        print(f"\n{'=' * 60}")
+        print(f"  {clf_name} — LOO Cross-Validation ({len(folds)} folds)")
+        print(f"{'=' * 60}")
+
+        for fold in folds:
+            test_pid_nm = fold["test_prompt_id"] + NM_SUFFIX
+            train_pids_nm = {pid + NM_SUFFIX for pid in fold["train_prompt_ids"]}
+
+            train_mask = np.isin(prompt_ids_arr, list(train_pids_nm))
+            test_mask = prompt_ids_arr == test_pid_nm
+
+            if not test_mask.any():
+                print(f"  Fold {fold['fold_idx']} ({test_pid_nm}): no test data, skipping")
+                continue
+
+            X_train, y_train = X[train_mask], y[train_mask]
+            X_test, y_test = X[test_mask], y[test_mask]
+
+            # Standardize per fold
+            scaler = StandardScaler()
+            X_train_s = scaler.fit_transform(X_train)
+            X_test_s = scaler.transform(X_test)
+
+            # Clone the classifier for this fold
+            from sklearn.base import clone
+            clf = clone(clf_template)
+            clf.fit(X_train_s, y_train)
+
+            test_pred = clf.predict(X_test_s)
+            test_acc = float((y_test == test_pred).mean())
+            min_m = _metrics(y_test, test_pred, pos_label=1)
+            maj_m = _metrics(y_test, test_pred, pos_label=0)
+            macro_f1 = (min_m["f1"] + maj_m["f1"]) / 2
+
+            print(f"  Fold {fold['fold_idx']} ({fold['test_prompt_id']}): "
+                  f"Acc={test_acc:.3f}, F1={macro_f1:.3f} "
+                  f"(maj={maj_m['f1']:.3f}, min={min_m['f1']:.3f}), "
+                  f"n={len(y_test)}")
+
+            fold_results.append({
+                "fold_idx": fold["fold_idx"],
+                "test_prompt_id": fold["test_prompt_id"],
+                "accuracy": test_acc,
+                "macro_f1": macro_f1,
+                "majority_f1": maj_m["f1"],
+                "majority_precision": maj_m["precision"],
+                "majority_recall": maj_m["recall"],
+                "minority_f1": min_m["f1"],
+                "minority_precision": min_m["precision"],
+                "minority_recall": min_m["recall"],
+                "n_test": len(y_test),
+                "n_train": len(y_train),
+            })
+            all_test_preds.extend(test_pred.tolist())
+            all_test_true.extend(y_test.tolist())
+
+        # ── Aggregate metrics for this classifier ─────────────────────
+        all_test_preds_arr = np.array(all_test_preds)
+        all_test_true_arr = np.array(all_test_true)
+        pooled_acc = float((all_test_true_arr == all_test_preds_arr).mean())
+        pooled_min = _metrics(all_test_true_arr, all_test_preds_arr, pos_label=1)
+        pooled_maj = _metrics(all_test_true_arr, all_test_preds_arr, pos_label=0)
+        pooled_macro_f1 = (pooled_min["f1"] + pooled_maj["f1"]) / 2
+        fold_f1s = [fr["macro_f1"] for fr in fold_results]
+        mean_fold_f1 = sum(fold_f1s) / len(fold_f1s) if fold_f1s else 0.0
+
+        majority_frac = float((all_test_true_arr == 0).sum()) / len(all_test_true_arr) if len(all_test_true_arr) > 0 else 0.0
+
+        print(f"\n  Aggregate ({len(fold_results)} folds):")
+        print(f"    Pooled accuracy:    {pooled_acc:.3f} (n={len(all_test_true_arr)})")
+        print(f"    Pooled macro F1:    {pooled_macro_f1:.3f}")
+        print(f"    Mean fold macro F1: {mean_fold_f1:.3f}")
+        print(f"    Pooled majority F1: {pooled_maj['f1']:.3f}")
+        print(f"    Pooled minority F1: {pooled_min['f1']:.3f}")
+        print(f"    Chance baseline (always majority): {majority_frac:.3f}")
+
+        all_classifier_results[clf_name] = {
+            "pooled_accuracy": pooled_acc,
+            "pooled_macro_f1": pooled_macro_f1,
+            "mean_fold_macro_f1": mean_fold_f1,
+            "pooled_majority_f1": pooled_maj["f1"],
+            "pooled_majority_precision": pooled_maj["precision"],
+            "pooled_majority_recall": pooled_maj["recall"],
+            "pooled_minority_f1": pooled_min["f1"],
+            "pooled_minority_precision": pooled_min["precision"],
+            "pooled_minority_recall": pooled_min["recall"],
+            "chance_baseline": majority_frac,
+            "n_folds": len(fold_results),
+            "n_total": len(all_test_true_arr),
+            "fold_results": fold_results,
+        }
+
+        if pooled_macro_f1 > best_macro_f1:
+            best_macro_f1 = pooled_macro_f1
+            best_clf_name = clf_name
+
+    # ── Summary comparison ────────────────────────────────────────────
     print(f"\n{'=' * 60}")
-    print(f"  Feature Vector Baseline — LOO Cross-Validation ({len(folds)} folds)")
+    print(f"  COMPARISON SUMMARY")
     print(f"{'=' * 60}")
-
-    for fold in folds:
-        test_pid_nm = fold["test_prompt_id"] + NM_SUFFIX
-        train_pids_nm = {pid + NM_SUFFIX for pid in fold["train_prompt_ids"]}
-
-        train_mask = np.isin(prompt_ids_arr, list(train_pids_nm))
-        test_mask = prompt_ids_arr == test_pid_nm
-
-        if not test_mask.any():
-            print(f"  Fold {fold['fold_idx']} ({test_pid_nm}): no test data, skipping")
-            continue
-
-        X_train, y_train = X[train_mask], y[train_mask]
-        X_test, y_test = X[test_mask], y[test_mask]
-
-        # Standardize per fold
-        scaler = StandardScaler()
-        X_train_s = scaler.fit_transform(X_train)
-        X_test_s = scaler.transform(X_test)
-
-        # Fit logistic regression
-        clf = LogisticRegression(
-            class_weight="balanced", max_iter=1000, random_state=SEED
-        )
-        clf.fit(X_train_s, y_train)
-
-        test_pred = clf.predict(X_test_s)
-        test_acc = float((y_test == test_pred).mean())
-        min_m = _metrics(y_test, test_pred, pos_label=1)
-        maj_m = _metrics(y_test, test_pred, pos_label=0)
-        macro_f1 = (min_m["f1"] + maj_m["f1"]) / 2
-
-        print(f"  Fold {fold['fold_idx']} ({fold['test_prompt_id']}): "
-              f"Acc={test_acc:.3f}, F1={macro_f1:.3f} "
-              f"(maj={maj_m['f1']:.3f}, min={min_m['f1']:.3f}), "
-              f"n={len(y_test)}")
-
-        fold_results.append({
-            "fold_idx": fold["fold_idx"],
-            "test_prompt_id": fold["test_prompt_id"],
-            "accuracy": test_acc,
-            "macro_f1": macro_f1,
-            "majority_f1": maj_m["f1"],
-            "majority_precision": maj_m["precision"],
-            "majority_recall": maj_m["recall"],
-            "minority_f1": min_m["f1"],
-            "minority_precision": min_m["precision"],
-            "minority_recall": min_m["recall"],
-            "n_test": len(y_test),
-            "n_train": len(y_train),
-        })
-        all_test_preds.extend(test_pred.tolist())
-        all_test_true.extend(y_test.tolist())
-
-    # ── Aggregate metrics ─────────────────────────────────────────────
-    all_test_preds = np.array(all_test_preds)
-    all_test_true = np.array(all_test_true)
-    pooled_acc = float((all_test_true == all_test_preds).mean())
-    pooled_min = _metrics(all_test_true, all_test_preds, pos_label=1)
-    pooled_maj = _metrics(all_test_true, all_test_preds, pos_label=0)
-    pooled_macro_f1 = (pooled_min["f1"] + pooled_maj["f1"]) / 2
-    fold_f1s = [fr["macro_f1"] for fr in fold_results]
-    mean_fold_f1 = sum(fold_f1s) / len(fold_f1s) if fold_f1s else 0.0
-
-    majority_frac = float((all_test_true == 0).sum()) / len(all_test_true) if len(all_test_true) > 0 else 0.0
-
-    print(f"\n  Aggregate ({len(fold_results)} folds):")
-    print(f"    Pooled accuracy:    {pooled_acc:.3f} (n={len(all_test_true)})")
-    print(f"    Pooled macro F1:    {pooled_macro_f1:.3f}")
-    print(f"    Mean fold macro F1: {mean_fold_f1:.3f}")
-    print(f"    Pooled majority F1: {pooled_maj['f1']:.3f}")
-    print(f"    Pooled minority F1: {pooled_min['f1']:.3f}")
-    print(f"    Chance baseline (always majority): {majority_frac:.3f}")
+    print(f"  {'Classifier':<25} {'Accuracy':>8} {'Macro F1':>9} {'Maj F1':>7} {'Min F1':>7}")
+    print(f"  {'-'*25} {'-'*8} {'-'*9} {'-'*7} {'-'*7}")
+    for clf_name, res in all_classifier_results.items():
+        marker = " *" if clf_name == best_clf_name else ""
+        print(f"  {clf_name:<25} {res['pooled_accuracy']:>8.3f} {res['pooled_macro_f1']:>9.3f} "
+              f"{res['pooled_majority_f1']:>7.3f} {res['pooled_minority_f1']:>7.3f}{marker}")
+    print(f"\n  * Best by pooled macro F1")
 
     # ── Save ──────────────────────────────────────────────────────────
     output = {
         "method": "loo_cv",
         "baseline": "feature_vector",
-        "pooled_accuracy": pooled_acc,
-        "pooled_macro_f1": pooled_macro_f1,
-        "mean_fold_macro_f1": mean_fold_f1,
-        "pooled_majority_f1": pooled_maj["f1"],
-        "pooled_majority_precision": pooled_maj["precision"],
-        "pooled_majority_recall": pooled_maj["recall"],
-        "pooled_minority_f1": pooled_min["f1"],
-        "pooled_minority_precision": pooled_min["precision"],
-        "pooled_minority_recall": pooled_min["recall"],
-        "chance_baseline": majority_frac,
-        "n_folds": len(fold_results),
-        "n_total": len(all_test_true),
+        "best_classifier": best_clf_name,
+        "best_pooled_macro_f1": best_macro_f1,
         "feature_names": feature_names,
         "num_segments": NUM_SEGMENTS,
         "num_features": len(feature_ids),
         "taxonomy": taxonomy,
-        "fold_results": fold_results,
+        "classifiers": all_classifier_results,
     }
     run_dir = _create_run_dir("train")
     with open(run_dir / "baseline_results.json", "w") as f:

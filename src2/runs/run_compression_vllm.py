@@ -265,6 +265,7 @@ def batch_evaluate_compressions(task, question_id, jobs, num_resamples=50,
             )
             step1_output = llm.generate(
                 [{"prompt_token_ids": base_tokens}], step1_params,
+                use_tqdm=False,
             )[0]
 
             # Step 2: immediately generate answers (KV cache is warm)
@@ -274,7 +275,8 @@ def batch_evaluate_compressions(task, question_id, jobs, num_resamples=50,
                 full_prefix = base_tokens + think_token_ids + END_THINK_TOKENS
                 step2_inputs.append({"prompt_token_ids": full_prefix})
 
-            step2_outputs = llm.generate(step2_inputs, step2_params)
+            step2_outputs = llm.generate(step2_inputs, step2_params,
+                                         use_tqdm=False)
 
             for output in step2_outputs:
                 answer_text = output.outputs[0].text.strip()
@@ -291,7 +293,7 @@ def batch_evaluate_compressions(task, question_id, jobs, num_resamples=50,
 
         tqdm.write(f"    Middle mode: {len(middle_indices)} prompts "
                     f"x {num_resamples} resamples")
-        mid_outputs = llm.generate(mid_prompts, mid_params)
+        mid_outputs = llm.generate(mid_prompts, mid_params, use_tqdm=False)
 
         for mi, mj_idx in enumerate(middle_indices):
             output = mid_outputs[mi]
@@ -366,6 +368,7 @@ def compute_baseline_vllm(task, question_id, rollout_idx=0, num_resamples=50,
         )
         step1_output = llm.generate(
             [{"prompt_token_ids": tokens}], step1_params,
+            use_tqdm=False,
         )[0]
 
         step2_inputs = []
@@ -377,7 +380,8 @@ def compute_baseline_vllm(task, question_id, rollout_idx=0, num_resamples=50,
         step2_params = VllmSamplingParams(
             max_tokens=ANSWER_MAX_TOKENS, temperature=temperature, n=1,
         )
-        step2_outputs = llm.generate(step2_inputs, step2_params)
+        step2_outputs = llm.generate(step2_inputs, step2_params,
+                                      use_tqdm=False)
 
         for output in step2_outputs:
             answer_text = output.outputs[0].text.strip()
@@ -389,7 +393,8 @@ def compute_baseline_vllm(task, question_id, rollout_idx=0, num_resamples=50,
         params = VllmSamplingParams(
             max_tokens=2048, temperature=temperature, n=num_resamples,
         )
-        output = llm.generate([{"prompt_token_ids": tokens}], params)[0]
+        output = llm.generate([{"prompt_token_ids": tokens}], params,
+                               use_tqdm=False)[0]
 
         for completion in output.outputs:
             answer, _, _ = task._extract_answer(
