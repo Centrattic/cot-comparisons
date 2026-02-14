@@ -2,13 +2,14 @@
 """
 Plot comparison of scruples monitor results.
 
-Compares base monitor, high-context monitor, and discrimination monitor
-for suggest_wrong and suggest_right variants.
+Compares base monitor, high-context monitor, discrimination monitor,
+and BoW TF-IDF baseline for suggest_wrong and suggest_right variants.
 
 Usage:
     python -m src2.runs.plot_scruples_monitors
 """
 
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -27,9 +28,29 @@ SYCOPHANTIC_ANSWER = {"suggest_wrong": "A", "suggest_right": "B"}
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _resolve_latest_run(base_dir: Path) -> Path:
+    """Resolve the latest run directory, preferring 'latest' symlink,
+    falling back to the most recent timestamped subdirectory."""
+    latest = base_dir / "latest"
+    if latest.exists():
+        return latest
+    timestamped = sorted(
+        [d for d in base_dir.iterdir() if d.is_dir() and d.name[0].isdigit()],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    if timestamped:
+        return timestamped[0]
+    return latest
+
+
 def load_monitor_results(variant: str, monitor: str) -> pd.DataFrame:
     """Load results CSV for a given variant and monitor type."""
-    path = DATA_DIR / f"llm_monitor_scruples_{monitor}_{variant}" / "latest" / "results.csv"
+    base_dir = DATA_DIR / f"llm_monitor_scruples_{monitor}_{variant}"
+    if not base_dir.exists():
+        raise FileNotFoundError(f"Directory not found: {base_dir}")
+    run_dir = _resolve_latest_run(base_dir)
+    path = run_dir / "results.csv"
     if not path.exists():
         raise FileNotFoundError(f"Results not found: {path}")
     return pd.read_csv(path)
@@ -99,11 +120,6 @@ def compute_discrimination_metrics(df: pd.DataFrame) -> dict:
     correct = (df["monitor_prediction"] == df["actual_intervention"]).sum()
     accuracy = correct / len(df) if len(df) > 0 else 0
 
-    # For precision/recall, we can compute per-class
-    # But simpler: treat it as binary classification where positive = correct identification
-    # Since the task is symmetric (A or B), precision = recall = accuracy for balanced data
-    # Let's compute properly anyway
-
     # True label is actual_intervention, prediction is monitor_prediction
     # Compute macro-averaged precision/recall across A and B
     classes = ["A", "B"]
@@ -131,6 +147,31 @@ def compute_discrimination_metrics(df: pd.DataFrame) -> dict:
         "f1": macro_f1,
         "n_samples": len(df),
         "n_correct": int(correct),
+    }
+
+
+def load_bow_tfidf_metrics() -> dict:
+    """Load BoW TF-IDF results (trained across both variants)."""
+    results_path = DATA_DIR / "bow_tfidf_scruples" / "latest" / "results.json"
+    if not results_path.exists():
+        # Try resolving without latest symlink
+        base_dir = DATA_DIR / "bow_tfidf_scruples"
+        if base_dir.exists():
+            run_dir = _resolve_latest_run(base_dir)
+            results_path = run_dir / "results.json"
+    if not results_path.exists():
+        return {}
+    with open(results_path) as f:
+        data = json.load(f)
+    if "metrics" not in data:
+        return {}
+    m = data["metrics"]
+    return {
+        "accuracy": m["accuracy"],
+        "precision": m["precision"],
+        "recall": m["recall"],
+        "f1": m["f1"],
+        "n_samples": len(data.get("predictions", [])),
     }
 
 
@@ -201,53 +242,75 @@ def main():
             except FileNotFoundError as e:
                 print(f"Skipping {variant}/{monitor}: {e}")
 
-    # Create comparison plots
+    # Load BoW TF-IDF (variant-agnostic)
+    bow_metrics = load_bow_tfidf_metrics()
+    if bow_metrics:
+        print(f"BoW TF-IDF (both variants):")
+        print(f"  Accuracy: {bow_metrics['accuracy']:.3f}")
+        print(f"  Precision: {bow_metrics['precision']:.3f}")
+        print(f"  Recall: {bow_metrics['recall']:.3f}")
+        print(f"  F1: {bow_metrics['f1']:.3f}")
+        print(f"  Samples: {bow_metrics['n_samples']}")
+        print()
+
+    # ── Create comparison plots ───────────────────────────────────────
+    all_methods = ["base_monitor", "high_context_monitor", "discrimination"]
+    has_bow = bool(bow_metrics)
+    if has_bow:
+        all_methods.append("bow_tfidf")
+
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     metrics_to_plot = ["accuracy", "precision", "recall", "f1"]
     x = np.arange(len(metrics_to_plot))
-    width = 0.25
+    n_bars = len(all_methods)
+    width = 0.8 / n_bars
 
     colors = {
         "base_monitor": "#4C72B0",
         "high_context_monitor": "#55A868",
         "discrimination": "#C44E52",
+        "bow_tfidf": "#8172B2",
     }
     labels = {
         "base_monitor": "Base Monitor",
         "high_context_monitor": "High-Context",
         "discrimination": "Discrimination",
+        "bow_tfidf": "BoW TF-IDF",
     }
 
     for idx, variant in enumerate(VARIANTS):
         ax = axes[idx]
+        all_bars = []
 
-        base_vals = [results[variant].get("base_monitor", {}).get(m, 0) for m in metrics_to_plot]
-        high_vals = [results[variant].get("high_context_monitor", {}).get(m, 0) for m in metrics_to_plot]
-        disc_vals = [results[variant].get("discrimination", {}).get(m, 0) for m in metrics_to_plot]
-
-        bars1 = ax.bar(x - width, base_vals, width, label=labels["base_monitor"], color=colors["base_monitor"])
-        bars2 = ax.bar(x, high_vals, width, label=labels["high_context_monitor"], color=colors["high_context_monitor"])
-        bars3 = ax.bar(x + width, disc_vals, width, label=labels["discrimination"], color=colors["discrimination"])
+        for i, method in enumerate(all_methods):
+            if method == "bow_tfidf":
+                vals = [bow_metrics.get(m, 0) for m in metrics_to_plot]
+            else:
+                vals = [results[variant].get(method, {}).get(m, 0) for m in metrics_to_plot]
+            offset = (i - (n_bars - 1) / 2) * width
+            bars = ax.bar(x + offset, vals, width,
+                          label=labels[method], color=colors[method], alpha=0.85)
+            all_bars.append(bars)
 
         ax.set_ylabel("Score")
         ax.set_title(f"Monitor Performance: {variant}")
         ax.set_xticks(x)
         ax.set_xticklabels(metrics_to_plot)
-        ax.legend(loc="upper right")
-        ax.set_ylim(0, 1.1)
-        ax.axhline(y=0.5, color="gray", linestyle="--", alpha=0.5, label="Chance")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.set_ylim(0, 1.15)
+        ax.axhline(y=0.5, color="gray", linestyle="--", alpha=0.5)
 
         # Add value labels
-        for bars in [bars1, bars2, bars3]:
+        for bars in all_bars:
             for bar in bars:
                 height = bar.get_height()
                 if height > 0:
                     ax.annotate(f"{height:.2f}",
-                               xy=(bar.get_x() + bar.get_width() / 2, height),
-                               xytext=(0, 3),
-                               textcoords="offset points",
-                               ha="center", va="bottom", fontsize=8)
+                                xy=(bar.get_x() + bar.get_width() / 2, height),
+                                xytext=(0, 3),
+                                textcoords="offset points",
+                                ha="center", va="bottom", fontsize=7)
 
     plt.tight_layout()
 
@@ -256,7 +319,7 @@ def main():
     plt.savefig(output_path, dpi=150)
     print(f"Plot saved to: {output_path}")
 
-    plt.show()
+    plt.close()
 
 
 if __name__ == "__main__":

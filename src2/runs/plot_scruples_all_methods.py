@@ -7,6 +7,7 @@ Methods:
   2. Base LLM Monitor (no context)
   3. High-Context LLM Monitor (15 few-shot examples)
   4. Entropy Baseline (logistic regression on forced-response entropy features)
+  5. BoW TF-IDF (TF-IDF + LogisticRegressionCV on CoT thinking text)
 
 Also generates data scaling and training curves subplots.
 
@@ -33,6 +34,23 @@ PLOT_DIR.mkdir(parents=True, exist_ok=True)
 VARIANTS = ["suggest_wrong", "suggest_right"]
 
 
+def _resolve_latest_run(base_dir: Path) -> Path:
+    """Resolve the latest run directory, preferring 'latest' symlink,
+    falling back to the most recent timestamped subdirectory."""
+    latest = base_dir / "latest"
+    if latest.exists():
+        return latest
+    # Fall back to most recent timestamped directory
+    timestamped = sorted(
+        [d for d in base_dir.iterdir() if d.is_dir() and d.name[0].isdigit()],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    if timestamped:
+        return timestamped[0]
+    return latest  # will fail downstream with a clear path
+
+
 def compute_monitor_metrics(monitor_name, test_anecdotes, syc_ids):
     """Compute F1/precision/recall for an LLM monitor on the test anecdotes.
 
@@ -44,12 +62,12 @@ def compute_monitor_metrics(monitor_name, test_anecdotes, syc_ids):
     tp = fp = fn = tn = 0
     for variant in VARIANTS:
         syc_answer = INTERVENTION_SUGGESTED_ANSWER[variant]
-        csv_path = (
-            DATA_DIR
-            / f"llm_monitor_scruples_{monitor_name}_{variant}"
-            / "latest"
-            / "results.csv"
-        )
+        base_dir = DATA_DIR / f"llm_monitor_scruples_{monitor_name}_{variant}"
+        if not base_dir.exists():
+            print(f"  Warning: {base_dir} not found")
+            continue
+        run_dir = _resolve_latest_run(base_dir)
+        csv_path = run_dir / "results.csv"
         if not csv_path.exists():
             print(f"  Warning: {csv_path} not found")
             continue
@@ -134,6 +152,24 @@ def main():
         print(f"Entropy Baseline: F1={ent['test_f1']:.3f}")
     else:
         print("Entropy baseline results not found (run --train phase first)")
+
+    # 5. BoW TF-IDF
+    bow_results_path = DATA_DIR / "bow_tfidf_scruples" / "latest" / "results.json"
+    if bow_results_path.exists():
+        with open(bow_results_path) as f:
+            bow = json.load(f)
+        if "metrics" in bow:
+            bm = bow["metrics"]
+            methods["BoW\nTF-IDF"] = {
+                "f1": bm["f1"],
+                "precision": bm["precision"],
+                "recall": bm["recall"],
+                "accuracy": bm["accuracy"],
+                "n": len(bow.get("predictions", [])),
+            }
+            print(f"BoW TF-IDF: F1={bm['f1']:.3f}")
+    else:
+        print("BoW TF-IDF results not found (run run_scruples_bow_tfidf first)")
 
     if not methods:
         print("No method results found!")

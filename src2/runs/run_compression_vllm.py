@@ -7,10 +7,10 @@ GPT-5.2 monitor calls (via OpenRouter) stay the same.
 
 Three phases per question (batched for speed):
   1. Prepare: generate compression specs + run monitors for all rollouts
-  2. Batch evaluate: fire ALL resamples across ALL rollouts×methods via vLLM
+  2. Batch evaluate: fire ALL resamples across ALL rollouts x methods via vLLM
   3. Save: compute KL, save per-rollout and aggregate results
 
-Skips question×method combos that already have >= NUM_ROLLOUTS results.
+Skips question x method combos that already have >= NUM_ROLLOUTS results.
 
 Usage:
     python -m src2.runs.run_compression_vllm
@@ -44,7 +44,7 @@ from src2.methods.base import BaseMethod
 from src2.utils.questions import GPQAQuestion
 from src2.utils.chat_template import build_thinking_prompt
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# ── Constants ────────────────────────────────────────────────────────
 
 SUBJECT_MODEL = "Qwen/Qwen3-32B"
 MONITOR_MODEL = "openai/gpt-5.2"
@@ -57,13 +57,13 @@ REGION = "prefix"
 EVAL_MODE = "kl_divergence"
 NUM_ROLLOUTS = 35
 NUM_RESAMPLES = 50
+ANSWER_MAX_TOKENS = 256
+CHUNK_SIZE = 15  # jobs per vLLM generate() call (15 x 50 = 750 seqs)
 
 QUESTION_IDS = [
-    # Custom questions
     "starfish",
     "custom_bagel_001",
     "waffle",
-    # GPQA diamond (10 questions, high agreement)
     "gpqa_gpqa_diamond_0007",
     "gpqa_gpqa_diamond_0010",
     "gpqa_gpqa_diamond_0013",
@@ -83,6 +83,9 @@ tokenizer = None
 END_THINK_TOKENS = None
 
 
+# ── LastNBaselineMethod ──────────────────────────────────────────────
+
+
 class LastNBaselineMethod(BaseMethod):
     """Trivial baseline: select the last N sentences of the compression region."""
 
@@ -90,7 +93,6 @@ class LastNBaselineMethod(BaseMethod):
         super().__init__("last_n_baseline")
 
     def infer(self, data, verbose=True):
-        """No LLM call — just pick the last target_num_sentences of the region."""
         rows = data if isinstance(data, list) else [data]
         results = []
         for row in rows:
@@ -195,130 +197,8 @@ def build_monitor_row(spec, question):
     return row
 
 
-# ── vLLM batch evaluation ───────────────────────────────────────────
-
-
-def batch_evaluate_compressions(task, question_id, jobs, num_resamples=50,
-                                 temperature=0.7):
-    """
-    Batch-evaluate ALL compressed CoTs for one question via vLLM.
-
-    Uses vLLM native batching instead of ThreadPoolExecutor:
-      - Step 1: thinking continuation (prefix jobs, n=num_resamples per prompt)
-      - Step 2: answer generation (one per continuation, n=1)
-      - Middle mode: single-step with n=num_resamples
-
-    Returns list of distribution dicts, one per job.
-    """
-    if not jobs:
-        return []
-
-    loaded = task.load_question_and_cot(question_id, jobs[0]["rollout_idx"])
-    if loaded is None:
-        raise RuntimeError(f"Could not load question for {question_id}")
-    question, _ = loaded
-
-    user_msg = task._user_msg(question)
-    ANSWER_MAX_TOKENS = 256
-
-    # Pre-compute tokenized prompts for each job
-    prepared = []
-    for job in jobs:
-        prompt_str = build_thinking_prompt(
-            tokenizer, user_msg, cot_prefix=job["compressed_cot"],
-        )
-        tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
-
-        spec = job["spec"]
-        cb = spec.original_token_count - spec.region_token_count
-        if cb <= 0:
-            cb = None
-
-        prepared.append({"tokens": tokens, "continuation_budget": cb})
-
-    job_answers = [[] for _ in range(len(jobs))]
-
-    # Separate prefix-mode and middle-mode jobs by index
-    prefix_indices = [i for i, p in enumerate(prepared) if p["continuation_budget"] is not None]
-    middle_indices = [i for i, p in enumerate(prepared) if p["continuation_budget"] is None]
-
-    # ── Prefix mode: chunked two-step generation ──
-    # Process jobs in chunks so each chunk does Step 1 → Step 2 while
-    # KV cache is warm, but with enough sequences per call to saturate GPUs.
-    CHUNK_SIZE = 15  # 15 jobs × 50 resamples = 750 sequences per call
-    if prefix_indices:
-        n_chunks = (len(prefix_indices) + CHUNK_SIZE - 1) // CHUNK_SIZE
-        tqdm.write(f"    Prefix mode: {len(prefix_indices)} jobs "
-                    f"x {num_resamples} resamples ({n_chunks} chunks of <={CHUNK_SIZE})")
-
-        step2_params = VllmSamplingParams(
-            max_tokens=ANSWER_MAX_TOKENS, temperature=temperature, n=1,
-        )
-
-        for chunk_start in tqdm(
-            range(0, len(prefix_indices), CHUNK_SIZE),
-            desc="    Eval chunks", leave=False,
-            total=n_chunks,
-        ):
-            chunk = prefix_indices[chunk_start:chunk_start + CHUNK_SIZE]
-
-            # Step 1: thinking continuations for all jobs in this chunk
-            step1_prompts = [
-                {"prompt_token_ids": prepared[pj_idx]["tokens"]}
-                for pj_idx in chunk
-            ]
-            step1_params = [
-                VllmSamplingParams(
-                    max_tokens=prepared[pj_idx]["continuation_budget"],
-                    temperature=temperature, n=num_resamples,
-                )
-                for pj_idx in chunk
-            ]
-            step1_outputs = llm.generate(step1_prompts, step1_params,
-                                          use_tqdm=False)
-
-            # Step 2: answer generation for all continuations in this chunk
-            step2_inputs = []
-            step2_job_indices = []
-            for ci, pj_idx in enumerate(chunk):
-                base_tokens = prepared[pj_idx]["tokens"]
-                for completion in step1_outputs[ci].outputs:
-                    think_token_ids = list(completion.token_ids)
-                    full_prefix = base_tokens + think_token_ids + END_THINK_TOKENS
-                    step2_inputs.append({"prompt_token_ids": full_prefix})
-                    step2_job_indices.append(pj_idx)
-
-            step2_outputs = llm.generate(step2_inputs, step2_params,
-                                          use_tqdm=False)
-
-            for s2_idx, output in enumerate(step2_outputs):
-                orig_idx = step2_job_indices[s2_idx]
-                answer_text = output.outputs[0].text.strip()
-                answer = task._extract_answer_from_text(answer_text, question)
-                if answer:
-                    job_answers[orig_idx].append(answer)
-
-    # ── Middle mode: single-step generation ──
-    if middle_indices:
-        mid_prompts = [{"prompt_token_ids": prepared[i]["tokens"]} for i in middle_indices]
-        mid_params = VllmSamplingParams(
-            max_tokens=2048, temperature=temperature, n=num_resamples,
-        )
-
-        tqdm.write(f"    Middle mode: {len(middle_indices)} prompts "
-                    f"x {num_resamples} resamples")
-        mid_outputs = llm.generate(mid_prompts, mid_params, use_tqdm=False)
-
-        for mi, mj_idx in enumerate(middle_indices):
-            output = mid_outputs[mi]
-            for completion in output.outputs:
-                answer, _, _ = task._extract_answer(
-                    list(completion.token_ids), tokenizer, question,
-                )
-                if answer:
-                    job_answers[mj_idx].append(answer)
-
-    # Compute distributions
+def _build_distributions(job_answers, jobs, prepared, question_id, num_resamples):
+    """Convert per-job answer lists into distribution dicts."""
     distributions = []
     for job_idx, answers in enumerate(job_answers):
         counts = {}
@@ -338,77 +218,176 @@ def batch_evaluate_compressions(task, question_id, jobs, num_resamples=50,
             "region_type": jobs[job_idx]["spec"].region_type,
             "continuation_budget": prepared[job_idx]["continuation_budget"],
         })
-
     return distributions
+
+
+# ── vLLM batch evaluation ───────────────────────────────────────────
+
+
+def batch_evaluate_compressions(task, question_id, jobs, num_resamples=50,
+                                 temperature=0.7):
+    """
+    Batch-evaluate ALL compressed CoTs for one question via vLLM.
+
+    Processes jobs in chunks of CHUNK_SIZE to balance GPU saturation
+    with KV cache locality:
+      - Step 1: thinking continuation (n=num_resamples per prompt)
+      - Step 2: answer generation (n=1, KV cache warm from Step 1)
+      - Middle mode: single-step with n=num_resamples
+
+    Returns list of distribution dicts, one per job.
+    """
+    if not jobs:
+        return []
+
+    loaded = task.load_question_and_cot(question_id, jobs[0]["rollout_idx"])
+    if loaded is None:
+        raise RuntimeError(f"Could not load question for {question_id}")
+    question, _ = loaded
+
+    user_msg = task._user_msg(question)
+
+    # Pre-compute tokenized prompts and continuation budgets
+    prepared = []
+    for job in jobs:
+        prompt_str = build_thinking_prompt(
+            tokenizer, user_msg, cot_prefix=job["compressed_cot"],
+        )
+        tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
+        spec = job["spec"]
+        cb = spec.original_token_count - spec.region_token_count
+        prepared.append({"tokens": tokens, "continuation_budget": cb if cb > 0 else None})
+
+    job_answers = [[] for _ in range(len(jobs))]
+
+    prefix_indices = [i for i, p in enumerate(prepared) if p["continuation_budget"] is not None]
+    middle_indices = [i for i, p in enumerate(prepared) if p["continuation_budget"] is None]
+
+    # ── Prefix mode: chunked two-step generation ──
+    if prefix_indices:
+        n_chunks = (len(prefix_indices) + CHUNK_SIZE - 1) // CHUNK_SIZE
+        tqdm.write(f"    Prefix mode: {len(prefix_indices)} jobs "
+                    f"x {num_resamples} resamples ({n_chunks} chunks of <={CHUNK_SIZE})")
+
+        step2_params = VllmSamplingParams(
+            max_tokens=ANSWER_MAX_TOKENS, temperature=temperature, n=1,
+        )
+
+        for chunk_start in tqdm(
+            range(0, len(prefix_indices), CHUNK_SIZE),
+            desc="    Eval chunks", leave=False, total=n_chunks,
+        ):
+            chunk = prefix_indices[chunk_start:chunk_start + CHUNK_SIZE]
+
+            # Step 1: thinking continuations
+            step1_prompts = [
+                {"prompt_token_ids": prepared[i]["tokens"]} for i in chunk
+            ]
+            step1_params = [
+                VllmSamplingParams(
+                    max_tokens=prepared[i]["continuation_budget"],
+                    temperature=temperature, n=num_resamples,
+                )
+                for i in chunk
+            ]
+            step1_outputs = llm.generate(step1_prompts, step1_params, use_tqdm=False)
+
+            # Step 2: answer generation (KV cache warm from Step 1)
+            step2_inputs = []
+            step2_job_indices = []
+            for ci, pj_idx in enumerate(chunk):
+                base_tokens = prepared[pj_idx]["tokens"]
+                for completion in step1_outputs[ci].outputs:
+                    full_prefix = base_tokens + list(completion.token_ids) + END_THINK_TOKENS
+                    step2_inputs.append({"prompt_token_ids": full_prefix})
+                    step2_job_indices.append(pj_idx)
+
+            step2_outputs = llm.generate(step2_inputs, step2_params, use_tqdm=False)
+
+            for s2_idx, output in enumerate(step2_outputs):
+                answer_text = output.outputs[0].text.strip()
+                answer = task._extract_answer_from_text(answer_text, question)
+                if answer:
+                    job_answers[step2_job_indices[s2_idx]].append(answer)
+
+    # ── Middle mode: single-step generation ──
+    if middle_indices:
+        tqdm.write(f"    Middle mode: {len(middle_indices)} prompts "
+                    f"x {num_resamples} resamples")
+        mid_prompts = [{"prompt_token_ids": prepared[i]["tokens"]} for i in middle_indices]
+        mid_params = VllmSamplingParams(
+            max_tokens=2048, temperature=temperature, n=num_resamples,
+        )
+        mid_outputs = llm.generate(mid_prompts, mid_params, use_tqdm=False)
+
+        for mi, mj_idx in enumerate(middle_indices):
+            for completion in mid_outputs[mi].outputs:
+                answer, _, _ = task._extract_answer(
+                    list(completion.token_ids), tokenizer, question,
+                )
+                if answer:
+                    job_answers[mj_idx].append(answer)
+
+    return _build_distributions(job_answers, jobs, prepared, question_id, num_resamples)
 
 
 def compute_baseline_vllm(task, question_id, rollout_idx=0, num_resamples=50,
                            temperature=0.7):
     """
     Compute baseline answer distribution using vLLM with full (uncompressed) CoT.
-
-    Same two-step logic as batch_evaluate_compressions but for a single
-    question with the original CoT as prefix. Returns the same dict format
-    as task.get_baseline_distribution().
+    Returns the same dict format as task.get_baseline_distribution().
     """
     loaded = task.load_question_and_cot(question_id, rollout_idx)
     if loaded is None:
         raise RuntimeError(f"Could not load question for {question_id}")
     question, source_cot = loaded
 
-    # Load spec for region_type and token counts
     spec_data = task._load_latest_spec(question_id, rollout_idx)
     region_type = spec_data.get("region_type", "middle") if spec_data else "middle"
 
     continuation_budget = None
     if region_type == "prefix" and spec_data:
-        original_token_count = spec_data.get("original_token_count", 0)
-        region_token_count = spec_data.get("region_token_count", 0)
-        if original_token_count > 0 and region_token_count > 0:
-            continuation_budget = original_token_count - region_token_count
+        otc = spec_data.get("original_token_count", 0)
+        rtc = spec_data.get("region_token_count", 0)
+        if otc > 0 and rtc > 0:
+            continuation_budget = otc - rtc
 
     user_msg = task._user_msg(question)
     prompt_str = build_thinking_prompt(tokenizer, user_msg, cot_prefix=source_cot)
     tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
 
-    ANSWER_MAX_TOKENS = 256
     answers = []
 
     if continuation_budget is not None:
-        # Prefix mode: two-step generation
-        step1_params = VllmSamplingParams(
-            max_tokens=continuation_budget, temperature=temperature,
-            n=num_resamples,
-        )
+        # Prefix mode: two-step
         step1_output = llm.generate(
-            [{"prompt_token_ids": tokens}], step1_params,
+            [{"prompt_token_ids": tokens}],
+            VllmSamplingParams(max_tokens=continuation_budget, temperature=temperature,
+                               n=num_resamples),
             use_tqdm=False,
         )[0]
 
-        step2_inputs = []
-        for completion in step1_output.outputs:
-            think_token_ids = list(completion.token_ids)
-            full_prefix = tokens + think_token_ids + END_THINK_TOKENS
-            step2_inputs.append({"prompt_token_ids": full_prefix})
-
-        step2_params = VllmSamplingParams(
-            max_tokens=ANSWER_MAX_TOKENS, temperature=temperature, n=1,
+        step2_inputs = [
+            {"prompt_token_ids": tokens + list(c.token_ids) + END_THINK_TOKENS}
+            for c in step1_output.outputs
+        ]
+        step2_outputs = llm.generate(
+            step2_inputs,
+            VllmSamplingParams(max_tokens=ANSWER_MAX_TOKENS, temperature=temperature, n=1),
+            use_tqdm=False,
         )
-        step2_outputs = llm.generate(step2_inputs, step2_params,
-                                      use_tqdm=False)
 
         for output in step2_outputs:
-            answer_text = output.outputs[0].text.strip()
-            answer = task._extract_answer_from_text(answer_text, question)
+            answer = task._extract_answer_from_text(output.outputs[0].text.strip(), question)
             if answer:
                 answers.append(answer)
     else:
-        # Middle mode: single-step generation
-        params = VllmSamplingParams(
-            max_tokens=2048, temperature=temperature, n=num_resamples,
-        )
-        output = llm.generate([{"prompt_token_ids": tokens}], params,
-                               use_tqdm=False)[0]
+        # Middle mode: single-step
+        output = llm.generate(
+            [{"prompt_token_ids": tokens}],
+            VllmSamplingParams(max_tokens=2048, temperature=temperature, n=num_resamples),
+            use_tqdm=False,
+        )[0]
 
         for completion in output.outputs:
             answer, _, _ = task._extract_answer(
@@ -417,7 +396,7 @@ def compute_baseline_vllm(task, question_id, rollout_idx=0, num_resamples=50,
             if answer:
                 answers.append(answer)
 
-    # Build distribution dict (same format as task.get_baseline_distribution)
+    # Build distribution dict
     counts = {}
     for a in answers:
         counts[a] = counts.get(a, 0) + 1
@@ -469,7 +448,6 @@ if __name__ == "__main__":
     run_faithful = "--skip-faithful" not in sys.argv
     run_baseline = "--skip-baseline" not in sys.argv
 
-    # Build skip index from existing results
     BB_DIR = str(task.data_dir / "llm_monitor_sentence_selection")
     FB_DIR = str(task.data_dir / "llm_monitor_faithful_sentence_selection")
     LN_DIR = str(task.data_dir / "last_n_baseline")
@@ -480,13 +458,11 @@ if __name__ == "__main__":
     ln_index = build_result_index(LN_DIR) if run_baseline else {}
 
     for qid in QUESTION_IDS:
-        bb_n = bb_index.get(qid, 0)
-        fb_n = fb_index.get(qid, 0)
-        ln_n = ln_index.get(qid, 0)
-        tqdm.write(f"  {qid}: BB={bb_n}, Faithful={fb_n}, Last-N={ln_n}")
+        tqdm.write(f"  {qid}: BB={bb_index.get(qid, 0)}, "
+                    f"Faithful={fb_index.get(qid, 0)}, "
+                    f"Last-N={ln_index.get(qid, 0)}")
 
     for q_idx, qid in enumerate(QUESTION_IDS):
-        # Determine which methods need to run
         need_bb = run_bb and bb_index.get(qid, 0) < NUM_ROLLOUTS
         need_fb = run_faithful and fb_index.get(qid, 0) < NUM_ROLLOUTS
         need_ln = run_baseline and ln_index.get(qid, 0) < NUM_ROLLOUTS
@@ -496,7 +472,8 @@ if __name__ == "__main__":
             continue
 
         methods_str = ", ".join(
-            [m for m, needed in [("BB", need_bb), ("Faithful", need_fb), ("Last-N", need_ln)] if needed]
+            m for m, needed in [("BB", need_bb), ("Faithful", need_fb), ("Last-N", need_ln)]
+            if needed
         )
         tqdm.write(f"\n{'='*60}")
         tqdm.write(f"[{q_idx+1}/{len(QUESTION_IDS)}] {qid}  [{methods_str}]")
@@ -517,9 +494,20 @@ if __name__ == "__main__":
                 json.dump(baseline, f, indent=2)
             tqdm.write(f"  Saved baseline to {baseline_path}")
 
-        # ── Phase 1: Prepare all specs + monitor predictions (parallel) ──
+        # ── Phase 1: Prepare all specs + monitor predictions ─────────
+        # Build (method_key, method_constructor) pairs for active methods
+        active_methods = []
+        if need_bb:
+            active_methods.append(("bb", lambda: LlmMonitor(
+                prompt=SentenceSelectionPrompt(), model=MONITOR_MODEL)))
+        if need_fb:
+            active_methods.append(("faithful", lambda: LlmMonitor(
+                prompt=FaithfulSentenceSelectionPrompt(), model=MONITOR_MODEL)))
+        if need_ln:
+            active_methods.append(("last_n", lambda: LastNBaselineMethod()))
+
         def prepare_one_rollout(rollout_idx):
-            """Prepare spec + run monitors for one rollout. Returns list of jobs."""
+            """Prepare spec + run monitors for one rollout."""
             spec = get_existing_spec(task, qid, rollout_idx)
             if spec is None:
                 spec = task.run_data(question_id=qid, rollout_idx=rollout_idx, verbose=False)
@@ -530,58 +518,26 @@ if __name__ == "__main__":
             if loaded is None:
                 return []
             question, _ = loaded
-            monitor_row = build_monitor_row(spec, question)
-            monitor_data = [monitor_row]
+            monitor_data = [build_monitor_row(spec, question)]
 
             rollout_jobs = []
-
-            if need_bb:
-                prompt = SentenceSelectionPrompt()
-                monitor = LlmMonitor(prompt=prompt, model=MONITOR_MODEL)
-                monitor.set_task(task)
-                results = monitor.infer(monitor_data, verbose=False)
+            for method_key, make_method in active_methods:
+                method = make_method()
+                method.set_task(task)
+                results = method.infer(monitor_data, verbose=False)
                 selected = results[0].get("monitor_prediction") or []
                 relative = [i - spec.region_start for i in selected]
                 compressed_cot = spec.reconstruct_from_indices(relative)
                 rollout_jobs.append({
-                    "rollout_idx": rollout_idx, "method": "bb",
+                    "rollout_idx": rollout_idx,
+                    "method": method_key,
                     "compressed_cot": compressed_cot,
-                    "selected_indices": selected, "relative_indices": relative,
-                    "output_folder": monitor.get_folder(), "method_obj": monitor,
+                    "selected_indices": selected,
+                    "relative_indices": relative,
+                    "output_folder": method.get_folder(),
+                    "method_obj": method,
                     "spec": spec,
                 })
-
-            if need_fb:
-                prompt = FaithfulSentenceSelectionPrompt()
-                monitor = LlmMonitor(prompt=prompt, model=MONITOR_MODEL)
-                monitor.set_task(task)
-                results = monitor.infer(monitor_data, verbose=False)
-                selected = results[0].get("monitor_prediction") or []
-                relative = [i - spec.region_start for i in selected]
-                compressed_cot = spec.reconstruct_from_indices(relative)
-                rollout_jobs.append({
-                    "rollout_idx": rollout_idx, "method": "faithful",
-                    "compressed_cot": compressed_cot,
-                    "selected_indices": selected, "relative_indices": relative,
-                    "output_folder": monitor.get_folder(), "method_obj": monitor,
-                    "spec": spec,
-                })
-
-            if need_ln:
-                last_n = LastNBaselineMethod()
-                last_n.set_task(task)
-                results = last_n.infer(monitor_data, verbose=False)
-                selected = results[0].get("monitor_prediction") or []
-                relative = [i - spec.region_start for i in selected]
-                compressed_cot = spec.reconstruct_from_indices(relative)
-                rollout_jobs.append({
-                    "rollout_idx": rollout_idx, "method": "last_n",
-                    "compressed_cot": compressed_cot,
-                    "selected_indices": selected, "relative_indices": relative,
-                    "output_folder": last_n.get_folder(), "method_obj": last_n,
-                    "spec": spec,
-                })
-
             return rollout_jobs
 
         jobs = []
@@ -595,23 +551,19 @@ if __name__ == "__main__":
                 desc="  Preparing", unit="rollout", leave=False,
             ):
                 try:
-                    rollout_jobs = future.result()
-                    jobs.extend(rollout_jobs)
+                    jobs.extend(future.result())
                 except Exception as e:
                     ri = futures[future]
                     tqdm.write(f"    WARNING: prep failed for rollout {ri}: {e}")
         tqdm.write(f"  Prepared {len(jobs)} compression jobs")
 
-        # ── Phase 2: Batch evaluate ALL compressions via vLLM ──
+        # ── Phase 2: Batch evaluate ALL compressions via vLLM ────────
         distributions = batch_evaluate_compressions(
-            task, qid, jobs,
-            num_resamples=NUM_RESAMPLES,
+            task, qid, jobs, num_resamples=NUM_RESAMPLES,
         )
 
-        # ── Phase 3: Compute KL, save results ──
-        bb_eval_results = []
-        faithful_eval_results = []
-        last_n_eval_results = []
+        # ── Phase 3: Compute KL, save results ────────────────────────
+        method_results = {"bb": [], "faithful": [], "last_n": []}
 
         for job, dist in zip(jobs, distributions):
             try:
@@ -629,7 +581,6 @@ if __name__ == "__main__":
                     **metrics,
                 }
 
-                # Save per-rollout results
                 output_folder = Path(job["output_folder"])
                 with open(output_folder / "compression_eval.json", "w") as f:
                     json.dump(eval_result, f, indent=2)
@@ -639,38 +590,31 @@ if __name__ == "__main__":
                 if hasattr(job["method_obj"], "_output") and job["method_obj"]._output:
                     job["method_obj"]._output.mark_success()
 
-                record = {"rollout_idx": job["rollout_idx"], **eval_result}
-                if job["method"] == "bb":
-                    bb_eval_results.append(record)
-                elif job["method"] == "faithful":
-                    faithful_eval_results.append(record)
-                elif job["method"] == "last_n":
-                    last_n_eval_results.append(record)
+                method_results[job["method"]].append(
+                    {"rollout_idx": job["rollout_idx"], **eval_result}
+                )
             except Exception as e:
                 tqdm.write(f"    WARNING: save failed for {job['method']} "
                            f"rollout {job['rollout_idx']}: {e}")
 
         # Print question summary
-        for method_name, results in [("BB Monitor", bb_eval_results),
-                                      ("Faithful BB", faithful_eval_results),
-                                      ("Last-N", last_n_eval_results)]:
+        label_map = {"bb": "BB Monitor", "faithful": "Faithful BB", "last_n": "Last-N"}
+        for key, results in method_results.items():
             if results:
                 avg_kl = sum(r["kl_divergence"] for r in results) / len(results)
-                tqdm.write(f"  {method_name}: avg KL={avg_kl:.4f} ({len(results)} rollouts)")
+                tqdm.write(f"  {label_map[key]}: avg KL={avg_kl:.4f} ({len(results)} rollouts)")
 
         # Save aggregate results per question
-        if bb_eval_results:
-            summary_path = task.compression_dir / qid / "all_rollouts_bb_eval.json"
-            summary_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(summary_path, "w") as f:
-                json.dump(bb_eval_results, f, indent=2)
-        if faithful_eval_results:
-            summary_path = task.compression_dir / qid / "all_rollouts_faithful_eval.json"
-            with open(summary_path, "w") as f:
-                json.dump(faithful_eval_results, f, indent=2)
-        if last_n_eval_results:
-            summary_path = task.compression_dir / qid / "all_rollouts_last_n_eval.json"
-            with open(summary_path, "w") as f:
-                json.dump(last_n_eval_results, f, indent=2)
+        agg_names = {
+            "bb": "all_rollouts_bb_eval.json",
+            "faithful": "all_rollouts_faithful_eval.json",
+            "last_n": "all_rollouts_last_n_eval.json",
+        }
+        for key, results in method_results.items():
+            if results:
+                summary_path = task.compression_dir / qid / agg_names[key]
+                summary_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(summary_path, "w") as f:
+                    json.dump(results, f, indent=2)
 
     tqdm.write("\nDone.")

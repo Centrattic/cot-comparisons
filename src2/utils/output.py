@@ -35,7 +35,7 @@ class OutputManager:
             Path to the created folder, e.g.
             data/{task}/{method}/2026-01-31_14-30-00/
         """
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
         folder = self.base_dir / timestamp
         folder.mkdir(parents=True, exist_ok=True)
         self._run_folder = folder
