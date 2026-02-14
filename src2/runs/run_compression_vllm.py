@@ -540,7 +540,7 @@ if __name__ == "__main__":
                 monitor = LlmMonitor(prompt=prompt, model=MONITOR_MODEL)
                 monitor.set_task(task)
                 results = monitor.infer(monitor_data, verbose=False)
-                selected = results[0].get("monitor_prediction", [])
+                selected = results[0].get("monitor_prediction") or []
                 relative = [i - spec.region_start for i in selected]
                 compressed_cot = spec.reconstruct_from_indices(relative)
                 rollout_jobs.append({
@@ -556,7 +556,7 @@ if __name__ == "__main__":
                 monitor = LlmMonitor(prompt=prompt, model=MONITOR_MODEL)
                 monitor.set_task(task)
                 results = monitor.infer(monitor_data, verbose=False)
-                selected = results[0].get("monitor_prediction", [])
+                selected = results[0].get("monitor_prediction") or []
                 relative = [i - spec.region_start for i in selected]
                 compressed_cot = spec.reconstruct_from_indices(relative)
                 rollout_jobs.append({
@@ -571,7 +571,7 @@ if __name__ == "__main__":
                 last_n = LastNBaselineMethod()
                 last_n.set_task(task)
                 results = last_n.infer(monitor_data, verbose=False)
-                selected = results[0].get("monitor_prediction", [])
+                selected = results[0].get("monitor_prediction") or []
                 relative = [i - spec.region_start for i in selected]
                 compressed_cot = spec.reconstruct_from_indices(relative)
                 rollout_jobs.append({
