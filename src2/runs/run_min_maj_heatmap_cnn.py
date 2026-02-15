@@ -79,35 +79,80 @@ def build_entries(task: MinMajAnswerTask) -> list:
 
 # ── Phase 2: Activation Extraction ──────────────────────────────────
 
-def extract_activations(entries: list, layer: int):
-    """Extract full-sequence activations for each entry using ActivationExtractor."""
+def extract_activations(entries: list, layer: int, batch_size: int = 8):
+    """Extract full-sequence activations in batches using ActivationExtractor."""
     ACT_DIR.mkdir(parents=True, exist_ok=True)
 
     extractor = ActivationExtractor(
         model_name=MODEL_NAME,
-        load_in_4bit=True,
+        load_in_4bit=False,
     )
 
+    # Find entries that need extraction
+    todo = []
     n_existing = 0
-    n_extracted = 0
-
     for idx, entry in enumerate(entries):
         out_path = ACT_DIR / f"sample_{idx}.npy"
         if out_path.exists():
             n_existing += 1
-            continue
+        else:
+            todo.append(idx)
 
-        # Apply chat template to get full text
-        text = extractor.tokenizer.apply_chat_template(
-            entry["messages"], tokenize=False, add_generation_prompt=False,
+    print(f"  {n_existing} cached, {len(todo)} to extract (batch_size={batch_size})")
+
+    if not todo:
+        return
+
+    # Prepare all texts upfront
+    tokenizer = extractor.tokenizer
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # left-pad so real tokens are right-aligned
+    texts = {}
+    for idx in todo:
+        texts[idx] = tokenizer.apply_chat_template(
+            entries[idx]["messages"], tokenize=False, add_generation_prompt=False,
         )
 
-        acts = extractor.extract_full_sequence(text, layer=layer)
-        np.save(out_path, acts)
-        n_extracted += 1
+    # Process in batches
+    n_extracted = 0
+    for batch_start in range(0, len(todo), batch_size):
+        batch_idxs = todo[batch_start:batch_start + batch_size]
+        batch_texts = [texts[idx] for idx in batch_idxs]
 
-        if (n_extracted) % 50 == 0:
-            print(f"  Extracted {n_extracted} activations ({idx + 1}/{len(entries)} total)...")
+        # Tokenize with padding
+        inputs = tokenizer(
+            batch_texts, return_tensors="pt", truncation=True,
+            max_length=4096, padding=True,
+        ).to(extractor.model.device)
+
+        # Extract activations via hook
+        activations = {}
+
+        def hook_fn(module, input, output):
+            if isinstance(output, tuple):
+                activations["resid"] = output[0].detach()
+            else:
+                activations["resid"] = output.detach()
+
+        handle = extractor.model.model.layers[layer].register_forward_hook(hook_fn)
+        try:
+            with torch.no_grad():
+                extractor.model(**inputs)
+        finally:
+            handle.remove()
+
+        # Save per-sample, stripping padding
+        attn_mask = inputs["attention_mask"]
+        for i, idx in enumerate(batch_idxs):
+            seq_len = int(attn_mask[i].sum())
+            # Left-padded: take the last seq_len tokens
+            acts = activations["resid"][i, -seq_len:, :].cpu().float().numpy()
+            np.save(ACT_DIR / f"sample_{idx}.npy", acts)
+
+        n_extracted += len(batch_idxs)
+        if n_extracted % 50 < batch_size:
+            print(f"  Extracted {n_extracted}/{len(todo)}...")
 
     print(f"  Activation extraction complete: {n_extracted} new, {n_existing} cached")
 
@@ -447,7 +492,9 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="Learning rate (default: 3e-4)")
     parser.add_argument("--batch-size", type=int, default=32,
-                        help="Batch size (default: 32)")
+                        help="CNN training batch size (default: 32)")
+    parser.add_argument("--extract-batch-size", type=int, default=8,
+                        help="Activation extraction batch size (default: 8)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
     args = parser.parse_args()
@@ -490,7 +537,7 @@ def main():
         print("\nPhase 2: Skipping activation extraction (--skip-extraction)")
     else:
         print(f"\nPhase 2: Extracting layer-{args.layer} activations...")
-        extract_activations(entries, layer=args.layer)
+        extract_activations(entries, layer=args.layer, batch_size=args.extract_batch_size)
 
     # ── Phase 3: Build heatmap images ────────────────────────────────
     print(f"\nPhase 3: Building heatmap images (K={args.K})...")
